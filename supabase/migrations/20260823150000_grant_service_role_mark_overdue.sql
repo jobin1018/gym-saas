@@ -1,0 +1,55 @@
+-- Grants for the mark-overdue Edge Function.
+--
+-- WHY THIS IS NEEDED: `auto_expose_new_tables` is not enabled (see config.toml),
+-- which matches the current Supabase cloud default — tables created by a
+-- migration are NOT automatically reachable by the Data API roles. RLS bypass
+-- and table privileges are two different things: `service_role` has BYPASSRLS,
+-- but without a GRANT every query still fails with
+-- `42501 permission denied for table ...`.
+--
+-- Scope is minimum-privilege: only the tables/operations mark-overdue actually
+-- performs. Grants are idempotent, so overlap with the five earlier grants
+-- migrations is harmless — repeating them keeps each function's requirements
+-- readable in one place.
+--
+-- ============================================================================
+-- THIS IS THE ONLY FUNCTION IN THE SYSTEM THAT MAY WRITE memberships.status
+-- OUTSIDE A PAYMENT CALLBACK
+-- ============================================================================
+-- The privilege boundary is the point of splitting this out of renewal-scan
+-- rather than folding it in:
+--
+--   mark-overdue      SELECT + UPDATE on memberships, and NOTHING else. It
+--                     cannot message anyone: no whatsapp_messages grant, no
+--                     payments grant, no members grant.
+--   renewal-scan      SELECT only on memberships. It cannot corrupt a status
+--                     even if its selection logic is wrong.
+--   razorpay-webhook  SELECT + UPDATE on memberships, for the reverse
+--                     transition (past_due -> active on payment).
+--
+-- So a bug in the dunning scanner cannot send a message, and a bug in the
+-- messaging scanner cannot change a member's standing. That separation is
+-- enforced here by the database, not by convention in the TypeScript.
+
+-- Read side: find memberships still marked 'active' whose current_period_end
+-- has passed, in the organization's own timezone.
+-- Write side: flip exactly those to 'past_due'. The UPDATE re-checks status and
+-- current_period_end as a compare-and-set, so a membership paid mid-run is left
+-- alone rather than being clobbered back to past_due.
+GRANT SELECT, UPDATE ON public.memberships TO service_role;
+
+-- NOTE ON THE TWO READS BELOW: the brief for this function said "SELECT/UPDATE
+-- on memberships only", and for a naive UTC implementation that would be
+-- enough. It is not enough for a correct one. current_period_end is a DATE, so
+-- "has it passed?" has no answer until you know whose calendar day you are
+-- asking about — and between 00:00 and 05:30 IST the UTC date is already
+-- tomorrow while an Indian gym's is not. Marking a member past_due five and a
+-- half hours early, on the morning their renewal reminder goes out and while
+-- they can still walk in and pay, is exactly the kind of quiet wrongness this
+-- whole function exists to remove.
+--
+-- Both reads are read-only, and mirror how daily-owner-brief resolves the same
+-- question: organizations enumerates the tenants, locations.timezone supplies
+-- each one's calendar.
+GRANT SELECT ON public.organizations TO service_role;
+GRANT SELECT ON public.locations     TO service_role;
