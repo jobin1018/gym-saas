@@ -9,17 +9,19 @@
 // against when the member pays.
 //
 // ============================================================================
-// WHAT IS REAL AND WHAT IS SIMULATED
+// WHAT IS REAL
 // ============================================================================
 // REAL: the Razorpay Payment Links API (POST /v1/payment_links) using
 //       RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET. Test mode is fully functional,
 //       so the same code path runs in production and every link this function
 //       returns is a real link at Razorpay.
 //
-// SIMULATED: the outbound WhatsApp send only, via the shared helper in
-//       ../_shared/whatsapp.ts (BEGIN/END SIMULATED SEND fence). Grep the
-//       simulated surface with:
-//         rg 'BEGIN SIMULATED SEND' supabase/functions
+// REAL: the outbound WhatsApp send, via the shared helper in
+//       ../_shared/whatsapp.ts — a real call to Meta's Cloud API. It goes out
+//       as free-form "type":"text", not an approved template (see the
+//       TODO(meta) in ../_shared/whatsapp.ts for why, and what to change once
+//       a template is approved). WHATSAPP_SEND_MODE=mock skips the real call;
+//       this function's test.sh enforces that for automated runs.
 //         rg 'TODO\((meta|razorpay)\)' supabase/functions
 //
 // ============================================================================

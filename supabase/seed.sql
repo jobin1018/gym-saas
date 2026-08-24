@@ -7,12 +7,15 @@
 --   917777777777  → member at BOTH gyms, no active context → disambiguation prompt
 --   916666666666  → not a member anywhere                 → "We couldn't find you"
 --
--- Staff/owner logins (public.users) — one owner + one front desk per gym:
---   919000000001 Ravi Krishnan  owner       Iron Temple  (= organizations.owner_phone)
---   919000000011 Priya Nair     front_desk  Iron Temple — Indiranagar
---   919000000002 Sanjay Mehta   owner       FlexFit      (= organizations.owner_phone)
---   919000000012 Divya Shetty   front_desk  FlexFit — Koramangala
--- All have pin_hash NULL — see the note above that INSERT.
+-- Staff/owner logins (public.users) — one owner + one front desk per gym.
+-- PINs below are LOCAL DEV ONLY, chosen to be easy to type and remember —
+-- never do this for a real deployment. Verify with staff-login (bcrypt
+-- compare against pin_hash, see that function's own docs for why bcrypt was
+-- chosen over argon2 for a 4-digit keyspace):
+--   919000000001 Ravi Krishnan  owner       Iron Temple  pin 1234  (= organizations.owner_phone)
+--   919000000011 Priya Nair     front_desk  Iron Temple  pin 1111
+--   919000000002 Sanjay Mehta   owner       FlexFit      pin 2345  (= organizations.owner_phone)
+--   919000000012 Divya Shetty   front_desk  FlexFit      pin 2222
 --
 -- Payment fixtures for the razorpay-webhook function:
 --   pay_TEST_CAPTURED  → pending payment on Asha's ACTIVE membership   (capture path)
@@ -32,13 +35,11 @@ INSERT INTO locations (id, organization_id, name) VALUES
 
 -- STAFF / OWNER LOGINS
 --
--- pin_hash is deliberately NULL on every row. Nothing hashes or verifies a PIN
--- yet — _shared/crypto.ts has HMAC and SHA-256 but no slow KDF, and a 4-digit
--- PIN under a fast hash is brute-forceable in milliseconds. Writing a
--- placeholder hash now would only have to be thrown away (and risks someone
--- treating it as real), so the column stays NULL until staff-login exists.
--- auth_user_id is NULL for the same reason: it is the bridge to Supabase Auth,
--- and nothing has decided yet whether to use it.
+-- pin_hash is a real bcrypt hash (cost 12) of the PIN listed in the header
+-- comment above, computed once with the same npm:bcryptjs library
+-- staff-login/index.ts uses at request time — these are not placeholders.
+-- auth_user_id stays NULL: it is the bridge to Supabase Auth, and staff-login
+-- populates it lazily on a user's first successful login rather than here.
 --
 -- OWNER PHONES INTENTIONALLY MATCH organizations.owner_phone. Nothing in the
 -- schema enforces that — there is no FK and no constraint tying the two
@@ -52,16 +53,20 @@ INSERT INTO locations (id, organization_id, name) VALUES
 INSERT INTO users (id, organization_id, name, phone, role, location_id, pin_hash) VALUES
   -- Iron Temple Gym
   ('91111111-1111-1111-1111-111111111111', '11111111-1111-1111-1111-111111111111',
-   'Ravi Krishnan', '919000000001', 'owner',      NULL, NULL),
+   'Ravi Krishnan', '919000000001', 'owner',      NULL,
+   '$2a$12$on0RNeDins4a4rqt4Mcpse8sQ/em3Irl1orEyXYomtKV7sH64bpNS'), -- pin 1234
   ('92222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111',
    'Priya Nair',    '919000000011', 'front_desk',
-   'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', NULL),
+   'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+   '$2a$12$z4yhVi.IJU8huu5x/9.tl.bOEfYHoc4nacMxkYZkc4omzCPP9gd7K'), -- pin 1111
   -- FlexFit Studio
   ('93333333-3333-3333-3333-333333333333', '22222222-2222-2222-2222-222222222222',
-   'Sanjay Mehta',  '919000000002', 'owner',      NULL, NULL),
+   'Sanjay Mehta',  '919000000002', 'owner',      NULL,
+   '$2a$12$bbAzBvScb.2lMUqcMsPNJOgYLb6BaY1bW0fn9tjjlXkKE1etAQvlK'), -- pin 2345
   ('94444444-4444-4444-4444-444444444444', '22222222-2222-2222-2222-222222222222',
    'Divya Shetty',  '919000000012', 'front_desk',
-   'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', NULL);
+   'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+   '$2a$12$P2guAJ41at5K/RCytsI8zevhRcAEX/3S0n0xfbWPqGBqY6zU21HOi'); -- pin 2222
 
 INSERT INTO membership_plans (id, organization_id, name, amount) VALUES
   ('cccccccc-cccc-cccc-cccc-cccccccccccc', '11111111-1111-1111-1111-111111111111', 'Monthly Unlimited', 1500.00),

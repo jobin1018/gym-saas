@@ -29,6 +29,8 @@ SUITES=(
   send-renewal-reminder
   renewal-scan
   razorpay-webhook
+  staff-login
+  staff-lookup-by-phone
 )
 
 if [ -t 1 ]; then

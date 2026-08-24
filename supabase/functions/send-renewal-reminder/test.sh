@@ -16,9 +16,11 @@
 # instruments. The links this suite leaves behind are unpaid and unsent; delete
 # them from the dashboard if you like tidy test data.
 #
-# The WhatsApp send remains simulated (see ../_shared/whatsapp.ts) — the
+# The WhatsApp send is REAL by default (see ../_shared/whatsapp.ts) — this
+# suite forces WHATSAPP_SEND_MODE=mock (checked in preflight below) so it
+# never fires a real Meta API call at the seeded test phone number. The
 # whatsapp_messages rows asserted on below are real rows, written by the
-# simulated send.
+# mocked send.
 #
 # PREREQUISITES
 #   1. supabase start
@@ -66,6 +68,7 @@ read_env() {
 }
 
 RZP_KEY_ID="${RAZORPAY_KEY_ID:-$(read_env RAZORPAY_KEY_ID)}"
+WA_SEND_MODE="${WHATSAPP_SEND_MODE:-$(read_env WHATSAPP_SEND_MODE)}"
 
 # The service role key is injected into the function by the edge runtime, not by
 # .env — so ask the CLI for it rather than reading a file. authorize() in
@@ -209,6 +212,16 @@ if [ -z "$SERVICE_KEY" ]; then
   printf '\n%sERROR%s could not determine the service role key.\n' "$R" "$N"
   printf '        Run `supabase status` from the project root, or export SERVICE_ROLE_KEY=...\n'
   printf '        The function rejects every other caller with 401, by design.\n\n'
+  exit 1
+fi
+
+if [ "$(printf '%s' "$WA_SEND_MODE" | tr '[:upper:]' '[:lower:]')" != "mock" ]; then
+  printf '\n%sREFUSING TO RUN%s WHATSAPP_SEND_MODE is not "mock" in %s (got: %s).\n' \
+    "$R" "$N" "$ENV_FILE" "${WA_SEND_MODE:-<unset>}"
+  printf '        This suite sends a real renewal reminder, which calls sendWhatsAppMessage(),\n'
+  printf '        which hits the real Meta Cloud API LIVE by default. Set WHATSAPP_SEND_MODE=mock\n'
+  printf '        in %s and restart `supabase functions serve` before running this\n' "$ENV_FILE"
+  printf '        suite, or it will send a real WhatsApp message to the seeded test phone number.\n\n'
   exit 1
 fi
 
@@ -369,7 +382,7 @@ assert_db "reconciled_at left NULL (nothing is reconciled yet)" \
 assert_db "payment is scoped to the right tenant" \
   "$ORG_IRON" "$(sql "select organization_id from payments where id='$PAYMENT_ID';")"
 
-# --- The whatsapp_messages row (simulated send, real row) ---
+# --- The whatsapp_messages row (send mocked by WHATSAPP_SEND_MODE=mock, real row) ---
 assert_db "one outbound renewal_reminder was logged" \
   "1" "$(sql "select count(*) from whatsapp_messages where member_id='$MEMBER_PAST_DUE' and direction='outbound' and template_name='renewal_reminder';")"
 assert_db "message status is queued" \
@@ -378,7 +391,7 @@ assert_db "message is linked to the new payment via related_payment_id" \
   "1" "$(sql "select count(*) from whatsapp_messages where related_payment_id='$PAYMENT_ID';")"
 assert_db "message body carries the real payment link" \
   "1" "$(sql "select count(*) from whatsapp_messages where related_payment_id='$PAYMENT_ID' and body_preview like '%rzp.io%';")"
-assert_db "wa_message_id is NULL (the send is simulated, nothing was delivered)" \
+assert_db "wa_message_id is NULL (send was mocked, nothing was delivered)" \
   "t" "$(sql "select (wa_message_id is null) from whatsapp_messages where related_payment_id='$PAYMENT_ID';")"
 
 # ---------------------------------------------------------------------------

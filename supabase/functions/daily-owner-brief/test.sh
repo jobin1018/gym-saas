@@ -8,9 +8,12 @@
 # ============================================================================
 # NO EXTERNAL CALLS — unlike renewal-scan's suite
 # ============================================================================
-# This function talks to nothing outside the database. The WhatsApp send is
-# simulated (../_shared/whatsapp.ts), and no Razorpay link is ever created. So
-# this suite is safe to run repeatedly and costs nothing.
+# This function talks to nothing outside the database except the WhatsApp
+# send, which is REAL by default (../_shared/whatsapp.ts) and no Razorpay link
+# is ever created. This suite forces WHATSAPP_SEND_MODE=mock (checked in
+# preflight below) so it never fires a real Meta API call at the seeded owner
+# phone numbers — with that in place, it is safe to run repeatedly and costs
+# nothing.
 #
 # It DOES write fixtures: a third organization (suspended), attendance rows
 # placed at deliberate hours in IST to test the timezone boundary, and it moves
@@ -29,6 +32,7 @@
 set -uo pipefail
 
 BASE_URL="${BASE_URL:-http://127.0.0.1:54321/functions/v1/daily-owner-brief}"
+ENV_FILE="${ENV_FILE:-$(dirname "$0")/../.env}"
 DB_CONTAINER="${DB_CONTAINER:-supabase_db_gym-saas}"
 PROJECT_DIR="${PROJECT_DIR:-$(dirname "$0")/../../..}"
 
@@ -69,6 +73,14 @@ if { [ -z "$SERVICE_KEY" ] || [ -z "$ANON_KEY" ]; } && command -v supabase >/dev
   [ -z "$SERVICE_KEY" ] && SERVICE_KEY=$(printf '%s' "$_env" | sed -n 's/^SERVICE_ROLE_KEY="\(.*\)"$/\1/p' | tail -1)
   [ -z "$ANON_KEY" ]    && ANON_KEY=$(printf '%s' "$_env"    | sed -n 's/^ANON_KEY="\(.*\)"$/\1/p'         | tail -1)
 fi
+
+read_env() {
+  # Reads KEY=value from the env file, ignoring comments. Empty if absent.
+  [ -f "$ENV_FILE" ] || return 0
+  sed -n "s/^[[:space:]]*$1=//p" "$ENV_FILE" | tail -1 | tr -d '\r"'
+}
+
+WA_SEND_MODE="${WHATSAPP_SEND_MODE:-$(read_env WHATSAPP_SEND_MODE)}"
 
 have_psql=false
 if docker exec "$DB_CONTAINER" true >/dev/null 2>&1; then have_psql=true; fi
@@ -241,6 +253,16 @@ clear_briefs() {
 printf '\n%s== daily-owner-brief tests ==%s\n' "$B" "$N"
 printf 'target: %s\n' "$BASE_URL"
 
+if [ "$(printf '%s' "$WA_SEND_MODE" | tr '[:upper:]' '[:lower:]')" != "mock" ]; then
+  printf '\n%sREFUSING TO RUN%s WHATSAPP_SEND_MODE is not "mock" in %s (got: %s).\n' \
+    "$R" "$N" "$ENV_FILE" "${WA_SEND_MODE:-<unset>}"
+  printf '        This suite sends real owner briefs, which call sendWhatsAppMessage(), which\n'
+  printf '        hits the real Meta Cloud API LIVE by default. Set WHATSAPP_SEND_MODE=mock in\n'
+  printf '        %s and restart `supabase functions serve` before running this\n' "$ENV_FILE"
+  printf '        suite, or it will send real WhatsApp messages to the seeded owner phone numbers.\n\n'
+  exit 1
+fi
+
 if [ -z "$SERVICE_KEY" ]; then
   printf '\n%sERROR%s could not determine the service role key.\n' "$R" "$N"
   printf '        Run `supabase status` from the project root, or export SERVICE_ROLE_KEY=...\n\n'
@@ -409,7 +431,7 @@ assert_db "brief row has no related_payment_id" \
   "1" "$(sql "select count(*) from whatsapp_messages where template_name='daily_owner_brief' and related_payment_id is null;")"
 assert_db "body_preview holds the real brief text" \
   "1" "$(sql "select count(*) from whatsapp_messages where template_name='daily_owner_brief' and body_preview like 'Good morning! Iron Temple Gym%';")"
-assert_db "wa_message_id is NULL (the send is simulated)" \
+assert_db "wa_message_id is NULL (send was mocked for this test run)" \
   "1" "$(sql "select count(*) from whatsapp_messages where template_name='daily_owner_brief' and wa_message_id is null;")"
 
 # A NULL member_id must not disturb send-renewal-reminder's member-scoped guard.
@@ -535,8 +557,8 @@ reset_state
 
 printf '\n%s== summary ==%s\n' "$B" "$N"
 printf '  %spassed %d%s   %sfailed %d%s   %sskipped %d%s\n' "$G" "$PASS" "$N" "$R" "$FAIL" "$N" "$Y" "$SKIP" "$N"
-printf '  note: no external API was called — the WhatsApp send is simulated and\n'
-printf '        this function creates no Razorpay links.\n'
+printf '  note: no external API was called — the WhatsApp send was mocked\n'
+printf '        (WHATSAPP_SEND_MODE=mock) and this function creates no Razorpay links.\n'
 printf '  note: seed data has been restored to seed.sql state.\n'
 
 if [ "$FAIL" -gt 0 ]; then

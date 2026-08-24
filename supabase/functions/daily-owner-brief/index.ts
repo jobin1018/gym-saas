@@ -9,13 +9,17 @@
 // testing.
 //
 // ============================================================================
-// WHAT IS REAL AND WHAT IS SIMULATED
+// WHAT IS REAL
 // ============================================================================
 // REAL: every number in the brief. They are computed from memberships,
 //       payments, attendance and whatsapp_messages at request time.
 //
-// SIMULATED: the outbound send only, via the shared helper in
-//       ../_shared/whatsapp.ts (BEGIN/END SIMULATED SEND fence).
+// REAL: the outbound send, via the shared helper in ../_shared/whatsapp.ts —
+//       a real call to Meta's Cloud API. It goes out as free-form "type":
+//       "text", not an approved template (see the TODO(meta) in
+//       ../_shared/whatsapp.ts for why, and what to change once a template is
+//       approved). WHATSAPP_SEND_MODE=mock skips the real call; this
+//       function's test.sh enforces that for automated runs.
 //
 // ============================================================================
 // THE RECIPIENT IS AN ORGANIZATION, NOT A MEMBER

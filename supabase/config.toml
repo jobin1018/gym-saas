@@ -269,11 +269,20 @@ max_frequency = "5s"
 # 4152127777 = "123456"
 
 # Configure logged in session timeouts.
-# [auth.sessions]
-# Force log out after the specified duration.
-# timebox = "24h"
-# Force log out if the user has been inactive longer than the specified duration.
-# inactivity_timeout = "8h"
+#
+# GLOBAL setting, not per-session — there is no way to set a longer/shorter
+# expiry for one staff-login call vs another via the Admin API. jwt_expiry
+# above (3600s) governs the short-lived ACCESS token; these govern the
+# SESSION as a whole, which is what actually determines how long a shared
+# front-desk tablet stays logged in (the access token silently refreshes
+# against the session in the background — enable_refresh_token_rotation
+# above already handles that, nothing custom needed for it).
+[auth.sessions]
+# Force log out after the specified duration, regardless of activity —
+# defense-in-depth in case a tablet is left logged in over a weekend.
+timebox = "24h"
+# Force log out after this long with no activity — matches a work shift.
+inactivity_timeout = "12h"
 
 # This hook runs before a new user is created and allows developers to reject the request based on the incoming user object.
 # [auth.hook.before_user_created]
@@ -281,9 +290,14 @@ max_frequency = "5s"
 # uri = "pg-functions://postgres/auth/before-user-created-hook"
 
 # This hook runs before a token is issued and allows you to add additional claims based on the authentication method used.
-# [auth.hook.custom_access_token]
-# enabled = true
-# uri = "pg-functions://<database>/<schema>/<hook_name>"
+#
+# Injects org_id / app_role / location_id onto every issued/refreshed token —
+# see 20260824140000_create_custom_access_token_hook.sql for the function and
+# 20260824140500_rewrite_tenant_isolation_policies_for_jwt.sql for the RLS
+# policies that depend on these claims.
+[auth.hook.custom_access_token]
+enabled = true
+uri = "pg-functions://postgres/public/custom_access_token_hook"
 
 # Configure one of the supported SMS providers: `twilio`, `twilio_verify`, `messagebird`, `textlocal`, `vonage`.
 [auth.sms.twilio]
@@ -454,6 +468,35 @@ enabled = true
 verify_jwt = true
 import_map = "./functions/send-renewal-reminder/deno.json"
 entrypoint = "./functions/send-renewal-reminder/index.ts"
+
+[functions.staff-login]
+enabled = true
+# Unlike the other internal functions, this one is meant to accept the ANON
+# key — it is called PRE-login, directly by the frontend, so the anon key is
+# the only credential the caller can possibly hold. verify_jwt = true is still
+# correct: the anon key IS a valid Supabase-issued JWT (role: anon), so the
+# gateway still rejects garbage/keyless traffic before this code runs. There
+# is deliberately no service-role gate on top (contrast with send-renewal-
+# reminder) — real auth happens inside the function itself, via rate-limited
+# bcrypt PIN verification against public.users.pin_hash. Internally the
+# function still uses the SERVICE ROLE key (createAdminClient()) for Admin API
+# access and to bypass RLS on users/login_attempts.
+verify_jwt = true
+import_map = "./functions/staff-login/deno.json"
+entrypoint = "./functions/staff-login/index.ts"
+
+[functions.staff-lookup-by-phone]
+enabled = true
+# Same gate as staff-login, and for the same reason: this runs BEFORE
+# staff-login, pre-session, so the anon key is the only credential the caller
+# can possibly hold. verify_jwt = true still rejects garbage/keyless traffic
+# at the gateway (the anon key IS a valid Supabase-issued JWT). No
+# service-role gate on top — there is no tighter credential a pre-login
+# caller could present, and this function reads no secret (no pin_hash, no
+# rate-limit state) that would need one.
+verify_jwt = true
+import_map = "./functions/staff-lookup-by-phone/deno.json"
+entrypoint = "./functions/staff-lookup-by-phone/index.ts"
 
 [functions.razorpay-webhook]
 enabled = true

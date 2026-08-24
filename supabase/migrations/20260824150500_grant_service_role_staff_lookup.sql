@@ -1,0 +1,16 @@
+-- Grant for the staff-lookup-by-phone Edge Function.
+--
+-- service_role already holds SELECT on both public.users and
+-- public.organizations (granted in 20260824130500_grant_service_role_staff_
+-- login.sql and the core schema's original grants respectively), so no base-
+-- table grant is needed for the view's own query to succeed underneath —
+-- confirmed via information_schema.role_table_grants before writing this,
+-- not assumed. What is missing is SELECT on the VIEW itself: Postgres does
+-- not treat "can select the underlying tables" as "can select a view built
+-- on them" — a view is its own relation with its own privilege set.
+--
+-- Deliberately narrow: SELECT only, service_role only. staff_lookup_
+-- directory is never exposed to anon/authenticated via PostgREST — it is
+-- read exclusively by staff-lookup-by-phone/index.ts using
+-- createAdminClient(), the same pattern every other internal function uses.
+GRANT SELECT ON public.staff_lookup_directory TO service_role;

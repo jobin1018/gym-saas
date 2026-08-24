@@ -4,17 +4,20 @@
 // POST → inbound WhatsApp messages: resolve tenant, parse intent, act, reply.
 //
 // ============================================================================
-// SIMULATION MODE
+// OUTBOUND SENDING — real Meta Cloud API, free-form text
 // ============================================================================
-// We do NOT have Meta WhatsApp Business API credentials yet. Every outbound
-// message is therefore "sent" by sendWhatsAppMessage(), which currently only
-// console.log()s and writes a whatsapp_messages row with status 'queued'.
-// Swapping in the real Meta Cloud API is a single-function change — see the
-// clearly-marked block inside sendWhatsAppMessage(). Everything else in this
-// file is production-shaped.
+// sendWhatsAppMessage() below calls the real Meta Cloud API. Every reply here
+// is a free-form "type":"text" message sent in direct response to an inbound
+// message, so it is always within Meta's 24h customer-service window and does
+// NOT need an approved template (unlike renewal_reminder / daily_owner_brief,
+// which are business-initiated — see ../_shared/whatsapp.ts).
 //
-// Every temporary/stubbed piece is tagged with `TODO(meta)`, `TODO(razorpay)`
-// or `TODO(convo)` so the simulated surface is easy to grep for:
+// WHATSAPP_SEND_MODE=mock skips the real call (console.log + 'queued' row
+// instead) — see the SEND MODE note at the top of ../_shared/whatsapp.ts for
+// why that is an opt-in for test runs rather than a runtime default.
+//
+// Every remaining temporary/stubbed piece is tagged with `TODO(meta)`,
+// `TODO(razorpay)` or `TODO(convo)` so it is easy to grep for:
 //   rg 'TODO\((meta|razorpay|convo)\)' supabase/functions
 // ============================================================================
 
@@ -22,6 +25,7 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { createAdminClient, type SupabaseClient } from "../_shared/supabase.ts";
 import { hmacSha256Hex, timingSafeEqualHex } from "../_shared/crypto.ts";
+import { expectedServiceRoleKey } from "../_shared/auth.ts";
 
 // NOTE: we intentionally do NOT use `withSupabase({ auth: [...] })` from
 // @supabase/server here. That wrapper requires a Supabase apiKey on every
@@ -39,15 +43,23 @@ const SOURCE = "meta" as const;
 // ---------------------------------------------------------------------------
 const REPLY = {
   checkedIn: "Checked in ✅",
-  needsRenewal: "Your membership needs renewal — [payment link placeholder]",
   membershipCancelled:
     "Your membership is cancelled. Reply PAY to start a new one, or talk to your gym's front desk.",
   noMembership:
     "We couldn't find a membership on file for you — please check with your gym's front desk.",
   notFound: "We couldn't find you — check with your gym's front desk",
-  pay: "[Payment link placeholder — Razorpay integration pending]",
   unknown:
     "Sorry, I didn't understand. Reply IN to check in, or PAY to renew your membership.",
+  // --- Real payment-link outcomes, from requestPaymentLink() below ---
+  paymentLinkSentToday:
+    "We already sent you a payment link earlier today — check your recent " +
+    "WhatsApp messages, or ask the front desk if you can't find it.",
+  paymentAlreadyPaid:
+    "You're already paid up for this period — no payment needed right now. See you at the gym!",
+  paymentOptedOut:
+    "You've opted out of WhatsApp payment messages — please contact the front desk to renew.",
+  paymentError:
+    "Sorry, we couldn't generate your payment link right now — please contact the front desk to renew.",
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -161,15 +173,76 @@ function formatGymList(options: GymOption[], lead: string): string {
 }
 
 // ===========================================================================
-// OUTBOUND MESSAGING — THE ONE PLACE TO SWAP IN THE REAL META API
+// OUTBOUND MESSAGING — real Meta Cloud API
 // ===========================================================================
 
+const META_API_VERSION = "v21.0";
+
+function isMockMode(): boolean {
+  return (Deno.env.get("WHATSAPP_SEND_MODE") ?? "").trim().toLowerCase() === "mock";
+}
+
 /**
- * "Send" a WhatsApp message to `phone`.
+ * Call the real Meta Cloud API. Never throws — a bad token or a Meta outage
+ * must not crash the webhook; Meta only needs its 200.
+ */
+async function callMetaApi(
+  phone: string,
+  text: string,
+): Promise<{ waMessageId: string | null; status: "sent" | "failed" }> {
+  const accessToken = Deno.env.get("META_ACCESS_TOKEN");
+  const phoneNumberId = Deno.env.get("META_PHONE_NUMBER_ID");
+
+  if (!accessToken || !phoneNumberId) {
+    console.error(
+      "[whatsapp-webhook] CRITICAL: META_ACCESS_TOKEN / META_PHONE_NUMBER_ID not set — cannot send.",
+    );
+    return { waMessageId: null, status: "failed" };
+  }
+
+  try {
+    const res = await fetch(
+      `https://graph.facebook.com/${META_API_VERSION}/${phoneNumberId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          messaging_product: "whatsapp",
+          recipient_type: "individual",
+          to: phone,
+          type: "text",
+          text: { preview_url: false, body: text },
+        }),
+      },
+    );
+
+    const result = await res.json().catch(() => null);
+
+    if (res.ok) {
+      const waMessageId = result?.messages?.[0]?.id ?? null;
+      return { waMessageId, status: "sent" };
+    }
+
+    console.error(`[whatsapp-webhook] Meta send failed (HTTP ${res.status}):`, result);
+    return { waMessageId: null, status: "failed" };
+  } catch (err) {
+    console.error(
+      "[whatsapp-webhook] Meta send threw:",
+      err instanceof Error ? err.message : err,
+    );
+    return { waMessageId: null, status: "failed" };
+  }
+}
+
+/**
+ * Send a WhatsApp message to `phone` and record it in whatsapp_messages.
  *
- * TODO(meta): SIMULATED. Right now this only logs and records the message as
- * 'queued'. When Meta credentials land, replace the marked block below with a
- * real Cloud API POST — no other file needs to change.
+ * Every reply sent from here is a free-form reply to an inbound message, so it
+ * is always within the 24h customer-service window — no template needed.
+ * WHATSAPP_SEND_MODE=mock skips the real call; see ../_shared/whatsapp.ts.
  */
 async function sendWhatsAppMessage(
   supabase: SupabaseClient,
@@ -182,44 +255,20 @@ async function sendWhatsAppMessage(
   } = {},
 ): Promise<void> {
   let waMessageId: string | null = null;
-  let status: "queued" | "sent" | "failed" = "queued";
+  let status: "queued" | "sent" | "failed";
 
-  // ---------------- BEGIN SIMULATED SEND — REPLACE THIS BLOCK ----------------
-  // TODO(meta): swap the console.log for the real Cloud API call:
-  //
-  //   const res = await fetch(
-  //     `https://graph.facebook.com/v21.0/${Deno.env.get("META_PHONE_NUMBER_ID")}/messages`,
-  //     {
-  //       method: "POST",
-  //       headers: {
-  //         authorization: `Bearer ${Deno.env.get("META_ACCESS_TOKEN")}`,
-  //         "content-type": "application/json",
-  //       },
-  //       body: JSON.stringify({
-  //         messaging_product: "whatsapp",
-  //         recipient_type: "individual",
-  //         to: phone,
-  //         type: "text",
-  //         text: { preview_url: false, body: text },
-  //       }),
-  //     },
-  //   );
-  //   const result = await res.json();
-  //   if (res.ok) {
-  //     waMessageId = result?.messages?.[0]?.id ?? null;
-  //     status = "sent";
-  //   } else {
-  //     status = "failed";
-  //     console.error("[whatsapp-webhook] Meta send failed", res.status, result);
-  //   }
-  //
-  // Also note: outside the 24h customer-service window Meta rejects free-form
-  // text and only allows approved templates — that is what `templateName` and
-  // the REPLY map above are staged for.
-  console.log(
-    `[whatsapp-webhook] SIMULATED SEND -> to=${phone} text=${JSON.stringify(text)}`,
-  );
-  // ----------------- END SIMULATED SEND — REPLACE THIS BLOCK -----------------
+  if (isMockMode()) {
+    console.log(
+      `[whatsapp-webhook] WHATSAPP_SEND_MODE=mock — not calling Meta. to=${phone} text=${
+        JSON.stringify(text)
+      }`,
+    );
+    status = "queued";
+  } else {
+    const outcome = await callMetaApi(phone, text);
+    waMessageId = outcome.waMessageId;
+    status = outcome.status;
+  }
 
   // The whatsapp_messages row is real either way — it is our outbound audit log.
   const { error } = await supabase.from("whatsapp_messages").insert({
@@ -236,6 +285,122 @@ async function sendWhatsAppMessage(
     // Never let logging failure break the webhook — Meta only needs its 200.
     console.error("[whatsapp-webhook] failed to log outbound message:", error);
   }
+}
+
+// ===========================================================================
+// PAYMENT LINKS — real, via an internal call to send-renewal-reminder
+// ===========================================================================
+// A member texting PAY (or checking IN with a past_due/expired membership)
+// needs a real Razorpay payment link. Rather than duplicate link creation,
+// idempotency and guard logic here, this calls send-renewal-reminder the same
+// way renewal-scan does — service-role-to-service-role, one membership at a
+// time. That function already sends the WhatsApp message itself (with the
+// real link) on success, so requestPaymentLink() returns `null` in that case:
+// "already handled, nothing more to say." It only returns text for outcomes
+// that need a DIFFERENT reply than a silent success — a skip, or a failure.
+
+/** http://kong:8000 locally, https://<project-ref>.supabase.co when deployed. */
+function reminderUrl(): string | null {
+  const override = Deno.env.get("SEND_RENEWAL_REMINDER_URL");
+  if (override) return override;
+
+  const base = Deno.env.get("SUPABASE_URL");
+  return base
+    ? `${base.replace(/\/+$/, "")}/functions/v1/send-renewal-reminder`
+    : null;
+}
+
+/** The member's current-period membership — same "latest by period end" pick as handleCheckin. */
+async function loadLatestMembership(
+  supabase: SupabaseClient,
+  organizationId: string,
+  memberId: string,
+): Promise<{ id: string } | null> {
+  const { data, error } = await supabase
+    .from("memberships")
+    .select("id")
+    .eq("organization_id", organizationId)
+    .eq("member_id", memberId)
+    .order("current_period_end", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  return data;
+}
+
+/**
+ * Ask send-renewal-reminder for a real payment link on `membershipId`.
+ *
+ * Returns `null` when send-renewal-reminder already sent the WhatsApp message
+ * itself (created or reused a link) — the caller must NOT send anything else.
+ * Returns reply text for every other outcome (skip or failure), since those
+ * leave the member with no message otherwise.
+ *
+ * NEVER THROWS — mirrors renewal-scan's sendOne(): a network hiccup or a
+ * malformed response here must fall back to REPLY.paymentError, not crash the
+ * webhook.
+ */
+async function requestPaymentLink(membershipId: string): Promise<string | null> {
+  const url = reminderUrl();
+  const serviceKey = expectedServiceRoleKey();
+
+  if (!url || !serviceKey) {
+    console.error(
+      "[whatsapp-webhook] CRITICAL: cannot reach send-renewal-reminder — " +
+        `${!url ? "SUPABASE_URL" : "SUPABASE_SERVICE_ROLE_KEY"} not set.`,
+    );
+    return REPLY.paymentError;
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${serviceKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ membership_id: membershipId }),
+    });
+  } catch (err) {
+    console.error(
+      "[whatsapp-webhook] send-renewal-reminder call threw:",
+      err instanceof Error ? err.message : err,
+    );
+    return REPLY.paymentError;
+  }
+
+  const body = await res.json().catch(() => null);
+
+  if (body === null || !res.ok || body.ok !== true) {
+    console.error(
+      `[whatsapp-webhook] send-renewal-reminder returned an error (HTTP ${res.status}):`,
+      body,
+    );
+    return REPLY.paymentError;
+  }
+
+  switch (body.skipped) {
+    case "already_sent_today":
+      return REPLY.paymentLinkSentToday;
+    case "already_paid":
+      return REPLY.paymentAlreadyPaid;
+    case "whatsapp_opt_out":
+      return REPLY.paymentOptedOut;
+  }
+
+  if (body.created === true || body.reused === true) {
+    // send-renewal-reminder already sent the WhatsApp message with the link.
+    return null;
+  }
+
+  console.error(
+    "[whatsapp-webhook] send-renewal-reminder returned an unrecognised shape:",
+    body,
+  );
+  return REPLY.paymentError;
 }
 
 /** Record the inbound message for audit / support history. */
@@ -341,7 +506,7 @@ async function handleCheckin(
   supabase: SupabaseClient,
   memberId: string,
   organizationId: string,
-): Promise<string> {
+): Promise<string | null> {
   // Most recent membership for this member, by period end.
   const { data: membership, error } = await supabase
     .from("memberships")
@@ -358,9 +523,9 @@ async function handleCheckin(
 
   if (membership.status === "past_due" || membership.status === "expired") {
     // No attendance row: an unpaid member must not be able to self-check-in.
-    // TODO(razorpay): create/reuse a payment link here and substitute it into
-    // the reply, then set whatsapp_messages.related_payment_id on the outbound row.
-    return REPLY.needsRenewal;
+    // Real payment link, sent by send-renewal-reminder itself on success —
+    // see requestPaymentLink() above.
+    return await requestPaymentLink(membership.id);
   }
 
   if (membership.status === "cancelled") return REPLY.membershipCancelled;
@@ -553,8 +718,9 @@ async function handleWebhook(req: Request): Promise<Response> {
     // Done before the reply so the whatsapp_messages log reads chronologically.
     await logInboundMessage(supabase, message, { memberId, organizationId });
 
-    // --- (d) Decide the reply. ---
-    let reply: string;
+    // --- (d) Decide the reply. `null` means "already sent elsewhere" (see
+    // --- requestPaymentLink()) — no further send happens at step (e).
+    let reply: string | null;
 
     if (resolution.kind === "not_found") {
       reply = REPLY.notFound;
@@ -581,22 +747,29 @@ async function handleWebhook(req: Request): Promise<Response> {
         case "switch":
           reply = await handleSwitch(supabase, phone);
           break;
-        case "pay":
-          // TODO(razorpay): create a Razorpay payment link for the member's
-          // outstanding membership, insert a `payments` row (status 'pending',
-          // with idempotency_key), and put the real link in this reply.
-          reply = REPLY.pay;
+        case "pay": {
+          const membership = await loadLatestMembership(
+            supabase,
+            resolution.organizationId,
+            resolution.memberId,
+          );
+          reply = membership
+            ? await requestPaymentLink(membership.id)
+            : REPLY.noMembership;
           break;
+        }
         default:
           reply = REPLY.unknown;
       }
     }
 
-    // --- (e) "Send" the reply. ---
-    await sendWhatsAppMessage(supabase, phone, reply, {
-      memberId,
-      organizationId,
-    });
+    // --- (e) "Send" the reply, unless requestPaymentLink() already sent one. ---
+    if (reply !== null) {
+      await sendWhatsAppMessage(supabase, phone, reply, {
+        memberId,
+        organizationId,
+      });
+    }
 
     // --- (g) Mark the event processed. ---
     const { error: processedError } = await supabase

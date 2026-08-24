@@ -20,6 +20,18 @@
 #                and missing-signature cases expect 403.
 #   permissive → META_APP_SECRET was not set in the serve environment, so
 #                requests go unsigned and the two signature cases report SKIP.
+#
+# OUTBOUND SENDING: every case below that gets a reply triggers a real send
+# through sendWhatsAppMessage() (see index.ts), which calls Meta's Cloud API
+# LIVE by default. This suite REFUSES TO RUN unless WHATSAPP_SEND_MODE=mock is
+# set in the serving environment — see the preflight check below — so it can
+# never fire a real WhatsApp message at the seeded test phone numbers.
+#
+# PAY / past_due 'in': also REAL Razorpay. Both intents now call
+# send-renewal-reminder internally (see requestPaymentLink() in index.ts),
+# which creates a real Razorpay TEST MODE payment link — same as
+# send-renewal-reminder/test.sh does directly. Nothing is charged; this suite
+# refuses to run against an rzp_live_ key, same guard as that suite.
 # ---------------------------------------------------------------------------
 
 set -uo pipefail
@@ -57,6 +69,8 @@ read_env() {
 
 VERIFY_TOKEN="${META_VERIFY_TOKEN:-$(read_env META_VERIFY_TOKEN)}"
 APP_SECRET="${META_APP_SECRET:-$(read_env META_APP_SECRET)}"
+WA_SEND_MODE="${WHATSAPP_SEND_MODE:-$(read_env WHATSAPP_SEND_MODE)}"
+RZP_KEY_ID="${RAZORPAY_KEY_ID:-$(read_env RAZORPAY_KEY_ID)}"
 
 have_psql=false
 if docker exec "$DB_CONTAINER" true >/dev/null 2>&1; then have_psql=true; fi
@@ -174,6 +188,30 @@ assert_db() {
 printf '\n%s== mock-meta webhook tests ==%s\n' "$B" "$N"
 printf 'target: %s\n' "$BASE_URL"
 
+if [ "$(printf '%s' "$WA_SEND_MODE" | tr '[:upper:]' '[:lower:]')" != "mock" ]; then
+  printf '\n%sREFUSING TO RUN%s WHATSAPP_SEND_MODE is not "mock" in %s (got: %s).\n' \
+    "$R" "$N" "$ENV_FILE" "${WA_SEND_MODE:-<unset>}"
+  printf '        Every reply this suite triggers calls sendWhatsAppMessage(), which hits\n'
+  printf '        the real Meta Cloud API LIVE by default. Set WHATSAPP_SEND_MODE=mock in\n'
+  printf '        %s and restart `supabase functions serve` before running this suite,\n' "$ENV_FILE"
+  printf '        or it will send real WhatsApp messages to the seeded test phone numbers.\n\n'
+  exit 1
+fi
+
+if [ -z "$RZP_KEY_ID" ]; then
+  printf '\n%sERROR%s no RAZORPAY_KEY_ID found in %s\n' "$R" "$N" "$ENV_FILE"
+  printf '        The PAY / past_due-checkin cases call send-renewal-reminder, which returns\n'
+  printf '        500 razorpay_not_configured without it.\n\n'
+  exit 1
+fi
+case "$RZP_KEY_ID" in
+  rzp_test_*) printf 'razorpay: %s %s(TEST MODE)%s\n' "$RZP_KEY_ID" "$G" "$N" ;;
+  rzp_live_*) printf '\n%sREFUSING TO RUN%s RAZORPAY_KEY_ID is a LIVE key (%s).\n' "$R" "$N" "$RZP_KEY_ID"
+              printf '        The PAY / past_due-checkin cases create real payment links. Use test-mode keys.\n\n'
+              exit 1 ;;
+  *)          printf 'razorpay: %s %s(unrecognised key prefix)%s\n' "$RZP_KEY_ID" "$Y" "$N" ;;
+esac
+
 if ! curl -s -o /dev/null --max-time 5 "$BASE_URL"; then
   printf '\n%sERROR%s cannot reach the function. Start it with:\n' "$R" "$N"
   printf '  supabase functions serve whatsapp-webhook --env-file supabase/functions/.env\n\n'
@@ -273,9 +311,23 @@ assert_db       "active member 'in' records attendance" "1" "$(attendance_count 
 
 got=$(send_message "$PHONE_PAST_DUE" "wamid.$RUN.a2" "in")
 assert_contains "past_due member 'in' resolves"      '"resolution":"resolved"' "$got"
-assert_db       "past_due member 'in' replies renewal" \
-  "Your membership needs renewal — [payment link placeholder]" "$(last_reply "$PHONE_PAST_DUE")"
+reply=$(last_reply "$PHONE_PAST_DUE")
+assert_contains "past_due member 'in' gets a real payment link" \
+  "Pay here to continue: https://rzp.io/" "$reply"
+assert_contains "past_due member 'in' reply names them"          "Bharat Rao" "$reply"
 assert_db       "past_due member 'in' records NO attendance" "0" "$(attendance_count "$PHONE_PAST_DUE")"
+
+printf '\n  %sREAL RAZORPAY LINK CREATED%s (via send-renewal-reminder, PHONE_PAST_DUE):\n    %s\n\n' \
+  "$B" "$N" "$reply"
+
+# A second ask the SAME day must not create a second link or re-send the
+# message — send-renewal-reminder's own once-per-day guard fires, and
+# requestPaymentLink() must turn that into an honest reply, not silence.
+got=$(send_message "$PHONE_PAST_DUE" "wamid.$RUN.a2b" "PAY")
+assert_contains "repeat 'PAY' the same day resolves"  '"resolution":"resolved"' "$got"
+assert_db       "repeat 'PAY' the same day says a link was already sent" \
+  "We already sent you a payment link earlier today — check your recent WhatsApp messages, or ask the front desk if you can't find it." \
+  "$(last_reply "$PHONE_PAST_DUE")"
 
 # ---------------------------------------------------------------------------
 # 4. Tenant resolution
@@ -313,8 +365,12 @@ printf '\n%s-- other intents --%s\n' "$B" "$N"
 
 got=$(send_message "$PHONE_ACTIVE" "wamid.$RUN.c1" "PAY")
 assert_contains "'PAY' resolves" '"resolution":"resolved"' "$got"
-assert_db       "'PAY' replies payment placeholder" \
-  "[Payment link placeholder — Razorpay integration pending]" "$(last_reply "$PHONE_ACTIVE")"
+pay_reply=$(last_reply "$PHONE_ACTIVE")
+assert_contains "'PAY' from an active member also gets a real payment link" \
+  "Pay here to continue: https://rzp.io/" "$pay_reply"
+
+printf '\n  %sREAL RAZORPAY LINK CREATED%s (via send-renewal-reminder, PHONE_ACTIVE / PAY):\n    %s\n\n' \
+  "$B" "$N" "$pay_reply"
 
 got=$(send_message "$PHONE_ACTIVE" "wamid.$RUN.c2" "hello there")
 assert_contains "gibberish resolves" '"resolution":"resolved"' "$got"

@@ -33,3 +33,31 @@ export function createAdminClient(): SupabaseClient {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 }
+
+/**
+ * A client keyed on the ANON key, RLS fully in effect.
+ *
+ * staff-login needs this for exactly one call: `auth.verifyOtp()`, to redeem
+ * the admin-generated magic-link token into a real session. That redemption
+ * is a public GoTrue endpoint gated on `apikey` alone — using the anon key
+ * here (rather than reusing createAdminClient()) keeps the distinction
+ * between "server minting a link" (needs service_role) and "redeeming a
+ * token" (does not) visible in the code, matching how the underlying GoTrue
+ * REST API itself separates /admin/generate_link from /verify.
+ */
+export function createAnonClient(): SupabaseClient {
+  const url = Deno.env.get("SUPABASE_URL");
+  // Confirmed present under this exact name in the edge runtime env (unlike
+  // the service-role key, there is no SUPABASE_INTERNAL_PUBLISHABLE_KEY
+  // fallback needed here — verified via `docker exec ... env` rather than
+  // assumed).
+  const anonKey = Deno.env.get("SUPABASE_ANON_KEY");
+
+  if (!url || !anonKey) {
+    throw new Error("Missing SUPABASE_URL or SUPABASE_ANON_KEY");
+  }
+
+  return createClient(url, anonKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
