@@ -262,9 +262,11 @@ got=$(curl -s -X GET "$BASE_URL" -H "Authorization: Bearer $SERVICE_KEY")
 assert_contains "GET is rejected (this endpoint is POST-only)" 'method_not_allowed' "$got"
 
 # This function writes membership status — an unauthorized caller must not have
-# been able to change anything.
+# been able to change anything. Scoped to this suite's 4 known fixtures, not a
+# global count — seed.sql now realistically seeds past_due/expired/cancelled
+# memberships elsewhere, which this assertion was never testing against.
 assert_db "rejected calls changed no membership status" \
-  "0" "$(sql "select count(*) from memberships where status='past_due' and id<>'$MEM_BHARAT';")"
+  "0" "$(sql "select count(*) from memberships where status='past_due' and id<>'$MEM_BHARAT' and id in ('$MEM_ASHA','$MEM_BHARAT','$MEM_CHITRA_IT','$MEM_CHITRA_FF');")"
 
 # ---------------------------------------------------------------------------
 # 2. Input validation
@@ -304,7 +306,7 @@ assert_not_contains "dry run excludes the membership due TOMORROW" "$MEM_CHITRA_
 assert_db "dry run left Asha active"      "active" "$(status_of "$MEM_ASHA")"
 assert_db "dry run left Bharat active"    "active" "$(status_of "$MEM_BHARAT")"
 assert_db "dry run changed nothing at all" \
-  "0" "$(sql "select count(*) from memberships where status='past_due';")"
+  "0" "$(sql "select count(*) from memberships where status='past_due' and id in ('$MEM_ASHA','$MEM_BHARAT','$MEM_CHITRA_IT','$MEM_CHITRA_FF');")"
 
 # ---------------------------------------------------------------------------
 # 4. Real run — the boundary
@@ -332,8 +334,13 @@ assert_db "membership due TOMORROW is still active" \
 # Nothing but status may have moved.
 assert_db "current_period_end was not modified" \
   "2" "$(sql "select count(*) from memberships where id in ('$MEM_ASHA','$MEM_BHARAT') and current_period_end < CURRENT_DATE;")"
+# Scoped to this suite's 4 known fixtures — mark-overdue never sets
+# expired/cancelled itself (only active->past_due), so this is really asking
+# "did this function touch a status it has no business touching" for the rows
+# it actually operated on. seed.sql now realistically seeds real
+# expired/cancelled memberships elsewhere on purpose.
 assert_db "no membership was pushed to expired or cancelled" \
-  "0" "$(sql "select count(*) from memberships where status in ('expired','cancelled');")"
+  "0" "$(sql "select count(*) from memberships where status in ('expired','cancelled') and id in ('$MEM_ASHA','$MEM_BHARAT','$MEM_CHITRA_IT','$MEM_CHITRA_FF');")"
 
 # ---------------------------------------------------------------------------
 # 5. Re-running is safe
@@ -348,8 +355,8 @@ assert_contains "second run is still ok:true"        '"ok":true' "$got"
 assert_equals   "second run returns 200"             "200" "$(post_status '{}')"
 
 assert_db "already-past_due rows were left alone" "past_due" "$(status_of "$MEM_ASHA")"
-assert_db "still exactly two past_due" \
-  "2" "$(sql "select count(*) from memberships where status='past_due';")"
+assert_db "still exactly two past_due (of this suite's 4 known fixtures)" \
+  "2" "$(sql "select count(*) from memberships where status='past_due' and id in ('$MEM_ASHA','$MEM_BHARAT','$MEM_CHITRA_IT','$MEM_CHITRA_FF');")"
 
 got=$(post '{}')
 assert_equals "a third run also transitions nothing" "0" "$(field_num transitioned "$got")"

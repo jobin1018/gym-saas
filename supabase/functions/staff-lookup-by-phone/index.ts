@@ -33,9 +33,16 @@
 // separately would add complexity without closing a real gap. A basic format
 // sanity check still guards against obviously garbage input reaching the DB.
 // ============================================================================
+//
+// One of exactly two functions in this project ever called directly from a
+// browser (staff-login is the other) — every other function is a provider
+// webhook, pg_cron, or curl. That means this is one of exactly two functions
+// CORS applies to at all; see ../_shared/cors.ts for the shared handling.
+// ============================================================================
 
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { createAdminClient } from "../_shared/supabase.ts";
+import { corsJson as json, corsPreflightResponse } from "../_shared/cors.ts";
 
 const TAG = "staff-lookup-by-phone";
 
@@ -51,13 +58,6 @@ function normalizePhone(raw: string): string {
 }
 
 const PHONE_RE = /^\d{7,15}$/;
-
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
 
 interface Match {
   organization_id: string;
@@ -117,6 +117,9 @@ async function handleLookup(req: Request): Promise<Response> {
 }
 
 Deno.serve(async (req: Request) => {
+  // Must answer OPTIONS before any other logic — see ../_shared/cors.ts.
+  if (req.method === "OPTIONS") return corsPreflightResponse();
+
   if (req.method !== "POST") {
     return json({ error: "method_not_allowed" }, 405);
   }

@@ -45,6 +45,23 @@ MEM_CHITRA_FF=f4444444-4444-4444-4444-444444444444
 ORG_IRON=11111111-1111-1111-1111-111111111111
 LOC_IRON=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
 
+# seed.sql's own extra memberships that land exactly on the default +7/+3
+# offsets (see that file's comments) — deliberately, to prove the scan hits
+# real data beyond this suite's 4 arranged fixtures. Tracked explicitly here
+# so arrange_empty() can push them out of range too (see its own note) and
+# restore_extra_window_memberships() can put them back.
+#
+# Only 2, not every "due soon" member in seed.sql — creating too many REAL
+# Razorpay links in one batch (this section originally tried 5 extras, for 7
+# total) reliably tripped Razorpay's test-mode rate limit on a real run, not
+# a hypothetical: 2 of the 7 came back "Too many requests" on repeated tries.
+# 4 total (2 arranged + these 2) matches this suite's own long-documented
+# concern about batch size vs Razorpay throughput (see the "partial failure"
+# section's note below). seed.sql's other near-window members were moved to
+# safely-outside dates (+9 to +13) for this reason, not deleted.
+MEM_SNEHA=70000000-0000-0000-0000-000000000002     # Iron Temple, +7, ₹1200
+MEM_PRIYANKA=70000000-0000-0000-0000-000000000012  # PowerHouse,  +3, ₹2500
+
 # Throwaway fixtures created by this suite to force a mid-batch failure.
 # A plan priced at 0.00 makes send-renewal-reminder answer 500
 # plan_amount_invalid — a real failure path, not a mocked one.
@@ -206,7 +223,27 @@ SQL
 # Everything far away -> zero matches.
 arrange_empty() {
   $have_psql || return 0
+  # Genuinely global on purpose — section 4 needs the scan to find LITERALLY
+  # NOTHING, so every membership in the database (this suite's 4 known
+  # fixtures, seed.sql's 5 extra in-window ones, and everything else) gets
+  # pushed out of range. The 5 extras are put back by
+  # restore_extra_window_memberships() wherever a later section needs the
+  # real in-window state again (see that function's own note — an earlier
+  # version of this function was accidentally scoped to just the 4 known
+  # IDs, which fixed section 4 but broke section 5's counts a different way).
   sql "update memberships set current_period_end = CURRENT_DATE + 400;" >/dev/null
+}
+
+# Puts seed.sql's 5 extra in-window memberships (see the MEM_SNEHA etc.
+# constants above) back at their real +7/+3 offsets after arrange_empty() has
+# swept everything out of range. Needed anywhere a section relies on the
+# natural "7 memberships in window" state following section 4.
+restore_extra_window_memberships() {
+  $have_psql || return 0
+  docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+UPDATE memberships SET current_period_end = CURRENT_DATE + 7 WHERE id = '$MEM_SNEHA';
+UPDATE memberships SET current_period_end = CURRENT_DATE + 3 WHERE id = '$MEM_PRIYANKA';
+SQL
 }
 
 # A membership on offset +7 whose plan costs ₹0. send-renewal-reminder rejects
@@ -361,7 +398,13 @@ got=$(post '{"dry_run":true}')
 assert_contains "response is flagged as a dry run"   '"dry_run":true' "$got"
 assert_contains "dry run reports the offsets used"   '"offset_days":[7,3]' "$got"
 assert_contains "dry run names the two target dates" '"target_dates":[' "$got"
-assert_equals   "dry run matched the 2 in-window memberships" "2" "$(field_num matched "$got")"
+# 4 now, not 2: seed.sql seeds 2 real additional memberships at exactly
+# +7/+3 days (Sneha @ Iron Temple, Priyanka @ PowerHouse) on top of the 2
+# arrange_window() controls — deliberately, to prove the scan's default
+# offsets hit real data, not just arranged fixtures. Kept to 2 extras, not
+# every near-window seed member, to keep this section's real Razorpay batch
+# size reasonable (see MEM_SNEHA/MEM_PRIYANKA's own note above).
+assert_equals   "dry run matched the 4 in-window memberships" "4" "$(field_num matched "$got")"
 
 # Requirement 5: membership ids, member names and amounts.
 assert_contains "dry run lists the membership id"  "\"membership_id\":\"$MEM_ASHA\"" "$got"
@@ -369,7 +412,7 @@ assert_contains "dry run lists the member name"    '"member_name":"Asha Menon"' 
 assert_contains "dry run lists the amount"         '"amount":1500' "$got"
 assert_contains "dry run lists the plan name"      '"plan_name":"Monthly Unlimited"' "$got"
 assert_contains "dry run shows days_until_due"     '"days_until_due":7' "$got"
-assert_contains "dry run totals the amount at risk" '"total_amount":3000' "$got"
+assert_contains "dry run totals the amount at risk" '"total_amount":6700' "$got"
 assert_contains "dry run says skip guards are NOT evaluated" '"note":"Selection only.' "$got"
 
 # Selection correctness, stated as exclusions.
@@ -422,12 +465,14 @@ printf '\n%s-- real scan --%s\n' "$B" "$N"
 
 reset_state
 arrange_window
+restore_extra_window_memberships
 
 got=$(post '{}')
 
 assert_contains "real scan is not flagged dry"  '"dry_run":false' "$got"
-assert_equals   "scanned both in-window memberships" "2" "$(field_num scanned "$got")"
-assert_equals   "both reminders were created"        "2" "$(field_num created "$got")"
+# 4, not 2 — same real-data expansion as the dry_run section above.
+assert_equals   "scanned all 4 in-window memberships" "4" "$(field_num scanned "$got")"
+assert_equals   "all 4 reminders were created"        "4" "$(field_num created "$got")"
 assert_equals   "nothing errored"                    "0" "$(field_num errored "$got")"
 assert_equals   "nothing was skipped"                "0" "$(field_num skipped "$got")"
 assert_contains "response carries real payment links" '"payment_url":"https://rzp.io/' "$got"
@@ -437,8 +482,8 @@ printf '\n  %sREAL RAZORPAY LINKS CREATED%s — verify these in the dashboard:\n
 print_links "$got"
 printf '\n'
 
-assert_db "two payment rows were created by the fan-out" "2" "$(renewal_payments)"
-assert_db "two reminders were logged"                    "2" "$(renewal_messages)"
+assert_db "four payment rows were created by the fan-out" "4" "$(renewal_payments)"
+assert_db "four reminders were logged"                    "4" "$(renewal_messages)"
 assert_db "Asha got a payment row"  "1" "$(sql "select count(*) from payments where membership_id='$MEM_ASHA' and idempotency_key like 'renewal-%';")"
 assert_db "Bharat (past_due) got a payment row" "1" "$(sql "select count(*) from payments where membership_id='$MEM_BHARAT' and idempotency_key like 'renewal-%';")"
 assert_db "the +5 membership was NOT contacted" \
@@ -446,16 +491,16 @@ assert_db "the +5 membership was NOT contacted" \
 assert_db "the cancelled membership was NOT contacted" \
   "0" "$(sql "select count(*) from payments where membership_id='$MEM_CHITRA_FF' and idempotency_key like 'renewal-%';")"
 assert_db "every payment row is pending with a link and no payment id yet" \
-  "2" "$(sql "select count(*) from payments where idempotency_key like 'renewal-%' and status='pending' and razorpay_link_id is not null and provider_payment_id is null;")"
+  "4" "$(sql "select count(*) from payments where idempotency_key like 'renewal-%' and status='pending' and razorpay_link_id is not null and provider_payment_id is null;")"
 
 # --- Re-running the same day must delegate to the reminder's own guard ---
 got=$(post '{}')
 assert_equals   "same-day re-scan created nothing new" "0" "$(field_num created "$got")"
-assert_equals   "same-day re-scan skipped both"        "2" "$(field_num skipped "$got")"
+assert_equals   "same-day re-scan skipped all 4"       "4" "$(field_num skipped "$got")"
 assert_contains "skips are attributed to already_sent_today" \
-  '"already_sent_today":2' "$got"
-assert_db "same-day re-scan created no extra payment rows" "2" "$(renewal_payments)"
-assert_db "same-day re-scan queued no extra messages"      "2" "$(renewal_messages)"
+  '"already_sent_today":4' "$got"
+assert_db "same-day re-scan created no extra payment rows" "4" "$(renewal_payments)"
+assert_db "same-day re-scan queued no extra messages"      "4" "$(renewal_messages)"
 
 # --- A later day: same period, so the link is reused, not recreated ---
 if ! $have_psql; then
@@ -463,9 +508,9 @@ if ! $have_psql; then
 else
   clear_todays_messages
   got=$(post '{}')
-  assert_equals "next-day scan reused both payment rows" "2" "$(field_num reused "$got")"
-  assert_equals "next-day scan created nothing new"      "0" "$(field_num created "$got")"
-  assert_db "still only two payment rows for the period" "2" "$(renewal_payments)"
+  assert_equals "next-day scan reused all 4 payment rows" "4" "$(field_num reused "$got")"
+  assert_equals "next-day scan created nothing new"       "0" "$(field_num created "$got")"
+  assert_db "still only four payment rows for the period" "4" "$(renewal_payments)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -498,10 +543,11 @@ else
       skipped "a failing membership does not abort the batch" \
         "Razorpay rate-limited this run; counts below are not meaningful. Re-run in a minute." ;;
     *)
-      assert_equals   "all three memberships were attempted" "3" "$(field_num scanned "$got")"
+      # 5 = the 4 in-window memberships from section 5 + this one ₹0-plan fixture.
+      assert_equals   "all 5 memberships were attempted"     "5" "$(field_num scanned "$got")"
       assert_equals   "exactly one errored"                  "1" "$(field_num errored "$got")"
-      # The point of the test: the other two completed rather than being abandoned.
-      assert_equals   "the other two still completed"        "2" "$(field_num reused "$got")"
+      # The point of the test: the other four completed rather than being abandoned.
+      assert_equals   "the other four still completed"       "4" "$(field_num reused "$got")"
       assert_contains "the failing membership id is reported for follow-up" \
         "\"errored_membership_ids\":[\"$BAD_MEMBERSHIP\"]" "$got"
       assert_contains "the failure reason is surfaced" '"error":"plan_amount_invalid"' "$got"
@@ -510,8 +556,8 @@ else
       assert_contains "a partial failure is still ok:true overall" '"ok":true' "$got"
       assert_equals   "a partial failure still returns 200, not 5xx" "200" "$(post_status '{"dry_run":true}')"
 
-      assert_db "the two healthy memberships kept their payment rows" \
-        "2" "$(renewal_payments)"
+      assert_db "the four healthy memberships kept their payment rows" \
+        "4" "$(renewal_payments)"
       assert_db "the failing membership got no payment row" \
         "0" "$(sql "select count(*) from payments where membership_id='$BAD_MEMBERSHIP';")"
       assert_db "the failing membership got no message" \
@@ -519,11 +565,14 @@ else
       ;;
   esac
 
-  # Ordering guarantee: current_period_end ascending. Bharat (+3) must be
-  # attempted before the two +7 rows, so an aborted run always favours the
-  # member closest to losing access.
+  # Ordering guarantee: current_period_end ascending, id ascending as a
+  # stable tiebreak (selectDueMemberships()'s own documented behaviour).
+  # Bharat and Priyanka are BOTH at +3 now (seed.sql) — a genuine tie the
+  # original version of this assertion predates. Priyanka's membership id
+  # ('70000000-...') sorts before Bharat's ('f2222222-...'), so she wins the
+  # tiebreak and is processed first. Confirmed against real, repeated output.
   first_id=$(printf '%s' "$got" | sed -n 's/.*"results":\[{"membership_id":"\([^"]*\)".*/\1/p' | head -1)
-  assert_equals "soonest-due membership was processed first" "$MEM_BHARAT" "$first_id"
+  assert_equals "soonest-due membership was processed first (tiebreak by id)" "$MEM_PRIYANKA" "$first_id"
 fi
 
 # ---------------------------------------------------------------------------

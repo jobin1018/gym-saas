@@ -178,11 +178,13 @@ UPDATE memberships SET status='active',   current_period_end=CURRENT_DATE + 25 W
 SQL
 }
 
-# Iron Temple gets realistic numbers:
-#   due this week : Asha (+2, ₹1500) + Chitra IT (+6, ₹1500) = 2, ₹3,000
-#   overdue       : Bharat (-10, ₹1500)                      = 1, ₹1,500
-# FlexFit is left with nothing due and nothing overdue (Chitra FF at +25),
-# which is the "zero activity" organization for the batch tests.
+# Iron Temple gets realistic numbers from these 4 arranged memberships PLUS
+# seed.sql's own additional Iron Temple members (Sneha/Manoj due, Ritu/Ajay
+# overdue) — see the real totals (5700/4200) at the assertion site below.
+# Chitra FF is left comfortably future (+25) on purpose, but FlexFit is NOT
+# naturally zero-activity any more either, now that seed.sql seeds its own
+# extra FlexFit members too — see arrange_flex_quiet() below, used only by
+# the "zero-activity organization" section that specifically needs it.
 arrange_activity() {
   $have_psql || return 0
   docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
@@ -190,6 +192,19 @@ UPDATE memberships SET status='active',   current_period_end=CURRENT_DATE + 2  W
 UPDATE memberships SET status='past_due', current_period_end=CURRENT_DATE - 10 WHERE id='$MEM_BHARAT';
 UPDATE memberships SET status='active',   current_period_end=CURRENT_DATE + 6  WHERE id='$MEM_CHITRA_IT';
 UPDATE memberships SET status='active',   current_period_end=CURRENT_DATE + 25 WHERE id='$MEM_CHITRA_FF';
+SQL
+}
+
+# Pushes seed.sql's own extra FlexFit members (Rakesh/Anjali/Vivek/Kiran —
+# not part of the 4 legacy IDs arrange_activity() controls) safely outside
+# any due/overdue window, so FlexFit can still serve as the "zero activity"
+# case the next section specifically needs. Comfortably-future dates rather
+# than deletion — keeps the rows intact for every other suite/manual use.
+arrange_flex_quiet() {
+  $have_psql || return 0
+  docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+UPDATE memberships SET current_period_end = CURRENT_DATE + 90
+ WHERE organization_id = '$ORG_FLEX' AND id <> '$MEM_CHITRA_FF';
 SQL
 }
 
@@ -352,11 +367,19 @@ assert_contains "outcome is computed, never sent"      '"outcome":"computed"' "$
 assert_not_contains "a dry run never reports anything as sent" '"outcome":"sent"' "$got"
 assert_contains "the org timezone is resolved from locations" '"timezone":"Asia/Kolkata"' "$got"
 
-# (7) The computed numbers.
-assert_contains "renewals due this week counted"  '"renewals_due_count":2' "$got"
-assert_contains "renewals due amount summed"      '"renewals_due_amount":3000' "$got"
-assert_contains "overdue counted"                 '"overdue_count":1' "$got"
-assert_contains "overdue amount summed"           '"overdue_amount":1500' "$got"
+# (7) The computed numbers. seed.sql now seeds real additional Iron Temple
+# members alongside the 4 legacy fixtures arrange_activity() controls —
+# Sneha Gupta (+7d, ₹1200) is also "due this week" (Manoj Tiwari is at +11d,
+# outside the 7-day window — see renewal-scan/test.sh's MEM_SNEHA/
+# MEM_PRIYANKA note for why only 2 seed members sit exactly on an offset);
+# Ritu Sharma (-1d, ₹1200) and Ajay Mishra (-32d, ₹1500) are overdue.
+# Verified against actual output, not hand-derived:
+#   due:     Asha(1500) + Chitra IT(1500) + Sneha(1200) = 4200
+#   overdue: Bharat(1500) + Ritu(1200) + Ajay(1500) = 4200
+assert_contains "renewals due this week counted"  '"renewals_due_count":3' "$got"
+assert_contains "renewals due amount summed"      '"renewals_due_amount":4200' "$got"
+assert_contains "overdue counted"                 '"overdue_count":3' "$got"
+assert_contains "overdue amount summed"           '"overdue_amount":4200' "$got"
 assert_contains "yesterday's check-ins counted"   '"checkins_yesterday":3' "$got"
 assert_contains "failed sends counted"            '"failed_sends":2' "$got"
 
@@ -368,8 +391,8 @@ ok "23:30 IST counts as yesterday and 00:30 IST does not (implied by count of 3)
 # (7) The exact message text.
 assert_contains "message greets with org name and date" \
   'Good morning! Iron Temple Gym — ' "$got"
-assert_contains "message has the renewals line"  '💰 Renewals due this week: 2 (₹3,000)' "$got"
-assert_contains "message has the overdue line"   '⚠️ Overdue: 1 member, ₹1,500 pending' "$got"
+assert_contains "message has the renewals line"  '💰 Renewals due this week: 3 (₹4,200)' "$got"
+assert_contains "message has the overdue line"   '⚠️ Overdue: 3 members, ₹4,200 pending' "$got"
 assert_contains "message has the check-ins line" '✅ Yesterday: 3 check-ins' "$got"
 assert_contains "message has the failure line"   '❌ 2 messages failed to send — tap to review' "$got"
 
@@ -387,6 +410,7 @@ printf '\n'
 # ---------------------------------------------------------------------------
 printf '\n%s-- zero-activity organization --%s\n' "$B" "$N"
 
+arrange_flex_quiet
 got=$(post "{\"dry_run\":true,\"organization_id\":\"$ORG_FLEX\"}")
 
 assert_contains "quiet org is still computed"      '"outcome":"computed"' "$got"
@@ -481,10 +505,14 @@ else
 
   got=$(post '{}')
 
-  assert_equals   "both briefable orgs were attempted" "2" "$(field_num organization_count "$got")"
+  # 4 briefable orgs now (Iron Temple, FlexFit, PowerHouse, Fitline) — seed.sql
+  # added PowerHouse (active) and Fitline (trial); Bodyline (suspended) and
+  # the throwaway ORG_SUSPENDED are correctly excluded either way.
+  assert_equals   "all 4 briefable orgs were attempted" "4" "$(field_num organization_count "$got")"
   assert_equals   "exactly one org errored"            "1" "$(field_num errored "$got")"
-  # The point of the test: the healthy org was still briefed.
-  assert_equals   "the healthy org was still sent its brief" "1" "$(field_num sent "$got")"
+  # The point of the test: the healthy orgs were still briefed (3 of the 4 —
+  # only Iron Temple's owner_phone was broken above).
+  assert_equals   "the healthy orgs were still sent their briefs" "3" "$(field_num sent "$got")"
   assert_contains "the failing org is named for follow-up" \
     "\"errored_organization_ids\":[\"$ORG_IRON\"]" "$got"
   assert_contains "the failure reason is surfaced" '"error":"owner_phone_missing"' "$got"
@@ -503,8 +531,10 @@ else
   got=$(post '{}')
   assert_equals   "the repaired org is briefed on the next run" "1" "$(field_num sent "$got")"
   assert_equals   "nothing errors after the repair"             "0" "$(field_num errored "$got")"
-  assert_contains "the already-briefed org is skipped, not re-sent" \
-    '"already_sent_today":1' "$got"
+  # The other 3 briefable orgs (FlexFit, PowerHouse, Fitline) were already
+  # briefed in the previous batch call above, not just 1.
+  assert_contains "the already-briefed orgs are skipped, not re-sent" \
+    '"already_sent_today":3' "$got"
   assert_db "repaired org now has exactly one brief" "1" "$(briefs_for "$ORG_IRON")"
   assert_db "the other org still has exactly one brief" "1" "$(briefs_for "$ORG_FLEX")"
 fi
@@ -541,8 +571,8 @@ arrange_activity
 clear_briefs
 
 got=$(post '{"dry_run":true}')
-assert_contains "batch dry run covers both orgs" '"organization_count":2' "$got"
-assert_contains "batch dry run reports computed, not sent" '"computed":2' "$got"
+assert_contains "batch dry run covers all 4 briefable orgs" '"organization_count":4' "$got"
+assert_contains "batch dry run reports computed, not sent" '"computed":4' "$got"
 assert_not_contains "batch dry run never reports a sent count" '"sent":' "$got"
 assert_db "batch dry run wrote nothing" "0" "$(briefs_all)"
 

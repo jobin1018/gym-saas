@@ -159,6 +159,24 @@ fi
 reset_state
 
 # ---------------------------------------------------------------------------
+# 0. CORS preflight — see staff-login/test.sh's identical section for why
+# this exists and why local Kong answering it doesn't fully prove the
+# function's own OPTIONS handler works (point BASE_URL at a real deployed
+# URL to actually exercise that).
+# ---------------------------------------------------------------------------
+printf '\n%s-- CORS preflight --%s\n' "$B" "$N"
+
+preflight=$(curl -s -i -X OPTIONS "$BASE_URL" \
+  -H "Origin: https://example-frontend.vercel.app" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: authorization,content-type" \
+  | tr '[:upper:]' '[:lower:]')
+assert_contains "OPTIONS preflight is answered 200"           "http/1.1 200" "$preflight"
+assert_contains "preflight allows the calling origin"         "access-control-allow-origin:" "$preflight"
+assert_contains "preflight allows authorization/content-type" "access-control-allow-headers:" "$preflight"
+assert_contains "preflight names POST as an allowed method"   "access-control-allow-methods:" "$preflight"
+
+# ---------------------------------------------------------------------------
 # 1. Input validation
 # ---------------------------------------------------------------------------
 printf '\n%s-- input validation --%s\n' "$B" "$N"

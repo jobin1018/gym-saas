@@ -314,8 +314,13 @@ got=$(post_status "$(payment_event "payment.captured" "evt_$RUN.ghost2" "pay_DOE
 assert_equals   "unmatched payment returns 200, not 5xx"  "200" "$got"
 assert_db "unmatched event still marked processed" \
   "t" "$(sql "select processed from webhook_events where event_id='evt_$RUN.ghost';")"
-assert_db "unmatched event changed no payment rows" \
-  "0" "$(sql "select count(*) from payments where status='success';")"
+# Scoped to this suite's own 3 known fixtures, not a global count — seed.sql
+# now seeds realistic 'success' payment history elsewhere (for v_daily_revenue
+# manual testing), so a global "zero success rows anywhere" check would fail
+# for reasons unrelated to what this assertion actually verifies: that an
+# unattributable event didn't corrupt one of THIS suite's own rows.
+assert_db "unmatched event changed none of this suite's own payment rows" \
+  "0" "$(sql "select count(*) from payments where status='success' and id in ('$PAY_CAPTURED','$PAY_FAILED','$PAY_LINK');")"
 
 # ---------------------------------------------------------------------------
 # 6. payment_link.paid — matched by razorpay_link_id

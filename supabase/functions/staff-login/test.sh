@@ -166,6 +166,12 @@ reset_state() {
   docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
 TRUNCATE login_attempts;
 
+-- The user_metadata self-heal test (section 2) renames Priya mid-run to
+-- prove a later login corrects a stale name. Restored here defensively so a
+-- partial/failed run never leaves seed data in a renamed state for anything
+-- that runs after it.
+UPDATE public.users SET name = 'Priya Nair' WHERE id = '$USER_PRIYA';
+
 -- users_auth_user_id_fkey must be cleared BEFORE the auth.users row it points
 -- to can be deleted (found the hard way: deleting auth.users first throws a
 -- foreign key violation, which -q's error swallowing was hiding — every
@@ -222,6 +228,33 @@ fi
 reset_state
 
 # ---------------------------------------------------------------------------
+# 0. CORS preflight — this is the one gap that made it to staging silently:
+# nothing here was ever testing it. See ../_shared/cors.ts's header comment
+# for why "worked locally" proved nothing on its own: this project's local
+# Kong gateway answers OPTIONS automatically for every function regardless of
+# the function's own code, which a real deployed function does NOT get for
+# free. Pointing BASE_URL at a real deployed URL (not the local default) is
+# how this section actually proves the function's OWN OPTIONS handler works,
+# rather than Kong's local passthrough — same env-var override every other
+# test.sh in this project already supports.
+# ---------------------------------------------------------------------------
+printf '\n%s-- CORS preflight --%s\n' "$B" "$N"
+
+# Lowercased once — Kong's own local passthrough capitalizes header names
+# differently than the function's own corsPreflightResponse() does; HTTP
+# header names are case-insensitive by spec, so the assertions below should
+# be too, rather than accidentally coupled to which layer answered.
+preflight=$(curl -s -i -X OPTIONS "$BASE_URL" \
+  -H "Origin: https://example-frontend.vercel.app" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: authorization,content-type" \
+  | tr '[:upper:]' '[:lower:]')
+assert_contains "OPTIONS preflight is answered 200"           "http/1.1 200" "$preflight"
+assert_contains "preflight allows the calling origin"         "access-control-allow-origin:" "$preflight"
+assert_contains "preflight allows authorization/content-type" "access-control-allow-headers:" "$preflight"
+assert_contains "preflight names POST as an allowed method"   "access-control-allow-methods:" "$preflight"
+
+# ---------------------------------------------------------------------------
 # 1. Input validation
 # ---------------------------------------------------------------------------
 printf '\n%s-- input validation --%s\n' "$B" "$N"
@@ -276,11 +309,29 @@ assert_db "the auth.users row uses the synthetic staff.internal.invalid email" \
 assert_db "successful login was recorded" \
   "1" "$(sql "select count(*) from login_attempts where organization_id='$ORG_IRON' and phone='$PHONE_PRIYA' and success=true;")"
 
+# --- user_metadata set correctly at creation time ---
+assert_db "auth.users.user_metadata.name is set on first login" \
+  "Priya Nair" "$(sql "select raw_user_meta_data->>'name' from auth.users where email='$USER_PRIYA@staff.internal.invalid';")"
+assert_db "auth.users.user_metadata.role is set on first login" \
+  "front_desk" "$(sql "select raw_user_meta_data->>'role' from auth.users where email='$USER_PRIYA@staff.internal.invalid';")"
+
 # --- Second login must NOT create a second auth.users row ---
 got2=$(post "$ORG_IRON" "$PHONE_PRIYA" "$PIN_PRIYA")
 assert_contains "second correct login also succeeds" '"ok":true' "$got2"
 assert_db "still exactly one auth.users row for Priya (no duplicate on re-login)" \
   "1" "$(sql "select count(*) from auth.users where email='$USER_PRIYA@staff.internal.invalid';")"
+
+# --- Self-heal: a name change in public.users is picked up on the NEXT login,
+# --- for an account that was already provisioned (not just at creation) ---
+sql "update public.users set name='Priya Nair (Renamed)' where id='$USER_PRIYA';" >/dev/null
+got3=$(post "$ORG_IRON" "$PHONE_PRIYA" "$PIN_PRIYA")
+assert_contains "login after a name change still succeeds"          '"ok":true' "$got3"
+assert_contains "the response reflects the NEW name immediately"    '"name":"Priya Nair (Renamed)"' "$got3"
+assert_db "user_metadata.name self-healed to the new name" \
+  "Priya Nair (Renamed)" "$(sql "select raw_user_meta_data->>'name' from auth.users where email='$USER_PRIYA@staff.internal.invalid';")"
+assert_db "still exactly one auth.users row (sync updates, does not duplicate)" \
+  "1" "$(sql "select count(*) from auth.users where email='$USER_PRIYA@staff.internal.invalid';")"
+sql "update public.users set name='Priya Nair' where id='$USER_PRIYA';" >/dev/null
 
 # ---------------------------------------------------------------------------
 # 3. Wrong PIN fails without revealing account existence

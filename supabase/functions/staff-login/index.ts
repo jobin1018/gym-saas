@@ -11,6 +11,12 @@
 // for tenant-scoped access) is separate follow-up work; this function does
 // not touch RLS.
 //
+// One of exactly two functions in this project ever called directly from a
+// browser (staff-lookup-by-phone is the other) — every other function is a
+// provider webhook, pg_cron, or curl. That means this is one of exactly two
+// functions CORS applies to at all; see ../_shared/cors.ts for the shared
+// handling and why "it worked without it locally" proved nothing.
+//
 // ============================================================================
 // WHY THIS FUNCTION IS DIFFERENT FROM send-renewal-reminder / renewal-scan
 // ============================================================================
@@ -47,6 +53,7 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import bcrypt from "bcryptjs";
 import { createAdminClient, createAnonClient, type SupabaseClient } from "../_shared/supabase.ts";
+import { corsJson as json, corsPreflightResponse } from "../_shared/cors.ts";
 
 const TAG = "staff-login";
 
@@ -65,13 +72,6 @@ const DUMMY_PIN_HASH = "$2a$12$mLcIlAVv3xGKT9aAKamRUey2mMyiAy8SLF7ZV1rZOHq3TPm1j
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
-
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
 
 /**
  * The non-deliverable email that bridges a phone-only staff user into
@@ -191,7 +191,7 @@ async function ensureAuthUser(admin: SupabaseClient, user: UserRow): Promise<str
   const { data: created, error: createErr } = await admin.auth.admin.createUser({
     email,
     email_confirm: true,
-    user_metadata: { staff_user_id: user.id },
+    user_metadata: { staff_user_id: user.id, name: user.name, role: user.role },
   });
 
   if (createErr || !created?.user) {
@@ -226,6 +226,50 @@ async function ensureAuthUser(admin: SupabaseClient, user: UserRow): Promise<str
   }
 
   return winner.auth_user_id;
+}
+
+/**
+ * Keeps auth.users.user_metadata.name/role in sync with public.users on every
+ * successful login — not just at first-time creation. Exists because the
+ * frontend has no other safe way to re-fetch the logged-in staffer's display
+ * name after a page refresh: `users` has no grant for `authenticated` at all
+ * (see 20260824141000_revoke_local_dev_only_policies.sql's note on why —
+ * pin_hash), and staff_lookup_directory is pre-login only (staff-lookup-by-
+ * phone). supabase.auth.getUser() already exposes user_metadata to any
+ * authenticated session with zero additional grants/views/RLS, so that's the
+ * bridge instead.
+ *
+ * Self-healing: covers both the first-login case (createUser above already
+ * set it, so this is a no-op read-and-compare) and every later login for an
+ * already-provisioned account, including the future case where an owner
+ * edits a staff member's name — the next login corrects the stale copy.
+ *
+ * Never throws: the PIN was already verified correct by the time this runs,
+ * so a metadata sync failure must not cost the user their session. Logged
+ * loudly instead — a stale display name is a real but non-blocking bug.
+ */
+async function syncUserMetadata(
+  admin: SupabaseClient,
+  authUserId: string,
+  user: UserRow,
+): Promise<void> {
+  const { data, error } = await admin.auth.admin.getUserById(authUserId);
+
+  if (error || !data?.user) {
+    console.error(`[${TAG}] could not read auth.users ${authUserId} to sync metadata:`, error);
+    return;
+  }
+
+  const current = data.user.user_metadata ?? {};
+  if (current.name === user.name && current.role === user.role) return; // already correct
+
+  const { error: updateErr } = await admin.auth.admin.updateUserById(authUserId, {
+    user_metadata: { ...current, name: user.name, role: user.role },
+  });
+
+  if (updateErr) {
+    console.error(`[${TAG}] failed to sync user_metadata for ${authUserId}:`, updateErr);
+  }
 }
 
 interface MintedSession {
@@ -356,6 +400,7 @@ async function handleLogin(req: Request): Promise<Response> {
 
   try {
     const authUserId = await ensureAuthUser(admin, user);
+    await syncUserMetadata(admin, authUserId, user);
     const anon = createAnonClient();
     const session = await mintSession(admin, anon, syntheticEmail(user.id));
 
@@ -384,6 +429,10 @@ async function handleLogin(req: Request): Promise<Response> {
 // ---------------------------------------------------------------------------
 
 Deno.serve(async (req: Request) => {
+  // Must answer OPTIONS before any other logic — see ../_shared/cors.ts for
+  // why this can't be skipped just because it "worked" without it locally.
+  if (req.method === "OPTIONS") return corsPreflightResponse();
+
   if (req.method !== "POST") {
     return json({ error: "method_not_allowed" }, 405);
   }
