@@ -4,17 +4,23 @@
 // and notifies the member on WhatsApp.
 //
 // ============================================================================
-// WHAT IS REAL AND WHAT IS SIMULATED
+// WHAT IS REAL
 // ============================================================================
 // REAL: signature verification (HMAC-SHA256 over the raw body, keyed on
 //       RAZORPAY_WEBHOOK_SECRET). Razorpay test mode is fully functional, so
 //       there is nothing to stub here — the same code path runs in production.
 //
-// SIMULATED: the outbound WhatsApp send, exactly as in whatsapp-webhook. It
-//       console.log()s and writes a whatsapp_messages row with status 'queued'.
-//       The swap point uses the identical BEGIN/END SIMULATED SEND fence, so
-//       both functions are updated the same way when Meta credentials land:
-//         rg 'BEGIN SIMULATED SEND' supabase/functions
+// REAL: the outbound WhatsApp send, via the shared helper in
+//       ../_shared/whatsapp.ts (no longer a private, simulated copy —
+//       see the removed BEGIN/END SIMULATED SEND fence this replaced).
+//         payment.captured / payment_link.paid (success) sends the APPROVED
+//         payment_confirmation template (language "en_GB" — Meta's code for
+//         "English (UK)").
+//         payment.failed still sends free-form text — real, just not
+//         template-wrapped — because no payment_failed template is approved
+//         yet. See the TODO(meta) at that call site.
+//       WHATSAPP_SEND_MODE=mock skips the real call; this function's test.sh
+//       enforces that for automated runs.
 //
 // Grep the temporary surface with:
 //   rg 'TODO\((meta|razorpay)\)' supabase/functions
@@ -23,10 +29,16 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { createAdminClient, type SupabaseClient } from "../_shared/supabase.ts";
 import { hmacSha256Hex, timingSafeEqualHex } from "../_shared/crypto.ts";
+import { sendWhatsAppMessage } from "../_shared/whatsapp.ts";
 
+const TAG = "razorpay-webhook";
 const SOURCE = "razorpay" as const;
 const SIGNATURE_HEADER = "x-razorpay-signature";
 const EVENT_ID_HEADER = "x-razorpay-event-id";
+const TEMPLATE_NAME_PAYMENT_CONFIRMATION = "payment_confirmation" as const;
+// Meta's locale code for the template's registered language, "English (UK)" —
+// not plain "en", which is a different template language variant to Meta.
+const TEMPLATE_LANGUAGE = "en_GB" as const;
 
 // current_period_end is a DATE, so "today" needs a timezone to be meaningful.
 // Defaults to the same zone as locations.timezone in the schema; a gym in IST
@@ -40,16 +52,37 @@ const SUCCESS_EVENTS = ["payment.captured", "payment_link.paid"];
 const FAILURE_EVENTS = ["payment.failed"];
 
 const MESSAGE = {
-  paymentReceived: (until: string) =>
-    `Payment received! ✅ Your membership is active until ${until}.`,
+  // Mirrors the payment_confirmation template body ("Hi {{1}}, we've received
+  // your payment of ₹{{2}} for {{3}}. Your membership is now active until
+  // {{4}}. Thank you for staying with us!") — not required to be byte-
+  // identical to Meta's own rendering, just an accurate audit-log preview.
+  paymentReceived: (name: string, amountRupees: string, planName: string, until: string) =>
+    `Hi ${name}, we've received your payment of ₹${amountRupees} for ${planName}. ` +
+    `Your membership is now active until ${until}. Thank you for staying with us!`,
+  // TODO(meta): no payment_failed template is approved yet, so this still goes
+  // out as free-form text — a REAL send (not simulated), just not template-
+  // wrapped. Switch to a template call the moment payment_failed is approved
+  // in Meta Business Manager, the same way payment_confirmation was above.
   paymentFailed:
     "We couldn't process your payment. Reply PAY to try again or contact your gym.",
 } as const;
 
-// One round trip gets the payment, its membership, and the member to notify.
+/** Same formatting as daily-owner-brief's — whole rupees with no decimals. */
+function formatRupees(amount: number): string {
+  const whole = Number.isInteger(amount);
+  return new Intl.NumberFormat("en-IN", {
+    minimumFractionDigits: whole ? 0 : 2,
+    maximumFractionDigits: whole ? 0 : 2,
+  }).format(amount);
+}
+
+// One round trip gets the payment, its membership, the member, and the plan
+// name (membership_plans is joined for the payment_confirmation template's
+// {{3}} — the old free-form message didn't need a plan name, so it wasn't
+// selected before).
 const PAYMENT_SELECT =
   "id,organization_id,membership_id,amount,status,provider_payment_id,razorpay_link_id," +
-  "memberships(id,member_id,status,current_period_end,members(id,name,phone))";
+  "memberships(id,member_id,status,current_period_end,members(id,name,phone),membership_plans(name))";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -87,6 +120,7 @@ interface PaymentRow {
     status: string;
     current_period_end: string;
     members: { id: string; name: string; phone: string } | null;
+    membership_plans: { name: string } | null;
   } | null;
 }
 
@@ -274,94 +308,6 @@ function resolveEventId(
     eventId: `unidentified:${crypto.randomUUID()}`,
     derivedFrom: "random(NOT idempotent)",
   };
-}
-
-// ===========================================================================
-// OUTBOUND MESSAGING — THE ONE PLACE TO SWAP IN THE REAL META API
-// ===========================================================================
-
-/**
- * "Send" a WhatsApp message to `phone`.
- *
- * TODO(meta): SIMULATED, identical to the helper in whatsapp-webhook. When Meta
- * credentials land, replace the fenced block below in BOTH functions.
- */
-async function sendWhatsAppMessage(
-  supabase: SupabaseClient,
-  phone: string | null,
-  text: string,
-  context: {
-    memberId?: string | null;
-    organizationId?: string | null;
-    templateName?: string | null;
-    relatedPaymentId?: string | null;
-  } = {},
-): Promise<void> {
-  let waMessageId: string | null = null;
-  let status: "queued" | "sent" | "failed" = "queued";
-
-  // ---------------- BEGIN SIMULATED SEND — REPLACE THIS BLOCK ----------------
-  // TODO(meta): swap the console.log for the real Cloud API call:
-  //
-  //   const res = await fetch(
-  //     `https://graph.facebook.com/v21.0/${Deno.env.get("META_PHONE_NUMBER_ID")}/messages`,
-  //     {
-  //       method: "POST",
-  //       headers: {
-  //         authorization: `Bearer ${Deno.env.get("META_ACCESS_TOKEN")}`,
-  //         "content-type": "application/json",
-  //       },
-  //       body: JSON.stringify({
-  //         messaging_product: "whatsapp",
-  //         recipient_type: "individual",
-  //         to: phone,
-  //         type: "text",
-  //         text: { preview_url: false, body: text },
-  //       }),
-  //     },
-  //   );
-  //   const result = await res.json();
-  //   if (res.ok) {
-  //     waMessageId = result?.messages?.[0]?.id ?? null;
-  //     status = "sent";
-  //   } else {
-  //     status = "failed";
-  //     console.error("[razorpay-webhook] Meta send failed", res.status, result);
-  //   }
-  //
-  // NOTE: a payment confirmation is business-initiated, so it will almost
-  // always fall OUTSIDE Meta's 24h customer-service window and must go out as
-  // an APPROVED TEMPLATE, not free-form text. Register a payment_confirmation
-  // template and pass its name via `templateName`.
-  if (!phone) {
-    console.warn(
-      "[razorpay-webhook] no phone on file for this member — logging the " +
-        "message but there is nobody to deliver it to.",
-    );
-  }
-  console.log(
-    `[razorpay-webhook] SIMULATED SEND -> to=${phone ?? "(unknown)"} text=${
-      JSON.stringify(text)
-    }`,
-  );
-  // ----------------- END SIMULATED SEND — REPLACE THIS BLOCK -----------------
-
-  // The whatsapp_messages row is real either way — it is our outbound audit log.
-  const { error } = await supabase.from("whatsapp_messages").insert({
-    organization_id: context.organizationId ?? null,
-    member_id: context.memberId ?? null,
-    direction: "outbound",
-    template_name: context.templateName ?? null,
-    body_preview: text,
-    wa_message_id: waMessageId,
-    status,
-    related_payment_id: context.relatedPaymentId ?? null,
-  });
-
-  if (error) {
-    // Never let logging failure break reconciliation — the money already moved.
-    console.error("[razorpay-webhook] failed to log outbound message:", error);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -625,20 +571,41 @@ async function handlePaymentSuccess(
     );
   }
 
-  await sendWhatsAppMessage(
+  const memberName = membership?.members?.name ?? "there";
+  const planName = membership?.membership_plans?.name ?? "your plan";
+  const amountRupees = formatRupees(Number(row.amount));
+  const untilText = newPeriodEnd
+    ? formatDateForMember(newPeriodEnd)
+    : "your next billing date";
+
+  const send = await sendWhatsAppMessage(
     supabase,
     membership?.members?.phone ?? null,
-    MESSAGE.paymentReceived(
-      newPeriodEnd ? formatDateForMember(newPeriodEnd) : "your next billing date",
-    ),
+    MESSAGE.paymentReceived(memberName, amountRupees, planName, untilText),
     {
+      tag: TAG,
       memberId: membership?.member_id ?? null,
       organizationId: row.organization_id,
       relatedPaymentId: row.id,
-      // TODO(meta): set to the approved payment_confirmation template name.
-      templateName: null,
+      templateName: TEMPLATE_NAME_PAYMENT_CONFIRMATION,
+    },
+    {
+      name: TEMPLATE_NAME_PAYMENT_CONFIRMATION,
+      language: TEMPLATE_LANGUAGE,
+      // Same order as the template body: "Hi {{1}}, we've received your
+      // payment of ₹{{2}} for {{3}}. Your membership is now active until
+      // {{4}}. Thank you for staying with us!"
+      bodyParams: [memberName, amountRupees, planName, untilText],
     },
   );
+
+  if (!send.logged) {
+    // Never fatal to reconciliation — the money already moved — but worth a
+    // loud log, same as the other two functions' once-real send paths.
+    console.error(
+      `[${TAG}] payment confirmation for payment ${row.id} was not logged.`,
+    );
+  }
 
   return {
     handled: "payment_success",
@@ -692,17 +659,27 @@ async function handlePaymentFailure(
 
   const membership = row.memberships;
 
-  await sendWhatsAppMessage(
+  // No template argument: payment_failed has no approved template yet, so
+  // this is a REAL send (not simulated) but still free-form text. See the
+  // TODO(meta) on MESSAGE.paymentFailed above.
+  const send = await sendWhatsAppMessage(
     supabase,
     membership?.members?.phone ?? null,
     MESSAGE.paymentFailed,
     {
+      tag: TAG,
       memberId: membership?.member_id ?? null,
       organizationId: row.organization_id,
       relatedPaymentId: row.id,
       templateName: null,
     },
   );
+
+  if (!send.logged) {
+    console.error(
+      `[${TAG}] payment-failed notice for payment ${row.id} was not logged.`,
+    );
+  }
 
   return { handled: "payment_failed", matched_by: matchedBy, payment_id: row.id };
 }

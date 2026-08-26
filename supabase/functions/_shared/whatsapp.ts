@@ -23,14 +23,31 @@
 // The whatsapp_messages row is REAL either way — it is the outbound audit log,
 // and send-renewal-reminder additionally uses it as its once-per-day guard.
 //
+// ============================================================================
+// TEMPLATES vs FREE-FORM TEXT
+// ============================================================================
+// Pass a 5th `template` argument to send an APPROVED message template (required
+// for any business-initiated message outside the 24h customer-service window —
+// confirmed in production: Meta rejects free-form sends outside that window
+// with "more than 24 hours have passed since the customer last replied").
+// Approved and in use: payment_confirmation, daily_owner_brief, renewal_reminder
+// (all language "en_GB" — Meta's code for "English (UK)", not plain "en").
+// Omit `template` to send free-form text instead — still a REAL call, just not
+// template-wrapped. That is deliberately still used for razorpay-webhook's
+// payment.failed notice, which has no approved template yet (see the TODO(meta)
+// at that call site). `text` is always what gets written to whatsapp_messages'
+// body_preview, whether or not a template was actually used to send — it is the
+// human-readable audit trail, not required to be byte-identical to Meta's own
+// template rendering.
+//
 // NOTE ON DUPLICATION: whatsapp-webhook/index.ts carries its own copy of this
 // helper with the same WHATSAPP_SEND_MODE handling (they predate this file and
 // both are working, so they were deliberately left untouched as separate
-// copies). razorpay-webhook/index.ts's copy is UNCHANGED and still simulated —
-// payment confirmation sends were not part of this migration; its own
-// BEGIN/END SIMULATED SEND fence is still there and still accurate for that
-// function specifically:
-//   rg 'BEGIN SIMULATED SEND' supabase/functions
+// copies) — its replies (check-in confirmation, "didn't understand",
+// disambiguation) stay free-form on purpose: they are genuine replies inside an
+// open service window and Meta does not require a template for those.
+// razorpay-webhook/index.ts now imports this file directly (its old private,
+// fully-simulated copy and BEGIN/END SIMULATED SEND fence are gone).
 // ============================================================================
 
 import { type SupabaseClient } from "./supabase.ts";
@@ -54,9 +71,31 @@ export interface SendResult {
   logged: boolean;
 }
 
+/**
+ * An approved WhatsApp message template call. `bodyParams` are positional —
+ * index 0 fills {{1}} in the template body, index 1 fills {{2}}, and so on.
+ * `language` is a Meta locale code (e.g. "en_GB" for "English (UK)"), not a
+ * bare ISO-639 code — Meta rejects "en" for a template registered under
+ * "English (UK)".
+ */
+export interface TemplateSpec {
+  name: string;
+  language: string;
+  bodyParams: string[];
+}
+
 function isMockMode(): boolean {
   return (Deno.env.get("WHATSAPP_SEND_MODE") ?? "").trim().toLowerCase() === "mock";
 }
+
+// Deliberate test-only hook. Mock mode otherwise always reports "queued" — the
+// live Meta-rejection path (status:"failed") is unreachable without real
+// credentials, so callers have no way to exercise their failed-send handling
+// under test (WHATSAPP_SEND_MODE=mock is mandatory for every test.sh). Sending
+// to exactly this number makes mock mode simulate a failed send instead. Not a
+// real phone shape (real numbers passed through this codebase are 12-digit
+// `91...`), so it can never collide with a seeded fixture.
+export const MOCK_FAILURE_PHONE = "0000000000";
 
 /**
  * Call the real Meta Cloud API. Never throws — a Meta outage or a bad token
@@ -67,6 +106,7 @@ async function callMetaApi(
   tag: string,
   phone: string,
   text: string,
+  template?: TemplateSpec,
 ): Promise<{ waMessageId: string | null; status: "sent" | "failed" }> {
   const accessToken = Deno.env.get("META_ACCESS_TOKEN");
   const phoneNumberId = Deno.env.get("META_PHONE_NUMBER_ID");
@@ -78,22 +118,31 @@ async function callMetaApi(
     return { waMessageId: null, status: "failed" };
   }
 
-  // TODO(meta): every send below goes out as "type":"text" (free-form),
-  // REGARDLESS of context.templateName. That is temporary. Meta requires an
-  // APPROVED MESSAGE TEMPLATE for any business-initiated message outside the
-  // 24h customer-service window opened by an inbound message from the
-  // customer — which is exactly what renewal_reminder and daily_owner_brief
-  // are. No templates are approved in Meta Business Manager yet, so free-form
-  // text is used here deliberately, to allow testing real delivery today. This
-  // will start failing at Meta's end for real customers once their 24h window
-  // (if any) has closed. Switch to a template call the moment one is approved:
-  //
-  //   body: JSON.stringify({
-  //     messaging_product: "whatsapp",
-  //     to: phone,
-  //     type: "template",
-  //     template: { name: context.templateName, language: { code: "en" } },
-  //   })
+  const payload = template
+    ? {
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to: phone,
+      type: "template",
+      template: {
+        name: template.name,
+        language: { code: template.language },
+        components: [
+          {
+            type: "body",
+            parameters: template.bodyParams.map((p) => ({ type: "text", text: p })),
+          },
+        ],
+      },
+    }
+    : {
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to: phone,
+      type: "text",
+      text: { preview_url: false, body: text },
+    };
+
   try {
     const res = await fetch(
       `https://graph.facebook.com/${META_API_VERSION}/${phoneNumberId}/messages`,
@@ -103,13 +152,7 @@ async function callMetaApi(
           authorization: `Bearer ${accessToken}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify({
-          messaging_product: "whatsapp",
-          recipient_type: "individual",
-          to: phone,
-          type: "text",
-          text: { preview_url: false, body: text },
-        }),
+        body: JSON.stringify(payload),
       },
     );
 
@@ -144,6 +187,7 @@ export async function sendWhatsAppMessage(
   phone: string | null,
   text: string,
   context: OutboundContext,
+  template?: TemplateSpec,
 ): Promise<SendResult> {
   const { tag } = context;
   let waMessageId: string | null = null;
@@ -157,14 +201,28 @@ export async function sendWhatsAppMessage(
     );
     status = "failed";
   } else if (isMockMode()) {
-    console.log(
-      `[${tag}] WHATSAPP_SEND_MODE=mock — not calling Meta. to=${phone} text=${
-        JSON.stringify(text)
-      }`,
-    );
-    status = "queued";
+    if (phone === MOCK_FAILURE_PHONE) {
+      console.log(
+        `[${tag}] WHATSAPP_SEND_MODE=mock — simulating a FAILED send (magic ` +
+          `phone ${MOCK_FAILURE_PHONE}). ${
+          template
+            ? `template=${template.name} params=${JSON.stringify(template.bodyParams)}`
+            : `text=${JSON.stringify(text)}`
+        }`,
+      );
+      status = "failed";
+    } else {
+      console.log(
+        `[${tag}] WHATSAPP_SEND_MODE=mock — not calling Meta. to=${phone} ${
+          template
+            ? `template=${template.name} params=${JSON.stringify(template.bodyParams)}`
+            : `text=${JSON.stringify(text)}`
+        }`,
+      );
+      status = "queued";
+    }
   } else {
-    const outcome = await callMetaApi(tag, phone, text);
+    const outcome = await callMetaApi(tag, phone, text, template);
     waMessageId = outcome.waMessageId;
     status = outcome.status;
   }

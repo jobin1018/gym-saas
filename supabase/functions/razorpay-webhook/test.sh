@@ -6,6 +6,14 @@
 # X-Razorpay-Signature headers (real HMAC-SHA256 over the raw body), and asserts
 # PASS/FAIL on the response shape plus the resulting database state.
 #
+# NOTE: unlike its name, "Mock-Razorpay" refers only to Razorpay being
+# simulated by this script (there is no real Razorpay account involved). The
+# outbound WhatsApp send this function triggers on payment.captured /
+# payment_link.paid / payment.failed is REAL (via ../_shared/whatsapp.ts, same
+# as send-renewal-reminder and daily-owner-brief), so this suite forces
+# WHATSAPP_SEND_MODE=mock (checked in preflight below) the same way those two
+# suites do.
+#
 # PREREQUISITES
 #   1. supabase start
 #   2. supabase db reset                 # applies migrations + seed.sql
@@ -50,6 +58,7 @@ read_env() {
 }
 
 WEBHOOK_SECRET="${RAZORPAY_WEBHOOK_SECRET:-$(read_env RAZORPAY_WEBHOOK_SECRET)}"
+WA_SEND_MODE="${WHATSAPP_SEND_MODE:-$(read_env WHATSAPP_SEND_MODE)}"
 
 have_psql=false
 if docker exec "$DB_CONTAINER" true >/dev/null 2>&1; then have_psql=true; fi
@@ -164,6 +173,17 @@ SQL
 printf '\n%s== mock-razorpay webhook tests ==%s\n' "$B" "$N"
 printf 'target: %s\n' "$BASE_URL"
 
+if [ "$(printf '%s' "$WA_SEND_MODE" | tr '[:upper:]' '[:lower:]')" != "mock" ]; then
+  printf '\n%sREFUSING TO RUN%s WHATSAPP_SEND_MODE is not "mock" in %s (got: %s).\n' \
+    "$R" "$N" "$ENV_FILE" "${WA_SEND_MODE:-<unset>}"
+  printf '        This suite triggers payment.captured/payment_link.paid/payment.failed,\n'
+  printf '        each of which calls sendWhatsAppMessage(), which hits the real Meta Cloud\n'
+  printf '        API LIVE by default. Set WHATSAPP_SEND_MODE=mock in %s and restart\n' "$ENV_FILE"
+  printf '        `supabase functions serve` before running this suite, or it will send real\n'
+  printf '        WhatsApp messages to the seeded member phone numbers.\n\n'
+  exit 1
+fi
+
 if ! command -v openssl >/dev/null 2>&1; then
   printf '\n%sERROR%s openssl is required to compute X-Razorpay-Signature.\n\n' "$R" "$N"
   exit 1
@@ -252,8 +272,14 @@ assert_db "period extended 1 month from the later of today/current end" \
   "$expected_end" "$(sql "select current_period_end from memberships where id='$MEM_ACTIVE';")"
 assert_db "confirmation message queued with related_payment_id" \
   "1" "$(sql "select count(*) from whatsapp_messages where direction='outbound' and status='queued' and related_payment_id='$PAY_CAPTURED';")"
-assert_db "confirmation names the new period end" \
-  "1" "$(sql "select count(*) from whatsapp_messages where related_payment_id='$PAY_CAPTURED' and body_preview like 'Payment received!%';")"
+# MEM_ACTIVE (PAY_CAPTURED) is Asha Menon, plan "Monthly Unlimited", ₹1500 —
+# see seed.sql. body_preview is the human-readable audit text (mirrors, but
+# need not byte-match, the approved payment_confirmation template Meta itself
+# renders — see the comment on MESSAGE.paymentReceived).
+assert_db "confirmation names the member, amount and plan" \
+  "1" "$(sql "select count(*) from whatsapp_messages where related_payment_id='$PAY_CAPTURED' and body_preview like 'Hi Asha Menon, we%received your payment of %1,500%Monthly Unlimited%';")"
+assert_db "confirmation uses the approved payment_confirmation template" \
+  "1" "$(sql "select count(*) from whatsapp_messages where related_payment_id='$PAY_CAPTURED' and template_name='payment_confirmation';")"
 assert_db "webhook_events marked processed"          "t" "$(sql "select processed from webhook_events where event_id='evt_$RUN.cap';")"
 
 # Paying early must ADD a month, not truncate to today+1month.
@@ -298,6 +324,10 @@ assert_db "payment marked failed"            "failed" "$(sql "select status from
 assert_db "membership status left UNCHANGED" "past_due" "$(sql "select status from memberships where id='$MEM_PAST_DUE';")"
 assert_db "membership period left UNCHANGED" "$end_before" "$(sql "select current_period_end from memberships where id='$MEM_PAST_DUE';")"
 assert_db "failure notice queued"            "1" "$(sql "select count(*) from whatsapp_messages where related_payment_id='$PAY_FAILED' and body_preview like 'We couldn''t process%';")"
+# payment_failed has no approved template yet (TODO(meta) in index.ts) — this
+# must still be a real send, just free-form text, not a template call.
+assert_db "failure notice is free-form (no approved template yet)" \
+  "1" "$(sql "select count(*) from whatsapp_messages where related_payment_id='$PAY_FAILED' and template_name is null;")"
 assert_db "failure event marked processed"   "t" "$(sql "select processed from webhook_events where event_id='evt_$RUN.fail';")"
 
 # ---------------------------------------------------------------------------

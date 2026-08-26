@@ -15,11 +15,13 @@
 //       payments, attendance and whatsapp_messages at request time.
 //
 // REAL: the outbound send, via the shared helper in ../_shared/whatsapp.ts —
-//       a real call to Meta's Cloud API. It goes out as free-form "type":
-//       "text", not an approved template (see the TODO(meta) in
-//       ../_shared/whatsapp.ts for why, and what to change once a template is
-//       approved). WHATSAPP_SEND_MODE=mock skips the real call; this
-//       function's test.sh enforces that for automated runs.
+//       a real call to Meta's Cloud API, using the APPROVED daily_owner_brief
+//       template (language "en_GB" — Meta's code for "English (UK)"). The
+//       template body has no "failed sends" line, so buildBrief()'s ❌ line
+//       (below) is preview/dry-run/body_preview content ONLY — it is never
+//       one of the template's 7 body params. WHATSAPP_SEND_MODE=mock skips
+//       the real call; this function's test.sh enforces that for automated
+//       runs.
 //
 // ============================================================================
 // THE RECIPIENT IS AN ORGANIZATION, NOT A MEMBER
@@ -45,6 +47,9 @@ import { sendWhatsAppMessage } from "../_shared/whatsapp.ts";
 
 const TAG = "daily-owner-brief";
 const TEMPLATE_NAME = "daily_owner_brief" as const;
+// Meta's locale code for the template's registered language, "English (UK)" —
+// not plain "en", which is a different template language variant to Meta.
+const TEMPLATE_LANGUAGE = "en_GB" as const;
 
 // Orgs that get a brief. 'suspended' is excluded: a suspended account should not
 // be receiving daily operational messages.
@@ -558,6 +563,23 @@ async function briefOneOrg(
     organizationId: org.id,
     templateName: TEMPLATE_NAME,
     relatedPaymentId: null,
+  }, {
+    name: TEMPLATE_NAME,
+    language: TEMPLATE_LANGUAGE,
+    // Same order as the template body: "Good morning! {{1}} — {{2}}.
+    // Renewals due this week: {{3}} (₹{{4}}). Overdue: {{5}} members,
+    // ₹{{6}} pending. Yesterday: {{7}} check-ins. Reply DETAILS for the
+    // full list." Exactly 7 — no 8th param for failed_sends; that line is
+    // buildBrief()'s preview/body_preview content only (see the header note).
+    bodyParams: [
+      org.name,
+      formatDateForOwner(todayLocal),
+      String(stats.renewals_due_count),
+      formatRupees(stats.renewals_due_amount),
+      String(stats.overdue_count),
+      formatRupees(stats.overdue_amount),
+      String(stats.checkins_yesterday),
+    ],
   });
 
   if (!send.logged) {
@@ -574,6 +596,28 @@ async function briefOneOrg(
       detail: "the send happened but whatsapp_messages could not be written",
       stats,
       message,
+    };
+  }
+
+  if (send.status === "failed") {
+    // Logged and Meta-rejected are independent: sendWhatsAppMessage always
+    // writes the row (so the once-per-day guard still sees it and this org
+    // won't be retried until tomorrow), but a 400 from Meta means the owner
+    // never actually got the brief. Checking send.logged alone here previously
+    // reported this as "sent" — the row write had succeeded even though the
+    // delivery hadn't.
+    console.error(
+      `[${TAG}] brief for org ${org.id} was logged but Meta rejected the ` +
+        "send (status=failed).",
+    );
+    return {
+      ...base,
+      outcome: "error",
+      error: "send_failed",
+      detail: "whatsapp_messages was written but the Meta API call failed",
+      stats,
+      message,
+      whatsapp_message_id: send.messageId,
     };
   }
 

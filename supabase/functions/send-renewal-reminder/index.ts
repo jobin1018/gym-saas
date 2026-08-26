@@ -17,11 +17,14 @@
 //       returns is a real link at Razorpay.
 //
 // REAL: the outbound WhatsApp send, via the shared helper in
-//       ../_shared/whatsapp.ts — a real call to Meta's Cloud API. It goes out
-//       as free-form "type":"text", not an approved template (see the
-//       TODO(meta) in ../_shared/whatsapp.ts for why, and what to change once
-//       a template is approved). WHATSAPP_SEND_MODE=mock skips the real call;
-//       this function's test.sh enforces that for automated runs.
+//       ../_shared/whatsapp.ts — a real call to Meta's Cloud API, using the
+//       APPROVED renewal_reminder template (language "en_GB" — Meta's code
+//       for "English (UK)"). Confirmed in production: the free-form text this
+//       used to send fails outside Meta's 24h customer-service window
+//       ("more than 24 hours have passed since the customer last replied"),
+//       which is why a template is required here. WHATSAPP_SEND_MODE=mock
+//       skips the real call; this function's test.sh enforces that for
+//       automated runs.
 //         rg 'TODO\((meta|razorpay)\)' supabase/functions
 //
 // ============================================================================
@@ -52,6 +55,9 @@ import { sendWhatsAppMessage } from "../_shared/whatsapp.ts";
 const TAG = "send-renewal-reminder";
 const PROVIDER = "razorpay" as const;
 const TEMPLATE_NAME = "renewal_reminder" as const;
+// Meta's locale code for the template's registered language, "English (UK)" —
+// not plain "en", which is a different template language variant to Meta.
+const TEMPLATE_LANGUAGE = "en_GB" as const;
 const RAZORPAY_API = "https://api.razorpay.com/v1/payment_links";
 
 // The once-per-day guard needs a timezone to mean anything. Same default and
@@ -770,6 +776,17 @@ async function handleReminder(req: Request): Promise<Response> {
     organizationId: membership.organization_id,
     templateName: TEMPLATE_NAME,
     relatedPaymentId: payment.id,
+  }, {
+    name: TEMPLATE_NAME,
+    language: TEMPLATE_LANGUAGE,
+    // Same order as the template body: "Hi {{1}}, your {{2}} membership
+    // renews on {{3}}. Pay here: {{4}}. Reply PAY if you need help."
+    bodyParams: [
+      member.name,
+      plan.name,
+      formatDateForMember(membership.current_period_end),
+      link.short_url,
+    ],
   });
 
   if (!send.logged) {

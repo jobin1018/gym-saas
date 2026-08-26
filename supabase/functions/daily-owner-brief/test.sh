@@ -463,6 +463,46 @@ assert_db "the NULL-member brief row is invisible to a member-scoped lookup" \
   "0" "$(sql "select count(*) from whatsapp_messages where member_id='$MEMBER_ASHA' and template_name='daily_owner_brief';")"
 
 # ---------------------------------------------------------------------------
+# 5b. Meta rejects the send — must report as errored, not sent
+# ---------------------------------------------------------------------------
+# whatsapp_messages gets a real row either way (see _shared/whatsapp.ts), so
+# send.logged is true here — send.logged alone is not enough to call this
+# "sent". MOCK_FAILURE_PHONE (_shared/whatsapp.ts) makes mock mode report
+# status:"failed" instead of the default "queued", standing in for a live
+# Meta 400 without needing a real Meta call.
+printf '\n%s-- Meta rejects the send --%s\n' "$B" "$N"
+
+if ! $have_psql; then
+  skipped "a Meta-rejected send is reported as errored, not sent" "requires docker/psql"
+else
+  # No reset_state()/arrange_activity() here on purpose — FlexFit has had no
+  # real (non-dry-run) send yet at this point in the suite, and section 5's
+  # Iron Temple "already sent today" state (needed by section 6, next) must
+  # survive untouched.
+  sql "update organizations set owner_phone='0000000000' where id='$ORG_FLEX';" >/dev/null
+
+  got=$(post "{\"organization_id\":\"$ORG_FLEX\"}")
+
+  assert_contains "a rejected send is reported as errored"      '"outcome":"error"' "$got"
+  assert_contains "the failure reason is surfaced"               '"error":"send_failed"' "$got"
+  assert_not_contains "a rejected send is never reported as sent" '"outcome":"sent"' "$got"
+  assert_equals   "nothing counts as sent"      "0" "$(field_num sent "$got")"
+  assert_equals   "one org errored"             "1" "$(field_num errored "$got")"
+
+  assert_db "the failed send was still logged (once-per-day guard sees it)" \
+    "1" "$(sql "select count(*) from whatsapp_messages where template_name='daily_owner_brief' and organization_id='$ORG_FLEX' and status='failed';")"
+
+  # The once-per-day guard keys on the row existing at all, not on its status —
+  # a re-run today must not retry, same as a genuinely sent brief.
+  got=$(post "{\"organization_id\":\"$ORG_FLEX\"}")
+  assert_contains "a re-run today is skipped, not retried" '"reason":"already_sent_today"' "$got"
+  assert_db "still exactly one row for this org" \
+    "1" "$(sql "select count(*) from whatsapp_messages where template_name='daily_owner_brief' and organization_id='$ORG_FLEX';")"
+
+  sql "update organizations set owner_phone='919000000002' where id='$ORG_FLEX';" >/dev/null
+fi
+
+# ---------------------------------------------------------------------------
 # 6. Duplicate the same day is skipped
 # ---------------------------------------------------------------------------
 printf '\n%s-- duplicate same day --%s\n' "$B" "$N"
