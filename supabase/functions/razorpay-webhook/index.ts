@@ -38,7 +38,7 @@ const EVENT_ID_HEADER = "x-razorpay-event-id";
 const TEMPLATE_NAME_PAYMENT_CONFIRMATION = "payment_confirmation" as const;
 // Meta's locale code for the template's registered language, "English (UK)" —
 // not plain "en", which is a different template language variant to Meta.
-const TEMPLATE_LANGUAGE = "en_GB" as const;
+const TEMPLATE_LANGUAGE = "en" as const;
 
 // current_period_end is a DATE, so "today" needs a timezone to be meaningful.
 // Defaults to the same zone as locations.timezone in the schema; a gym in IST

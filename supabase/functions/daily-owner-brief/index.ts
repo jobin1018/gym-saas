@@ -49,7 +49,7 @@ const TAG = "daily-owner-brief";
 const TEMPLATE_NAME = "daily_owner_brief" as const;
 // Meta's locale code for the template's registered language, "English (UK)" —
 // not plain "en", which is a different template language variant to Meta.
-const TEMPLATE_LANGUAGE = "en_GB" as const;
+const TEMPLATE_LANGUAGE = "en" as const;
 
 // Orgs that get a brief. 'suspended' is excluded: a suspended account should not
 // be receiving daily operational messages.
