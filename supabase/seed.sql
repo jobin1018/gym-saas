@@ -596,4 +596,78 @@ INSERT INTO whatsapp_messages (organization_id, member_id, direction, body_previ
   ('44444444-4444-4444-4444-444444444444', '80000000-0000-0000-0000-000000000017', 'inbound', 'in',   'delivered', now() - interval '6 hours'),
   ('22222222-2222-2222-2222-222222222222', '80000000-0000-0000-0000-000000000007', 'inbound', 'switch', 'delivered', now() - interval '2 days');
 
+-- ---------------------------------------------------------------------------
+-- PT COACHING — coaches, packages, notes, measurements
+-- (20260829090000..20260829092000 migrations)
+--
+-- Purely additive: new id prefixes (c0ac.../9c00.../not reused elsewhere),
+-- new phone range 9184540000NN, all PIN 1234 (reuses Ravi's bcrypt hash so no
+-- new hash needs computing). Consumed by supabase/rls-test.sh's coaching
+-- section; also lets the real coach UI show live data.
+--
+--   Coaches:  918454000001 Farah Sheikh  coach  Iron Temple / Indiranagar  1234
+--             918454000002 Girish Menon   coach  Iron Temple / Indiranagar  1234
+--             918454000003 Hema Pillai    coach  FlexFit / Koramangala      1234
+--
+--   Packages: Farah  -> Asha Menon (e1111111)   active   muscle_gain 12/8
+--             Farah  -> Deepak Kumar (8000..01) active   fat_loss    12/3
+--             Girish -> Sneha Gupta (8000..02)  active   general     8/2
+--             Farah  -> Chitra Iyer (e3333333)  COMPLETED fat_loss   16/16
+--             Hema   -> Chitra Iyer FF (e4444444) active muscle_gain 12/5
+--   Bharat Rao (e2222222) deliberately has NO package — the "member with no
+--   coaching data" fixture.
+-- ---------------------------------------------------------------------------
+INSERT INTO users (id, organization_id, name, phone, role, location_id, pin_hash) VALUES
+  ('c0ac0000-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111111',
+   'Farah Sheikh', '918454000001', 'coach', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+   '$2a$12$on0RNeDins4a4rqt4Mcpse8sQ/em3Irl1orEyXYomtKV7sH64bpNS'), -- pin 1234
+  ('c0ac0000-0000-0000-0000-000000000002', '11111111-1111-1111-1111-111111111111',
+   'Girish Menon', '918454000002', 'coach', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+   '$2a$12$on0RNeDins4a4rqt4Mcpse8sQ/em3Irl1orEyXYomtKV7sH64bpNS'), -- pin 1234
+  ('c0ac0000-0000-0000-0000-000000000003', '22222222-2222-2222-2222-222222222222',
+   'Hema Pillai',  '918454000003', 'coach', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+   '$2a$12$on0RNeDins4a4rqt4Mcpse8sQ/em3Irl1orEyXYomtKV7sH64bpNS'); -- pin 1234
+
+-- duration_months x sessions_per_month = sessions_purchased (all kept
+-- explicit and consistent; see 20260829098500_pt_packages_session_calc.sql).
+INSERT INTO pt_packages (id, organization_id, member_id, coach_id, goal,
+                         duration_months, sessions_per_month,
+                         sessions_purchased, sessions_used, price, status, start_date) VALUES
+  ('9c000000-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111111',
+   'e1111111-1111-1111-1111-111111111111', 'c0ac0000-0000-0000-0000-000000000001',
+   'muscle_gain', 3, 4, 12, 8, 12000.00, 'active', CURRENT_DATE - 60),
+  ('9c000000-0000-0000-0000-000000000002', '11111111-1111-1111-1111-111111111111',
+   '80000000-0000-0000-0000-000000000001', 'c0ac0000-0000-0000-0000-000000000001',
+   'fat_loss', 3, 4, 12, 3, 12000.00, 'active', CURRENT_DATE - 20),
+  ('9c000000-0000-0000-0000-000000000003', '11111111-1111-1111-1111-111111111111',
+   '80000000-0000-0000-0000-000000000002', 'c0ac0000-0000-0000-0000-000000000002',
+   'general_fitness', 2, 4, 8, 2, 8000.00, 'active', CURRENT_DATE - 14),
+  ('9c000000-0000-0000-0000-000000000004', '11111111-1111-1111-1111-111111111111',
+   'e3333333-3333-3333-3333-333333333333', 'c0ac0000-0000-0000-0000-000000000001',
+   'fat_loss', 4, 4, 16, 16, 16000.00, 'completed', CURRENT_DATE - 180),
+  ('9c000000-0000-0000-0000-000000000005', '22222222-2222-2222-2222-222222222222',
+   'e4444444-4444-4444-4444-444444444444', 'c0ac0000-0000-0000-0000-000000000003',
+   'muscle_gain', 3, 4, 12, 5, 15000.00, 'active', CURRENT_DATE - 30);
+
+INSERT INTO training_notes (organization_id, member_id, coach_id, pt_package_id, note_text, session_date) VALUES
+  ('11111111-1111-1111-1111-111111111111', 'e1111111-1111-1111-1111-111111111111',
+   'c0ac0000-0000-0000-0000-000000000001', '9c000000-0000-0000-0000-000000000001',
+   'Increased squat to 80kg, form solid throughout.', CURRENT_DATE - 2),
+  ('11111111-1111-1111-1111-111111111111', 'e1111111-1111-1111-1111-111111111111',
+   'c0ac0000-0000-0000-0000-000000000001', '9c000000-0000-0000-0000-000000000001',
+   'Bench stalled; deloaded to 60kg and rebuilt.', CURRENT_DATE - 9),
+  ('11111111-1111-1111-1111-111111111111', '80000000-0000-0000-0000-000000000002',
+   'c0ac0000-0000-0000-0000-000000000002', '9c000000-0000-0000-0000-000000000003',
+   'Mobility work — hip flexors loosening up.', CURRENT_DATE - 3);
+
+INSERT INTO body_measurements (organization_id, member_id, recorded_by, weight_kg, height_cm, recorded_at) VALUES
+  ('11111111-1111-1111-1111-111111111111', 'e1111111-1111-1111-1111-111111111111',
+   'c0ac0000-0000-0000-0000-000000000001', 68.0, 176.0, now() - interval '60 days'),
+  ('11111111-1111-1111-1111-111111111111', 'e1111111-1111-1111-1111-111111111111',
+   'c0ac0000-0000-0000-0000-000000000001', 70.5, 176.0, now() - interval '30 days'),
+  ('11111111-1111-1111-1111-111111111111', 'e1111111-1111-1111-1111-111111111111',
+   'c0ac0000-0000-0000-0000-000000000001', 72.0, 176.0, now() - interval '2 days'),
+  ('11111111-1111-1111-1111-111111111111', '80000000-0000-0000-0000-000000000002',
+   'c0ac0000-0000-0000-0000-000000000002', 71.0, 172.0, now() - interval '3 days');
+
 COMMIT;

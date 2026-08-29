@@ -517,6 +517,53 @@ assert_contains "a payment with unrelated notes is still unattributable" \
 assert_contains "unattributable payments are still acked, not retried forever" '"ok":true' "$got"
 
 # ---------------------------------------------------------------------------
+# 11. Multi-month plan — current_period_end extends by duration_months, not 1
+# ---------------------------------------------------------------------------
+printf '\n%s-- multi-month plan period extension --%s\n' "$B" "$N"
+reset_state
+
+# Throwaway fixture, fully self-contained: a 3-month plan, a membership on it
+# (reusing an existing member), and a pending payment. Torn down at the end of
+# this section so nothing else sees it.
+Q_ORG=11111111-1111-1111-1111-111111111111
+Q_PLAN=d0000000-0000-0000-0000-0000000000d1
+Q_MEM=d0000000-0000-0000-0000-0000000000d2
+Q_PAY=d0000000-0000-0000-0000-0000000000d3
+docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+INSERT INTO membership_plans (id, organization_id, name, amount, duration_months)
+VALUES ('$Q_PLAN','$Q_ORG','Quarterly Test', 4000, 3)
+ON CONFLICT (id) DO UPDATE SET duration_months = 3;
+INSERT INTO memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end)
+VALUES ('$Q_MEM','$Q_ORG','e1111111-1111-1111-1111-111111111111','$Q_PLAN','active', CURRENT_DATE, CURRENT_DATE + 30)
+ON CONFLICT (id) DO UPDATE SET status='active', current_period_end = CURRENT_DATE + 30, plan_id = '$Q_PLAN';
+INSERT INTO payments (id, organization_id, membership_id, amount, provider, provider_payment_id, status, idempotency_key)
+VALUES ('$Q_PAY','$Q_ORG','$Q_MEM', 4000, 'razorpay', 'pay_QUARTERLY_TEST', 'pending', 'razpay-test-quarterly')
+ON CONFLICT (id) DO UPDATE SET status='pending', reconciled_at=NULL, provider_payment_id='pay_QUARTERLY_TEST';
+SQL
+
+expected_3mo=$(sql "select (CURRENT_DATE + 30 + interval '3 months')::date;")
+one_month=$(sql "select (CURRENT_DATE + 30 + interval '1 month')::date;")
+
+got=$(post "$(payment_event "payment.captured" "evt_$RUN.q3" "pay_QUARTERLY_TEST" 400000)")
+assert_contains "quarterly-plan capture is handled"        '"handled":"payment_success"' "$got"
+
+new_end=$(sql "select current_period_end from memberships where id='$Q_MEM';")
+assert_db "3-month plan extends current_period_end by 3 months" "$expected_3mo" "$new_end"
+if [ "$new_end" = "$one_month" ]; then
+  bad "3-month plan did NOT fall back to the old +1-month behaviour" "$expected_3mo" "$new_end"
+else
+  ok "3-month plan did NOT fall back to the old +1-month behaviour"
+fi
+
+docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+DELETE FROM whatsapp_messages WHERE related_payment_id='$Q_PAY';
+DELETE FROM webhook_events   WHERE event_id = 'evt_$RUN.q3';
+DELETE FROM payments         WHERE id='$Q_PAY';
+DELETE FROM memberships      WHERE id='$Q_MEM';
+DELETE FROM membership_plans WHERE id='$Q_PLAN';
+SQL
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 reset_state

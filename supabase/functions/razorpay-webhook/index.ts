@@ -82,7 +82,8 @@ function formatRupees(amount: number): string {
 // selected before).
 const PAYMENT_SELECT =
   "id,organization_id,membership_id,amount,status,provider_payment_id,razorpay_link_id," +
-  "memberships(id,member_id,status,current_period_end,members(id,name,phone),membership_plans(name))";
+  "memberships(id,member_id,status,current_period_end,members(id,name,phone)," +
+  "membership_plans(name,duration_months))";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -120,7 +121,7 @@ interface PaymentRow {
     status: string;
     current_period_end: string;
     members: { id: string; name: string; phone: string } | null;
-    membership_plans: { name: string } | null;
+    membership_plans: { name: string; duration_months: number } | null;
   } | null;
 }
 
@@ -152,20 +153,24 @@ function todayInBillingTimezone(): string {
 }
 
 /**
- * Add one calendar month to a YYYY-MM-DD string, clamping to the end of the
- * target month — the same semantics as Postgres `date + interval '1 month'`
- * (2026-01-31 → 2026-02-28). Naive `Date.setMonth()` would overflow to March 3
- * and silently hand out three extra days.
+ * Add `months` calendar months to a YYYY-MM-DD string, clamping to the end of
+ * the target month — the same semantics as Postgres
+ * `date + (n || ' months')::interval` (2026-01-31 + 1 month → 2026-02-28).
+ * Naive `Date.setMonth()` would overflow to March 3 and silently hand out
+ * three extra days.
  *
- * TODO: membership_plans.billing_interval is CHECK-constrained to 'monthly'
- * today. When quarterly/annual plans arrive, read the interval from the plan
- * and generalise this.
+ * `months` comes from membership_plans.duration_months (1 for the legacy
+ * monthly plans, via that column's DEFAULT — see
+ * 20260829098000_membership_plans_duration_months.sql), so a monthly plan
+ * still gets exactly the old +1-month behaviour.
  */
-function addOneMonth(isoDate: string): string {
+function addMonths(isoDate: string, months: number): string {
   const [year, month, day] = isoDate.split("-").map(Number);
 
-  const targetYear = year + Math.floor(month / 12);
-  const targetMonth = (month % 12) + 1;
+  // Zero-based absolute month index, then split back into year/month.
+  const total = year * 12 + (month - 1) + months;
+  const targetYear = Math.floor(total / 12);
+  const targetMonth = (total % 12) + 1; // 1..12
 
   // Day 0 of the following month is the last day of the target month.
   const lastDayOfTarget = new Date(Date.UTC(targetYear, targetMonth, 0))
@@ -550,13 +555,17 @@ async function handlePaymentSuccess(
         "period was extended.",
     );
   } else {
-    // Extend from whichever is later, so paying early adds a month rather than
-    // truncating the remaining period.
+    // Extend from whichever is later, so paying early adds the full period
+    // rather than truncating the remaining time.
     const extendFrom = laterDate(
       todayInBillingTimezone(),
       membership.current_period_end,
     );
-    newPeriodEnd = addOneMonth(extendFrom);
+    // duration_months drives the length. `?? 1` is defensive only: the embed
+    // above always selects it and the column is NOT NULL DEFAULT 1, so a
+    // monthly plan yields exactly the previous +1-month behaviour.
+    const durationMonths = membership.membership_plans?.duration_months ?? 1;
+    newPeriodEnd = addMonths(extendFrom, durationMonths);
 
     const { error: membershipError } = await supabase
       .from("memberships")

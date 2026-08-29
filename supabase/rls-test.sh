@@ -105,6 +105,48 @@ rest_status() {
   curl -s -o /dev/null -w '%{http_code}' "$REST_URL/$2" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $1"
 }
 
+# rest_post_status <token> <path> <json-body> -> HTTP status only (POST/insert)
+rest_post_status() {
+  curl -s -o /dev/null -w '%{http_code}' -X POST "$REST_URL/$2" \
+    -H "apikey: $ANON_KEY" -H "Authorization: Bearer $1" \
+    -H 'Content-Type: application/json' -H 'Prefer: return=representation' -d "$3"
+}
+
+# rest_post <token> <path> <json-body> -> response body (POST/insert, returns the row)
+rest_post() {
+  curl -s -X POST "$REST_URL/$2" \
+    -H "apikey: $ANON_KEY" -H "Authorization: Bearer $1" \
+    -H 'Content-Type: application/json' -H 'Prefer: return=representation' -d "$3"
+}
+
+# rest_patch_status <token> <path-and-filter> <json-body> -> HTTP status only (PATCH/update)
+rest_patch_status() {
+  curl -s -o /dev/null -w '%{http_code}' -X PATCH "$REST_URL/$2" \
+    -H "apikey: $ANON_KEY" -H "Authorization: Bearer $1" \
+    -H 'Content-Type: application/json' -H 'Prefer: return=representation' -d "$3"
+}
+
+# rest_rpc <token> <fn-name> <json-body> -> response body (POST /rpc/<fn>)
+rest_rpc() {
+  curl -s -X POST "$REST_URL/rpc/$2" \
+    -H "apikey: $ANON_KEY" -H "Authorization: Bearer $1" \
+    -H 'Content-Type: application/json' -d "$3"
+}
+
+# rest_rpc_status <token> <fn-name> <json-body> -> HTTP status only, newline-terminated
+rest_rpc_status() {
+  curl -s -o /dev/null -w '%{http_code}\n' -X POST "$REST_URL/rpc/$2" \
+    -H "apikey: $ANON_KEY" -H "Authorization: Bearer $1" \
+    -H 'Content-Type: application/json' -d "$3"
+}
+
+# rest_range <token> <path-and-query> -> the Content-Range value (needs Prefer: count=exact)
+rest_range() {
+  curl -s -D - -o /dev/null "$REST_URL/$2" \
+    -H "apikey: $ANON_KEY" -H "Authorization: Bearer $1" -H 'Prefer: count=exact' \
+    | tr -d '\r' | sed -n 's/^[Cc]ontent-[Rr]ange: *//p'
+}
+
 # count_rows <json-array-body> -> number of elements (crude but dependency-free)
 count_rows() {
   local body="$1"
@@ -128,6 +170,27 @@ DELETE FROM members WHERE id = '$MEMBER_LOC2';
 DELETE FROM locations WHERE id = '$LOC_IRON_2';
 DELETE FROM whatsapp_messages WHERE body_preview IN ('rls-test broadcast', 'rls-test member message');
 UPDATE organizations SET gst_number = NULL WHERE id = '$ORG_FLEX';
+-- coaching section's own inserts (seed rows carry none of these markers).
+-- body_measurements FIRST — it FK-references training_notes now.
+DELETE FROM body_measurements
+ WHERE weight_kg = 77.77
+    OR member_id IN ('80000000-0000-0000-0000-000000000004',   -- Ritu: fixture-only coaching data
+                     '80000000-0000-0000-0000-000000000005')   -- Ajay: fixture-only coaching data
+    OR training_note_id IN (SELECT id FROM training_notes WHERE note_text LIKE 'rls-test%');
+DELETE FROM training_notes
+ WHERE note_text LIKE 'rls-test%'
+    OR pt_package_id IN ('9c000000-0000-0000-0000-0000000000f1',
+                         '9c000000-0000-0000-0000-0000000000f3');
+DELETE FROM pt_packages
+ WHERE (price >= 4321.00 AND price < 4400.00)   -- 4321.xx: this suite's created packages
+    OR id IN ('9c000000-0000-0000-0000-0000000000f1',
+              '9c000000-0000-0000-0000-0000000000f3');
+-- the session-count trigger bumps sessions_used on every note; deleting the
+-- note does not undo the bump, so restore the one seed package the coaching
+-- section writes a real note against (keeps repeated runs without `db reset`
+-- stable).
+UPDATE pt_packages SET sessions_used = 8, status = 'active'
+ WHERE id = '9c000000-0000-0000-0000-000000000001';
 SQL
 }
 
@@ -147,6 +210,20 @@ VALUES ('$ORG_IRON', NULL, 'outbound', 'daily_owner_brief', 'rls-test broadcast'
 
 INSERT INTO whatsapp_messages (organization_id, member_id, direction, template_name, body_preview, status)
 VALUES ('$ORG_IRON', 'e2222222-2222-2222-2222-222222222222', 'outbound', 'renewal_reminder', 'rls-test member message', 'queued');
+
+-- Coaching fixtures for the log_session / session-count / pagination tests.
+-- Both: Farah (c0ac...01) is the coach; Ritu / Ajay are otherwise-uncoached
+-- Indiranagar members so this suite fully owns their coaching rows.
+--   f1: 5 purchased, 0 used  -> the pagination + auto-complete-at-5 package
+--   f3: 5 purchased, 4 used  -> the concurrent-boundary (race) package
+INSERT INTO pt_packages
+  (id, organization_id, member_id, coach_id, goal,
+   duration_months, sessions_per_month, sessions_purchased, sessions_used, price, status, start_date)
+VALUES
+  ('9c000000-0000-0000-0000-0000000000f1', '$ORG_IRON', '80000000-0000-0000-0000-000000000004',
+   'c0ac0000-0000-0000-0000-000000000001', 'fat_loss', 1, 5, 5, 0, 5000.00, 'active', CURRENT_DATE),
+  ('9c000000-0000-0000-0000-0000000000f3', '$ORG_IRON', '80000000-0000-0000-0000-000000000005',
+   'c0ac0000-0000-0000-0000-000000000001', 'general_fitness', 1, 5, 5, 4, 5000.00, 'active', CURRENT_DATE);
 SQL
 }
 
@@ -181,12 +258,20 @@ printf '\n%s-- minting real sessions via staff-login --%s\n' "$B" "$N"
 RAVI=$(login "$ORG_IRON" 919000000001 1234)
 PRIYA=$(login "$ORG_IRON" 919000000011 1111)
 SANJAY=$(login "$ORG_FLEX" 919000000002 2345)
+FARAH=$(login "$ORG_IRON" 918454000001 1234)   # coach, Iron — clients: Asha, Deepak
+GIRISH=$(login "$ORG_IRON" 918454000002 1234)  # coach, Iron — client: Sneha
+HEMA=$(login "$ORG_FLEX" 918454000003 1234)    # coach, FlexFit — client: Chitra (FF)
 
 if [ -z "$RAVI" ] || [ -z "$PRIYA" ] || [ -z "$SANJAY" ]; then
   printf '\n%sERROR%s could not mint one or more sessions — check staff-login / seed.sql.\n\n' "$R" "$N"
   exit 1
 fi
+if [ -z "$FARAH" ] || [ -z "$GIRISH" ] || [ -z "$HEMA" ]; then
+  printf '\n%sERROR%s could not mint coach sessions — check the coach role / seed.sql PT section.\n\n' "$R" "$N"
+  exit 1
+fi
 ok "minted real sessions for Ravi (Iron owner), Priya (Iron front_desk), Sanjay (FlexFit owner)"
+ok "minted real coach sessions for Farah + Girish (Iron) and Hema (FlexFit)"
 
 # ---------------------------------------------------------------------------
 # 1. Cross-tenant isolation
@@ -272,7 +357,7 @@ assert_contains "Priya DOES see the member-tied message (her location)" "rls-tes
 # ---------------------------------------------------------------------------
 printf '\n%s-- anon lockout is zero rows, not an error --%s\n' "$B" "$N"
 
-for table in organizations locations members membership_plans memberships payments attendance whatsapp_messages organizations_for_client; do
+for table in organizations locations members membership_plans memberships payments attendance whatsapp_messages organizations_for_client pt_packages training_notes body_measurements; do
   status=$(rest_status "$ANON_KEY" "$table?select=id&limit=1")
   body=$(rest "$ANON_KEY" "$table?select=id&limit=1")
   assert_equals "anon reading $table is 200" "200" "$status"
@@ -286,7 +371,11 @@ printf '\n%s-- tampered JWT --%s\n' "$B" "$N"
 printf '   (a 401 here proves the request never reached RLS at all — a\n'
 printf '    stronger, different guarantee than case 6''s "zero rows")\n'
 
-TAMPERED="${RAVI%?}X"
+# Corrupt the last 8 chars of the signature, not just the last 1: a single
+# base64url char at the end of an ES256 signature carries only 2 significant
+# bits, so a 1-char flip decodes to the SAME signature bytes ~1 time in 16 —
+# which is why this case used to fail intermittently.
+TAMPERED="${RAVI%????????}AAAAAAAA"
 if [ "$TAMPERED" = "$RAVI" ]; then
   bad "tampering actually changed the token" "a different string" "identical (test bug)"
 else
@@ -295,6 +384,264 @@ else
   body=$(rest "$TAMPERED" "members?select=id")
   assert_contains "the rejection names a JWT/key problem, not a data answer" "PGRST301" "$body"
 fi
+
+# ---------------------------------------------------------------------------
+# 8. PT coaching — assignment-scoped, NOT location-scoped
+# ---------------------------------------------------------------------------
+# Seed (supabase/seed.sql PT section):
+#   Farah  -> Asha Menon (e1111111)          active   pkg 9c..01
+#   Farah  -> Deepak Kumar (8000..01)        active   pkg 9c..02
+#   Girish -> Sneha Gupta (8000..02)         active   pkg 9c..03
+#   Farah  -> Chitra Iyer Iron (e3333333)    COMPLETED pkg 9c..04
+#   Hema   -> Chitra Iyer FlexFit (e4444444) active   pkg 9c..05
+#   Bharat Rao (e2222222) — no package at all
+printf '\n%s-- PT coaching: assignment-scoped access --%s\n' "$B" "$N"
+
+ASHA=e1111111-1111-1111-1111-111111111111
+DEEPAK=80000000-0000-0000-0000-000000000001
+SNEHA=80000000-0000-0000-0000-000000000002
+RITU=80000000-0000-0000-0000-000000000004        # Farah's fixture package f1 (arrange_fixtures)
+POOJA=80000000-0000-0000-0000-000000000006       # Indiranagar member, never assigned to any coach
+CHITRA_IRON=e3333333-3333-3333-3333-333333333333 # Farah's package is COMPLETED
+BHARAT=e2222222-2222-2222-2222-222222222222      # no package
+CHITRA_FF=e4444444-4444-4444-4444-444444444444
+FARAH_UID=c0ac0000-0000-0000-0000-000000000001
+GIRISH_UID=c0ac0000-0000-0000-0000-000000000002
+PKG_ASHA=9c000000-0000-0000-0000-000000000001
+PKG_SNEHA=9c000000-0000-0000-0000-000000000003
+PKG_CHITRA_DONE=9c000000-0000-0000-0000-000000000004
+
+# --- a coach sees every member assigned to them, ANY package status
+#     (completed-package history included, per 20260829097000) — but NOT
+#     unassigned members at their own branch ---
+got=$(rest "$FARAH" "members?organization_id=eq.$ORG_IRON&select=id")
+assert_contains     "Farah sees Asha (active assignment)"          "$ASHA" "$got"
+assert_contains     "Farah sees Deepak (active assignment)"        "$DEEPAK" "$got"
+assert_contains     "Farah sees Chitra — completed-package history (097000)" "$CHITRA_IRON" "$got"
+assert_not_contains "Farah does NOT see Sneha (Girish's client)"   "$SNEHA" "$got"
+assert_not_contains "Farah does NOT see Bharat (no package)"       "$BHARAT" "$got"
+assert_not_contains "Farah does NOT see Pooja (Indiranagar, no coach assignment) — proves NOT location-scoped" "$POOJA" "$got"
+
+got=$(rest "$GIRISH" "members?organization_id=eq.$ORG_IRON&select=id")
+assert_contains     "Girish sees Sneha"                            "$SNEHA" "$got"
+assert_not_contains "Girish does NOT see Asha"                     "$ASHA" "$got"
+
+# --- pt_packages: coach sees every package assigned to them (any status);
+#     other coaches' packages stay hidden ---
+got=$(rest "$FARAH" "pt_packages?select=id,status")
+assert_contains     "Farah sees her active package for Asha"       "$PKG_ASHA" "$got"
+assert_not_contains "Farah does NOT see Girish's package"          "$PKG_SNEHA" "$got"
+assert_contains     "Farah DOES see her own COMPLETED package (history)" "$PKG_CHITRA_DONE" "$got"
+assert_equals       "Farah's pt_packages read is 200"             "200" "$(rest_status "$FARAH" "pt_packages?select=id")"
+
+got=$(rest "$RAVI" "pt_packages?select=id,status")
+assert_contains "Ravi (owner) still sees the completed package"    "$PKG_CHITRA_DONE" "$got"
+
+# --- coach retains READ on an inactive package, but NO write of any kind
+#     (migration 20260829093000: only the coach SELECT branch widened) ---
+got=$(rest "$FARAH" "pt_packages?id=eq.$PKG_CHITRA_DONE&select=id,status,member_id,goal")
+assert_contains "Farah can SELECT the completed package by id"     "$PKG_CHITRA_DONE" "$got"
+assert_contains "  ...and it really is the completed one"          '"status":"completed"' "$got"
+assert_contains "  ...and it carries the assigned member"          "$CHITRA_IRON" "$got"
+
+NOTE_DONE="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$CHITRA_IRON\",\"coach_id\":\"$FARAH_UID\",\"pt_package_id\":\"$PKG_CHITRA_DONE\",\"note_text\":\"rls-test on a completed pkg\"}"
+assert_equals "Farah CANNOT add a training_note against the completed package"       "403" "$(rest_post_status "$FARAH" "training_notes" "$NOTE_DONE")"
+BM_DONE="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$CHITRA_IRON\",\"recorded_by\":\"$FARAH_UID\",\"weight_kg\":77.77,\"height_cm\":175}"
+assert_equals "Farah CANNOT add a measurement for a member whose package is completed" "403" "$(rest_post_status "$FARAH" "body_measurements" "$BM_DONE")"
+assert_equals "Farah CANNOT UPDATE the completed package itself"                     "403" "$(rest_patch_status "$FARAH" "pt_packages?id=eq.$PKG_CHITRA_DONE" '{"sessions_used":15}')"
+assert_equals "Farah's read of the completed-package member's training_notes is permitted, not 403" "200" "$(rest_status "$FARAH" "training_notes?member_id=eq.$CHITRA_IRON&select=id")"
+assert_contains "post-097000 the completed-package member IS on Farah's member list (history)" "$CHITRA_IRON" "$(rest "$FARAH" "members?organization_id=eq.$ORG_IRON&select=id")"
+
+got=$(rest "$PRIYA" "pt_packages?select=id")
+priya_pkgs=$(count_rows "$got")
+if [ "$priya_pkgs" -ge 4 ] 2>/dev/null; then
+  ok "Priya (front_desk) sees her location's packages ($priya_pkgs)"
+else
+  bad "Priya (front_desk) sees her location's packages" ">=4" "$priya_pkgs"
+fi
+
+# --- training_notes / body_measurements: coach scoped, front_desk shut out ---
+got=$(rest "$FARAH" "training_notes?select=note_text")
+assert_contains     "Farah sees Asha's session note"              "Increased squat" "$got"
+assert_not_contains "Farah does NOT see Girish's note for Sneha"  "Mobility work" "$got"
+got=$(rest "$GIRISH" "training_notes?select=note_text")
+assert_contains     "Girish sees his note for Sneha"              "Mobility work" "$got"
+assert_not_contains "Girish does NOT see Farah's note for Asha"   "Increased squat" "$got"
+
+assert_equals "Priya (front_desk) sees zero training_notes"       "0" "$(count_rows "$(rest "$PRIYA" "training_notes?select=id")")"
+assert_equals "Priya's training_notes read is 200, not 403"       "200" "$(rest_status "$PRIYA" "training_notes?select=id")"
+assert_equals "Priya (front_desk) sees zero body_measurements"    "0" "$(count_rows "$(rest "$PRIYA" "body_measurements?select=id")")"
+
+got=$(rest "$FARAH" "body_measurements?member_id=eq.$ASHA&select=id")
+farah_bm=$(count_rows "$got")
+if [ "$farah_bm" -gt 0 ] 2>/dev/null; then ok "Farah sees Asha's measurements ($farah_bm)"; else bad "Farah sees Asha's measurements" ">0" "$farah_bm"; fi
+assert_equals "Farah sees zero measurements for Sneha (not hers)" "0" "$(count_rows "$(rest "$FARAH" "body_measurements?member_id=eq.$SNEHA&select=id")")"
+
+# --- "most recent height" query + generated BMI ---
+got=$(rest "$FARAH" "body_measurements?member_id=eq.$ASHA&select=weight_kg,height_cm,bmi&order=recorded_at.desc&limit=1")
+assert_contains "most-recent measurement carries the last-recorded height (176)" '"height_cm":176' "$got"
+assert_contains "generated BMI is correct for 72.0kg / 176cm (23.2)"             '"bmi":23.2' "$got"
+
+# --- writes: coach can log only for active-assigned clients ---
+NOTE_OK="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"coach_id\":\"$FARAH_UID\",\"pt_package_id\":\"$PKG_ASHA\",\"note_text\":\"rls-test squat pr\"}"
+assert_equals "Farah CAN add a note for Asha (active package)"    "201" "$(rest_post_status "$FARAH" "training_notes" "$NOTE_OK")"
+NOTE_BAD="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$BHARAT\",\"coach_id\":\"$FARAH_UID\",\"pt_package_id\":\"$PKG_ASHA\",\"note_text\":\"rls-test nope\"}"
+assert_equals "Farah CANNOT add a note for Bharat (no package)"   "403" "$(rest_post_status "$FARAH" "training_notes" "$NOTE_BAD")"
+NOTE_SPOOF="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$SNEHA\",\"coach_id\":\"$GIRISH_UID\",\"pt_package_id\":\"$PKG_SNEHA\",\"note_text\":\"rls-test spoof\"}"
+assert_equals "Farah CANNOT add a note as Girish for Sneha"       "403" "$(rest_post_status "$FARAH" "training_notes" "$NOTE_SPOOF")"
+
+BM_OK="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"recorded_by\":\"$FARAH_UID\",\"weight_kg\":77.77,\"height_cm\":180}"
+assert_equals "Farah CAN add a measurement for Asha"              "201" "$(rest_post_status "$FARAH" "body_measurements" "$BM_OK")"
+BM_BAD="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$SNEHA\",\"recorded_by\":\"$FARAH_UID\",\"weight_kg\":77.77,\"height_cm\":170}"
+assert_equals "Farah CANNOT add a measurement for Sneha"          "403" "$(rest_post_status "$FARAH" "body_measurements" "$BM_BAD")"
+
+got=$(rest "$FARAH" "body_measurements?member_id=eq.$ASHA&select=bmi&weight_kg=eq.77.77")
+assert_contains "generated BMI is correct for the 77.77kg / 180cm insert (24.0)" '"bmi":24' "$got"
+
+# --- writes: coach cannot create/modify packages; front_desk can ---
+PKG_BY_COACH="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"coach_id\":\"$FARAH_UID\",\"goal\":\"fat_loss\",\"sessions_purchased\":10,\"price\":4321.00}"
+assert_equals "Farah (coach) CANNOT create a pt_package"          "403" "$(rest_post_status "$FARAH" "pt_packages" "$PKG_BY_COACH")"
+PKG_BY_FD="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"coach_id\":\"$GIRISH_UID\",\"goal\":\"general_fitness\",\"sessions_purchased\":6,\"price\":4321.00}"
+assert_equals "Priya (front_desk) CAN create a pt_package + assign a coach" "201" "$(rest_post_status "$PRIYA" "pt_packages" "$PKG_BY_FD")"
+PKG_BAD_COACH="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"coach_id\":\"91111111-1111-1111-1111-111111111111\",\"goal\":\"fat_loss\",\"sessions_purchased\":5,\"price\":4321.00}"
+assert_equals "assigning a NON-coach user as coach_id is rejected (trigger)" "400" "$(rest_post_status "$PRIYA" "pt_packages" "$PKG_BAD_COACH")"
+
+# --- sessions_purchased derived from duration_months * sessions_per_month,
+#     but overridable (migration 20260829098500) ---
+PKG_DERIVE="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"coach_id\":\"$GIRISH_UID\",\"goal\":\"muscle_gain\",\"duration_months\":6,\"sessions_per_month\":4,\"price\":4321.10}"
+got=$(rest_post "$PRIYA" "pt_packages?select=duration_months,sessions_per_month,sessions_purchased" "$PKG_DERIVE")
+assert_contains "6-month x 4/month package derives sessions_purchased = 24" '"sessions_purchased":24' "$got"
+
+PKG_1MO="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"coach_id\":\"$GIRISH_UID\",\"goal\":\"fat_loss\",\"duration_months\":1,\"sessions_per_month\":8,\"price\":4321.20}"
+got=$(rest_post "$PRIYA" "pt_packages?select=sessions_purchased" "$PKG_1MO")
+assert_contains "1-month x 8/month package still derives 8 (no regression)" '"sessions_purchased":8' "$got"
+
+PKG_OVERRIDE="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"coach_id\":\"$GIRISH_UID\",\"goal\":\"fat_loss\",\"duration_months\":6,\"sessions_per_month\":4,\"sessions_purchased\":25,\"price\":4321.30}"
+got=$(rest_post "$PRIYA" "pt_packages?select=sessions_purchased" "$PKG_OVERRIDE")
+assert_contains "an explicit sessions_purchased overrides the derived value (25, not 24)" '"sessions_purchased":25' "$got"
+
+# --- cross-org isolation with a valid coach session ---
+assert_equals "Hema (FlexFit coach) reading Iron pt_packages -> 0"    "0" "$(count_rows "$(rest "$HEMA" "pt_packages?organization_id=eq.$ORG_IRON&select=id")")"
+assert_equals "Hema reading Iron training_notes -> 0"                 "0" "$(count_rows "$(rest "$HEMA" "training_notes?organization_id=eq.$ORG_IRON&select=id")")"
+assert_equals "Hema reading Iron members -> 0"                        "0" "$(count_rows "$(rest "$HEMA" "members?organization_id=eq.$ORG_IRON&select=id")")"
+assert_equals "Farah reading FlexFit pt_packages -> 0"               "0" "$(count_rows "$(rest "$FARAH" "pt_packages?organization_id=eq.$ORG_FLEX&select=id")")"
+
+# --- member with no package: no coaching data anywhere, cleanly ---
+assert_equals "owner: pt_packages for Bharat -> 0"        "0" "$(count_rows "$(rest "$RAVI" "pt_packages?member_id=eq.$BHARAT&select=id")")"
+assert_equals "owner: training_notes for Bharat -> 0"     "0" "$(count_rows "$(rest "$RAVI" "training_notes?member_id=eq.$BHARAT&select=id")")"
+assert_equals "owner: body_measurements for Bharat -> 0"  "0" "$(count_rows "$(rest "$RAVI" "body_measurements?member_id=eq.$BHARAT&select=id")")"
+assert_equals "owner reads on an unpackaged member are 200, not errors" "200" "$(rest_status "$RAVI" "training_notes?member_id=eq.$BHARAT&select=id")"
+
+# ---------------------------------------------------------------------------
+# 9. Unified session write — log_session RPC, session-count trigger, paginated
+#    session history
+# ---------------------------------------------------------------------------
+printf '\n%s-- unified session: log_session + session count + history --%s\n' "$B" "$N"
+
+RITU=80000000-0000-0000-0000-000000000004        # Farah -> Ritu, pkg f1 (5 purchased), from arrange_fixtures
+AJAY=80000000-0000-0000-0000-000000000005        # Farah -> Ajay, pkg f3 (4/5), from arrange_fixtures
+PKG_PAGE=9c000000-0000-0000-0000-0000000000f1
+PKG_RACE=9c000000-0000-0000-0000-0000000000f3
+
+# --- who may NOT call log_session (package f1 still untouched at 0/5) ---
+assert_equals "front_desk cannot log_session" "403" \
+  "$(rest_rpc_status "$PRIYA" log_session "{\"p_member_id\":\"$RITU\",\"p_pt_package_id\":\"$PKG_PAGE\",\"p_note_text\":\"rls-test fd\"}")"
+assert_equals "a coach cannot log_session against another coach's package" "403" \
+  "$(rest_rpc_status "$GIRISH" log_session "{\"p_member_id\":\"$RITU\",\"p_pt_package_id\":\"$PKG_PAGE\",\"p_note_text\":\"rls-test xcoach\"}")"
+assert_equals "a coach in another org cannot log_session here" "403" \
+  "$(rest_rpc_status "$HEMA" log_session "{\"p_member_id\":\"$RITU\",\"p_pt_package_id\":\"$PKG_PAGE\",\"p_note_text\":\"rls-test xorg\"}")"
+assert_equals "log_session with weight but no height is rejected (both-or-neither)" "400" \
+  "$(rest_rpc_status "$FARAH" log_session "{\"p_member_id\":\"$RITU\",\"p_pt_package_id\":\"$PKG_PAGE\",\"p_note_text\":\"rls-test half\",\"p_weight_kg\":70}")"
+assert_equals "  ...and none of those rejected calls advanced the session count" "0" \
+  "$(sql "select sessions_used from pt_packages where id='$PKG_PAGE'")"
+
+# --- session with note only ---
+got=$(rest_rpc "$FARAH" log_session "{\"p_member_id\":\"$RITU\",\"p_pt_package_id\":\"$PKG_PAGE\",\"p_note_text\":\"rls-test S1\",\"p_session_date\":\"2026-01-01\"}")
+assert_contains "log_session (note only) returns a training_note_id"      '"training_note_id":"' "$got"
+assert_contains "log_session (note only) leaves body_measurement_id null"  '"body_measurement_id":null' "$got"
+assert_contains "log_session (note only) advances sessions_used to 1"      '"sessions_used":1' "$got"
+
+# --- session with note + linked measurement ---
+got=$(rest_rpc "$FARAH" log_session "{\"p_member_id\":\"$RITU\",\"p_pt_package_id\":\"$PKG_PAGE\",\"p_note_text\":\"rls-test S2\",\"p_session_date\":\"2026-01-02\",\"p_weight_kg\":80.00,\"p_height_cm\":178}")
+assert_contains "log_session (note + measurement) returns a body_measurement_id" '"body_measurement_id":"' "$got"
+assert_contains "log_session (note + measurement) advances sessions_used to 2"    '"sessions_used":2' "$got"
+s2_note=$(printf '%s' "$got" | sed -n 's/.*"training_note_id":"\([^"]*\)".*/\1/p')
+got=$(rest "$FARAH" "body_measurements?training_note_id=eq.$s2_note&select=weight_kg,bmi,member_id")
+assert_contains "the linked measurement is stored against the right member" "\"member_id\":\"$RITU\"" "$got"
+assert_contains "the linked measurement's generated BMI is correct (80.0/178 -> 25.2)" '"bmi":25.2' "$got"
+
+# --- three more sessions bring it to the purchased count -> auto-complete ---
+rest_rpc "$FARAH" log_session "{\"p_member_id\":\"$RITU\",\"p_pt_package_id\":\"$PKG_PAGE\",\"p_note_text\":\"rls-test S3\"}" >/dev/null
+rest_rpc "$FARAH" log_session "{\"p_member_id\":\"$RITU\",\"p_pt_package_id\":\"$PKG_PAGE\",\"p_note_text\":\"rls-test S4\",\"p_weight_kg\":79.50,\"p_height_cm\":178}" >/dev/null
+got=$(rest_rpc "$FARAH" log_session "{\"p_member_id\":\"$RITU\",\"p_pt_package_id\":\"$PKG_PAGE\",\"p_note_text\":\"rls-test S5\"}")
+assert_contains "the session that reaches sessions_purchased auto-completes the package" '"package_status":"completed"' "$got"
+assert_contains "  ...with sessions_used == sessions_purchased"                          '"sessions_used":5' "$got"
+assert_equals   "DB agrees the package is completed" "completed" "$(sql "select status from pt_packages where id='$PKG_PAGE'")"
+
+# --- a completed package rejects a further session, and does not overshoot ---
+assert_equals "log_session on the now-completed package is refused" "403" \
+  "$(rest_rpc_status "$FARAH" log_session "{\"p_member_id\":\"$RITU\",\"p_pt_package_id\":\"$PKG_PAGE\",\"p_note_text\":\"rls-test S6 overflow\"}")"
+assert_equals "  ...sessions_used stayed at the purchased count" "5" "$(sql "select sessions_used from pt_packages where id='$PKG_PAGE'")"
+
+# --- concurrent sessions at the boundary must not overshoot (pkg f3 at 4/5) ---
+race_codes=$(for i in 1 2 3 4 5; do
+  rest_rpc_status "$FARAH" log_session "{\"p_member_id\":\"$AJAY\",\"p_pt_package_id\":\"$PKG_RACE\",\"p_note_text\":\"rls-test race $i\"}" &
+done; wait)
+race_ok=$(printf '%s\n' "$race_codes" | grep -c '^20')
+race_bad=$(printf '%s\n' "$race_codes" | grep -cE '^40[0-9]')
+assert_equals "exactly ONE of 5 concurrent boundary sessions succeeds" "1" "$race_ok"
+assert_equals "the other four are cleanly refused (4xx, no 5xx)"       "4" "$race_bad"
+assert_equals "sessions_used lands exactly on the purchased count"     "5" "$(sql "select sessions_used from pt_packages where id='$PKG_RACE'")"
+assert_equals "the race package is completed"                          "completed" "$(sql "select status from pt_packages where id='$PKG_RACE'")"
+assert_equals "exactly one race note actually persisted"              "1" "$(sql "select count(*) from training_notes where pt_package_id='$PKG_RACE' and note_text like 'rls-test race%'")"
+
+# --- paginated session history: training_notes + optional linked measurement,
+#     session_date desc, keyed tiebreak on created_at then id ---
+PGSEL="member_id=eq.$RITU&select=note_text,session_date,body_measurements(weight_kg,bmi)&order=session_date.desc,created_at.desc,id.desc"
+# full desc order is S5, S4, S3 (all CURRENT_DATE, newest created_at first), then S2 (2026-01-02), S1 (2026-01-01)
+assert_equals "history page 1 range is 0-1 of 5"  "0-1/5" "$(rest_range "$FARAH" "training_notes?$PGSEL&limit=2&offset=0")"
+assert_equals "history page 2 range is 2-3 of 5"  "2-3/5" "$(rest_range "$FARAH" "training_notes?$PGSEL&limit=2&offset=2")"
+assert_equals "history page 3 range is 4-4 of 5"  "4-4/5" "$(rest_range "$FARAH" "training_notes?$PGSEL&limit=2&offset=4")"
+
+p1=$(rest "$FARAH" "training_notes?$PGSEL&limit=2&offset=0")
+assert_contains "page 1 holds the two newest sessions (S5, S4)" "rls-test S5" "$p1"
+assert_contains "page 1 holds S4"                               "rls-test S4" "$p1"
+assert_not_contains "page 1 does NOT spill into S3"             "rls-test S3" "$p1"
+case "$p1" in
+  *'"rls-test S5"'*'"rls-test S4"'*) ok "page 1 rows are ordered newest-first (S5 before S4)" ;;
+  *) bad "page 1 ordering" "S5 before S4" "$p1" ;;
+esac
+assert_contains "S4's linked weigh-in is embedded (bmi 25.10 for 79.50/178)" '25.10' "$p1"
+case "$p1" in
+  *'"rls-test S5"'*'"body_measurements":[]'*) ok "S5 (note only) shows an empty measurement embed" ;;
+  *) bad "S5 empty measurement embed" 'S5 then body_measurements:[]' "$p1" ;;
+esac
+
+p3=$(rest "$FARAH" "training_notes?$PGSEL&limit=2&offset=4")
+assert_contains "page 3 holds the oldest session (S1)"          "rls-test S1" "$p3"
+assert_not_contains "page 3 does NOT still contain S2"          "rls-test S2" "$p3"
+
+# history query is assignment-scoped like everything else
+assert_equals "another coach sees 0 of Ritu's session history"        "0" \
+  "$(count_rows "$(rest "$GIRISH" "training_notes?member_id=eq.$RITU&select=id")")"
+assert_equals "a coach in another org sees 0 of Ritu's session history" "0" \
+  "$(count_rows "$(rest "$HEMA" "training_notes?member_id=eq.$RITU&select=id")")"
+assert_equals "front_desk sees 0 of Ritu's session history"           "0" \
+  "$(count_rows "$(rest "$PRIYA" "training_notes?member_id=eq.$RITU&select=id")")"
+# ...but the assigned coach keeps it after the package completed (093000/097000 history rule)
+hist_n=$(count_rows "$(rest "$FARAH" "training_notes?member_id=eq.$RITU&select=id")")
+if [ "$hist_n" -eq 5 ] 2>/dev/null; then
+  ok "the assigned coach still reads all 5 sessions after the package completed"
+else
+  bad "assigned coach reads completed-package history" "5" "$hist_n"
+fi
+assert_equals "owner reads the same completed-package history org-wide" "5" \
+  "$(count_rows "$(rest "$RAVI" "training_notes?member_id=eq.$RITU&select=id")")"
+
+# cross-org: the new note<->measurement linkage cannot straddle orgs
+xo_note=$(sql "select id from training_notes where member_id='$RITU' and note_text='rls-test S1'")
+assert_equals "a measurement cannot link to a note from a different member (validate trigger)" "400" \
+  "$(rest_post_status "$FARAH" "body_measurements" "{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"recorded_by\":\"c0ac0000-0000-0000-0000-000000000001\",\"weight_kg\":77.77,\"height_cm\":180,\"training_note_id\":\"$xo_note\"}")"
 
 # ---------------------------------------------------------------------------
 # Summary
