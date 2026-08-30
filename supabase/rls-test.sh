@@ -181,10 +181,19 @@ DELETE FROM training_notes
  WHERE note_text LIKE 'rls-test%'
     OR pt_package_id IN ('9c000000-0000-0000-0000-0000000000f1',
                          '9c000000-0000-0000-0000-0000000000f3');
+-- PT payment rows spawned by the pt_packages_record_payment trigger for every
+-- non-seed package this suite creates (must go before their pt_packages).
+DELETE FROM payments
+ WHERE idempotency_key LIKE 'ptpkg-%'
+   AND pt_package_id NOT IN (
+     '9c000000-0000-0000-0000-000000000001','9c000000-0000-0000-0000-000000000002',
+     '9c000000-0000-0000-0000-000000000003','9c000000-0000-0000-0000-000000000004',
+     '9c000000-0000-0000-0000-000000000005');
 DELETE FROM pt_packages
  WHERE (price >= 4321.00 AND price < 4400.00)   -- 4321.xx: this suite's created packages
     OR id IN ('9c000000-0000-0000-0000-0000000000f1',
-              '9c000000-0000-0000-0000-0000000000f3');
+              '9c000000-0000-0000-0000-0000000000f3',
+              '9c000000-0000-0000-0000-0000000000f5');
 -- the session-count trigger bumps sessions_used on every note; deleting the
 -- note does not undo the bump, so restore the one seed package the coaching
 -- section writes a real note against (keeps repeated runs without `db reset`
@@ -225,7 +234,12 @@ VALUES
   ('9c000000-0000-0000-0000-0000000000f1', '$ORG_IRON', '80000000-0000-0000-0000-000000000004',
    'c0ac0000-0000-0000-0000-000000000001', 'fat_loss', 1, 5, 5, 0, 5000.00, 'active', CURRENT_DATE),
   ('9c000000-0000-0000-0000-0000000000f3', '$ORG_IRON', '80000000-0000-0000-0000-000000000005',
-   'c0ac0000-0000-0000-0000-000000000001', 'general_fitness', 1, 5, 5, 4, 5000.00, 'active', CURRENT_DATE);
+   'c0ac0000-0000-0000-0000-000000000001', 'general_fitness', 1, 5, 5, 4, 5000.00, 'active', CURRENT_DATE),
+  -- f5: 1 session left -> shows in v_pt_packages_attention (low_sessions).
+  -- price 0 so the pt_packages_record_payment trigger creates no payment row.
+  -- Manoj (8000..03) is otherwise unreferenced by this suite.
+  ('9c000000-0000-0000-0000-0000000000f5', '$ORG_IRON', '80000000-0000-0000-0000-000000000003',
+   'c0ac0000-0000-0000-0000-000000000001', 'muscle_gain', 1, 5, 5, 4, 0, 'active', CURRENT_DATE);
 SQL
 }
 
@@ -686,6 +700,49 @@ assert_contains "a coach still reads the plan catalogue (USING unchanged)" "rls-
 
 assert_equals "anon CANNOT create a plan" "401" \
   "$(rest_post_status "$ANON_KEY" "membership_plans" "{\"organization_id\":\"$ORG_IRON\",\"name\":\"rls-test plan anon\",\"amount\":1.00}")"
+
+# ---------------------------------------------------------------------------
+# 11. PT-package payments + revenue-by-source + attention view
+#     (migrations 20260829101000 / 101500 / 102000)
+# ---------------------------------------------------------------------------
+printf '\n%s-- PT payments, revenue split, attention view --%s\n' "$B" "$N"
+
+# --- selling a PT package records a payment (trigger); owner sees it, front_desk does not ---
+got=$(rest "$RAVI" "payments?pt_package_id=eq.9c000000-0000-0000-0000-000000000001&select=amount,status,membership_id")
+assert_contains "owner sees the auto-recorded PT payment"          '"amount":12000' "$got"
+assert_contains "  ...as a manual payment"                         '"status":"manual"' "$got"
+assert_contains "  ...with membership_id null (XOR)"               '"membership_id":null' "$got"
+assert_equals   "front_desk sees zero PT payments (owner-only, unchanged)" "0" \
+  "$(count_rows "$(rest "$PRIYA" "payments?pt_package_id=eq.9c000000-0000-0000-0000-000000000001&select=id")")"
+
+# --- XOR constraint (DB-level; no authenticated INSERT grant on payments, so
+#     exercised via psql — the trigger/seed/service_role paths all hit it) ---
+xor_both=$(docker exec "$DB_CONTAINER" psql -U postgres -d postgres -tAc "INSERT INTO payments (organization_id, membership_id, pt_package_id, amount, provider, status, idempotency_key) VALUES ('$ORG_IRON','f1111111-1111-1111-1111-111111111111','9c000000-0000-0000-0000-000000000001',1,'x','manual','rls-test-xor-both');" 2>&1)
+assert_contains "a payment naming BOTH subjects violates payments_subject_xor"    "payments_subject_xor" "$xor_both"
+xor_none=$(docker exec "$DB_CONTAINER" psql -U postgres -d postgres -tAc "INSERT INTO payments (organization_id, amount, provider, status, idempotency_key) VALUES ('$ORG_IRON',1,'x','manual','rls-test-xor-none');" 2>&1)
+assert_contains "a payment naming NEITHER subject violates payments_subject_xor"  "payments_subject_xor" "$xor_none"
+
+# --- revenue by source: owner sees a membership + a pt_package line; they sum to the combined view ---
+got=$(rest "$RAVI" "v_daily_revenue_by_source?organization_id=eq.$ORG_IRON&select=source,total")
+assert_contains "owner's revenue breakout has a membership line"   '"source":"membership"' "$got"
+assert_contains "owner's revenue breakout has a pt_package line"    '"source":"pt_package"' "$got"
+assert_equals   "front_desk sees zero revenue rows (security_invoker -> payments RLS)" "[]" \
+  "$(rest "$PRIYA" "v_daily_revenue_by_source?organization_id=eq.$ORG_IRON&select=total")"
+by_source_sum=$(sql "select coalesce(sum(total),0)::int from v_daily_revenue_by_source where organization_id='$ORG_IRON'")
+combined_sum=$(sql "select coalesce(sum(total),0)::int from v_daily_revenue where organization_id='$ORG_IRON'")
+assert_equals "combined v_daily_revenue == sum of the by-source split" "$by_source_sum" "$combined_sum"
+
+# --- v_pt_packages_attention: owner-only, flags the low-session fixture (f5) ---
+got=$(rest "$RAVI" "v_pt_packages_attention?select=id,low_sessions,sessions_remaining,member_name")
+assert_contains "owner sees the low-session package in the attention view" "9c000000-0000-0000-0000-0000000000f5" "$got"
+assert_contains "  ...flagged low_sessions"                        '"low_sessions":true' "$got"
+assert_contains "  ...with the member name joined in"              '"member_name":"Manoj Tiwari"' "$got"
+assert_equals   "front_desk sees nothing in the attention view (owner-only)" "0" \
+  "$(count_rows "$(rest "$PRIYA" "v_pt_packages_attention?select=id")")"
+assert_equals   "a coach sees nothing in the attention view (owner-only)" "0" \
+  "$(count_rows "$(rest "$FARAH" "v_pt_packages_attention?select=id")")"
+assert_equals   "cross-org: FlexFit owner sees no Iron attention rows" "0" \
+  "$(count_rows "$(rest "$SANJAY" "v_pt_packages_attention?select=id")")"
 
 # ---------------------------------------------------------------------------
 # Summary

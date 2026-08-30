@@ -59,6 +59,13 @@ const MESSAGE = {
   paymentReceived: (name: string, amountRupees: string, planName: string, until: string) =>
     `Hi ${name}, we've received your payment of ₹${amountRupees} for ${planName}. ` +
     `Your membership is now active until ${until}. Thank you for staying with us!`,
+  // TODO(meta): no pt_payment_confirmation template is approved yet, so a PT
+  // package payment confirmation goes out as free-form text — a REAL send,
+  // just not template-wrapped. Add the template call once approved, exactly
+  // like payment_confirmation above.
+  ptPaymentReceived: (name: string, amountRupees: string) =>
+    `Hi ${name}, we've received your payment of ₹${amountRupees} for your ` +
+    `personal training package. Thank you!`,
   // TODO(meta): no payment_failed template is approved yet, so this still goes
   // out as free-form text — a REAL send (not simulated), just not template-
   // wrapped. Switch to a template call the moment payment_failed is approved
@@ -81,9 +88,10 @@ function formatRupees(amount: number): string {
 // {{3}} — the old free-form message didn't need a plan name, so it wasn't
 // selected before).
 const PAYMENT_SELECT =
-  "id,organization_id,membership_id,amount,status,provider_payment_id,razorpay_link_id," +
+  "id,organization_id,membership_id,pt_package_id,amount,status,provider_payment_id,razorpay_link_id," +
   "memberships(id,member_id,status,current_period_end,duration_months," +
-  "members(id,name,phone),membership_plans(name))";
+  "members(id,name,phone),membership_plans(name))," +
+  "pt_packages(id,member_id,goal,members(id,name,phone))";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -103,14 +111,22 @@ interface ExtractedPayment {
   notes: {
     organizationId: string | null;
     membershipId: string | null;
+    ptPackageId: string | null;
     idempotencyKey: string | null;
   };
+}
+
+interface MemberRef {
+  id: string;
+  name: string;
+  phone: string;
 }
 
 interface PaymentRow {
   id: string;
   organization_id: string;
-  membership_id: string;
+  membership_id: string | null;
+  pt_package_id: string | null;
   amount: number | string;
   status: string;
   provider_payment_id: string | null;
@@ -121,8 +137,14 @@ interface PaymentRow {
     status: string;
     current_period_end: string;
     duration_months: number;
-    members: { id: string; name: string; phone: string } | null;
+    members: MemberRef | null;
     membership_plans: { name: string } | null;
+  } | null;
+  pt_packages: {
+    id: string;
+    member_id: string;
+    goal: string;
+    members: MemberRef | null;
   } | null;
 }
 
@@ -130,7 +152,8 @@ type MatchedBy =
   | "provider_payment_id"
   | "razorpay_link_id"
   | "notes_idempotency_key"
-  | "notes_membership_id";
+  | "notes_membership_id"
+  | "notes_pt_package_id";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -272,6 +295,7 @@ function extractPayment(body: any): ExtractedPayment {
     notes: {
       organizationId: note("organization_id"),
       membershipId: note("membership_id"),
+      ptPackageId: note("pt_package_id"),
       idempotencyKey: note("idempotency_key"),
     },
   };
@@ -462,6 +486,32 @@ async function findPaymentRow(
     }
   }
 
+  // --- Tier 4 (PT): notes.organization_id + notes.pt_package_id, still pending ---
+  // Same shape and same safety argument as the membership tier above, for a
+  // PT-package payment link (Razorpay PT checkout, a fast-follow — see
+  // 20260829101000). Both ids required together; cannot cross a tenant.
+  if (extracted.notes.ptPackageId && extracted.notes.organizationId) {
+    const { data, error } = await supabase
+      .from("payments")
+      .select(PAYMENT_SELECT)
+      .eq("organization_id", extracted.notes.organizationId)
+      .eq("pt_package_id", extracted.notes.ptPackageId)
+      .eq("status", "pending")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (data) {
+      console.warn(
+        "[razorpay-webhook] matched via notes.pt_package_id " +
+          `${extracted.notes.ptPackageId} (newest pending payment for that ` +
+          "PT package).",
+      );
+      return { row: data as PaymentRow, matchedBy: "notes_pt_package_id" };
+    }
+  }
+
   return null;
 }
 
@@ -545,70 +595,103 @@ async function handlePaymentSuccess(
     throw paymentError;
   }
 
-  // --- Extend the membership period ---
-  const membership = row.memberships;
-  let newPeriodEnd: string | null = null;
-
-  if (!membership) {
-    // memberships.membership_id is NOT NULL, so this is defensive only.
-    console.error(
-      `[razorpay-webhook] payment ${row.id} has no readable membership ` +
-        `(membership_id=${row.membership_id}); payment marked success but no ` +
-        "period was extended.",
-    );
-  } else {
-    // Extend from whichever is later, so paying early adds the full period
-    // rather than truncating the remaining time.
-    const extendFrom = laterDate(
-      todayInBillingTimezone(),
-      membership.current_period_end,
-    );
-    // The MEMBERSHIP's own duration drives the length. `?? 1` is defensive
-    // only: the embed above always selects it and the column is NOT NULL
-    // DEFAULT 1, so a monthly signup yields exactly the previous +1-month
-    // behaviour.
-    const durationMonths = membership.duration_months ?? 1;
-    newPeriodEnd = addMonths(extendFrom, durationMonths);
-
-    const { error: membershipError } = await supabase
-      .from("memberships")
-      .update({ status: "active", current_period_end: newPeriodEnd })
-      .eq("id", membership.id);
-
-    if (membershipError) throw membershipError;
-
-    console.log(
-      `[razorpay-webhook] membership ${membership.id} extended ` +
-        `${membership.current_period_end} -> ${newPeriodEnd} (from ${extendFrom})`,
-    );
-  }
-
-  const memberName = membership?.members?.name ?? "there";
-  const planName = membership?.membership_plans?.name ?? "your plan";
+  // --- Apply the payment ---
+  // A membership payment extends the membership period. A PT-package payment
+  // (pt_package_id set, membership_id null — see 20260829101000) has no period
+  // to extend: the package is already active. The XOR CHECK on payments
+  // guarantees exactly one of the two branches applies.
   const amountRupees = formatRupees(Number(row.amount));
-  const untilText = newPeriodEnd
-    ? formatDateForMember(newPeriodEnd)
-    : "your next billing date";
+
+  let member: MemberRef | null = null;
+  let memberId: string | null = null;
+  let newPeriodEnd: string | null = null;
+  let messageBody: string;
+  let templateArg:
+    | { name: string; language: string; bodyParams: string[] }
+    | undefined;
+
+  if (row.membership_id) {
+    const membership = row.memberships;
+
+    if (!membership) {
+      // Defensive: the FK is intact, so this only happens on a read failure.
+      console.error(
+        `[razorpay-webhook] payment ${row.id} has membership_id=${row.membership_id} ` +
+          "but no readable membership row; marked success, no period extended.",
+      );
+      const memberName = "there";
+      const untilText = "your next billing date";
+      messageBody = MESSAGE.paymentReceived(memberName, amountRupees, "your plan", untilText);
+      templateArg = {
+        name: TEMPLATE_NAME_PAYMENT_CONFIRMATION,
+        language: TEMPLATE_LANGUAGE,
+        bodyParams: [memberName, amountRupees, "your plan", untilText],
+      };
+    } else {
+      // Extend from whichever is later, so paying early adds the full period
+      // rather than truncating the remaining time.
+      const extendFrom = laterDate(
+        todayInBillingTimezone(),
+        membership.current_period_end,
+      );
+      // The MEMBERSHIP's own duration drives the length. `?? 1` is defensive
+      // only: the column is NOT NULL DEFAULT 1, so a monthly signup yields
+      // exactly the previous +1-month behaviour.
+      const durationMonths = membership.duration_months ?? 1;
+      newPeriodEnd = addMonths(extendFrom, durationMonths);
+
+      const { error: membershipError } = await supabase
+        .from("memberships")
+        .update({ status: "active", current_period_end: newPeriodEnd })
+        .eq("id", membership.id);
+      if (membershipError) throw membershipError;
+
+      console.log(
+        `[razorpay-webhook] membership ${membership.id} extended ` +
+          `${membership.current_period_end} -> ${newPeriodEnd} (from ${extendFrom})`,
+      );
+
+      member = membership.members;
+      memberId = membership.member_id;
+      const memberName = member?.name ?? "there";
+      const planName = membership.membership_plans?.name ?? "your plan";
+      const untilText = formatDateForMember(newPeriodEnd);
+      messageBody = MESSAGE.paymentReceived(memberName, amountRupees, planName, untilText);
+      templateArg = {
+        name: TEMPLATE_NAME_PAYMENT_CONFIRMATION,
+        language: TEMPLATE_LANGUAGE,
+        // Same order as the template body.
+        bodyParams: [memberName, amountRupees, planName, untilText],
+      };
+    }
+  } else {
+    // PT-package payment. Nothing to extend; just confirm.
+    const pkg = row.pt_packages;
+    if (!pkg) {
+      console.error(
+        `[razorpay-webhook] payment ${row.id} has pt_package_id=${row.pt_package_id} ` +
+          "but no readable pt_packages row; marked success, confirmation may lack a name.",
+      );
+    }
+    member = pkg?.members ?? null;
+    memberId = pkg?.member_id ?? null;
+    // TODO(meta): no pt_payment_confirmation template — free-form send, real.
+    messageBody = MESSAGE.ptPaymentReceived(member?.name ?? "there", amountRupees);
+    templateArg = undefined;
+  }
 
   const send = await sendWhatsAppMessage(
     supabase,
-    membership?.members?.phone ?? null,
-    MESSAGE.paymentReceived(memberName, amountRupees, planName, untilText),
+    member?.phone ?? null,
+    messageBody,
     {
       tag: TAG,
-      memberId: membership?.member_id ?? null,
+      memberId,
       organizationId: row.organization_id,
       relatedPaymentId: row.id,
-      templateName: TEMPLATE_NAME_PAYMENT_CONFIRMATION,
+      templateName: templateArg ? TEMPLATE_NAME_PAYMENT_CONFIRMATION : null,
     },
-    {
-      name: TEMPLATE_NAME_PAYMENT_CONFIRMATION,
-      language: TEMPLATE_LANGUAGE,
-      // Same order as the template body: "Hi {{1}}, we've received your
-      // payment of ₹{{2}} for {{3}}. Your membership is now active until
-      // {{4}}. Thank you for staying with us!"
-      bodyParams: [memberName, amountRupees, planName, untilText],
-    },
+    templateArg,
   );
 
   if (!send.logged) {
@@ -623,6 +706,7 @@ async function handlePaymentSuccess(
     handled: "payment_success",
     matched_by: matchedBy,
     payment_id: row.id,
+    subject: row.membership_id ? "membership" : "pt_package",
     new_period_end: newPeriodEnd,
   };
 }
@@ -667,20 +751,24 @@ async function handlePaymentFailure(
   // NOTE: membership status is deliberately untouched. A failed attempt on a
   // still-active membership must not revoke access — deciding when to move a
   // membership to past_due/expired is a dunning policy, and belongs in the
-  // scheduled reminder job, not in a payment callback.
+  // scheduled reminder job, not in a payment callback. A PT-package payment
+  // has no equivalent access to revoke.
 
-  const membership = row.memberships;
+  // The member to notify — from the membership OR the PT package, whichever
+  // this payment is for (payments_subject_xor guarantees exactly one).
+  const member = row.memberships?.members ?? row.pt_packages?.members ?? null;
+  const memberId = row.memberships?.member_id ?? row.pt_packages?.member_id ?? null;
 
   // No template argument: payment_failed has no approved template yet, so
   // this is a REAL send (not simulated) but still free-form text. See the
   // TODO(meta) on MESSAGE.paymentFailed above.
   const send = await sendWhatsAppMessage(
     supabase,
-    membership?.members?.phone ?? null,
+    member?.phone ?? null,
     MESSAGE.paymentFailed,
     {
       tag: TAG,
-      memberId: membership?.member_id ?? null,
+      memberId,
       organizationId: row.organization_id,
       relatedPaymentId: row.id,
       templateName: null,

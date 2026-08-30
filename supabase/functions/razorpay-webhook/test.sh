@@ -575,6 +575,53 @@ DELETE FROM membership_plans WHERE id='$Q_PLAN';
 SQL
 
 # ---------------------------------------------------------------------------
+# 12. PT-package payment — reconciled like a membership payment, but with NO
+#     period to extend (20260829101000)
+# ---------------------------------------------------------------------------
+printf '\n%s-- PT-package payment reconciliation --%s\n' "$B" "$N"
+reset_state
+
+PT_PKG=d0000000-0000-0000-0000-0000000000e1
+PT_PAY=d0000000-0000-0000-0000-0000000000e2
+docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+-- price 0 keeps the pt_packages_record_payment trigger out of the way; this
+-- test drives the Razorpay pending -> success path explicitly.
+INSERT INTO pt_packages (id, organization_id, member_id, coach_id, goal,
+                         duration_months, sessions_per_month, sessions_purchased, price, status, start_date)
+VALUES ('$PT_PKG','$ORG_IRON','e1111111-1111-1111-1111-111111111111',
+        'c0ac0000-0000-0000-0000-000000000001','fat_loss',3,4,12,0,'active',CURRENT_DATE)
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO payments (id, organization_id, membership_id, pt_package_id, amount, provider,
+                      provider_payment_id, status, idempotency_key)
+VALUES ('$PT_PAY','$ORG_IRON',NULL,'$PT_PKG',3000,'razorpay',NULL,'pending','razpay-test-ptpkg')
+ON CONFLICT (id) DO UPDATE SET status='pending', reconciled_at=NULL, provider_payment_id=NULL;
+SQL
+
+pt_notes="{\"organization_id\":\"$ORG_IRON\",\"pt_package_id\":\"$PT_PKG\",\"idempotency_key\":\"razpay-test-ptpkg\"}"
+pt_body=$(printf '{"entity":"event","account_id":"acc_TEST","event":"payment.captured","id":"evt_%s.pt","contains":["payment"],"payload":{"payment":{"entity":{"id":"pay_PT_TEST","entity":"payment","amount":300000,"currency":"INR","status":"captured","method":"upi","notes":%s}}},"created_at":1767225600}' "$RUN" "$pt_notes")
+
+got=$(post "$pt_body")
+assert_contains "PT-package capture is handled"                 '"handled":"payment_success"' "$got"
+assert_contains "  ...identified as a PT-package payment"       '"subject":"pt_package"' "$got"
+assert_contains "  ...no membership period was extended"        '"new_period_end":null' "$got"
+assert_db "the PT payment row is now success"                   "success"      "$(sql "select status from payments where id='$PT_PAY';")"
+assert_db "  ...reconciled_at was stamped"                      "1"            "$(sql "select (reconciled_at is not null)::int from payments where id='$PT_PAY';")"
+assert_db "  ...provider_payment_id backfilled"                 "pay_PT_TEST"  "$(sql "select provider_payment_id from payments where id='$PT_PAY';")"
+assert_db "  ...the pt_package itself was NOT touched"          "active"       "$(sql "select status from pt_packages where id='$PT_PKG';")"
+assert_db "a confirmation was queued for the PT payment"        "1" "$(sql "select count(*) from whatsapp_messages where related_payment_id='$PT_PAY';")"
+assert_db "  ...free-form (no pt_payment_confirmation template yet)" "1" "$(sql "select count(*) from whatsapp_messages where related_payment_id='$PT_PAY' and template_name is null;")"
+
+got=$(post "$pt_body")
+assert_contains "replayed PT event is a duplicate no-op"        '"duplicate":true' "$got"
+
+docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+DELETE FROM whatsapp_messages WHERE related_payment_id='$PT_PAY';
+DELETE FROM webhook_events   WHERE event_id = 'evt_$RUN.pt';
+DELETE FROM payments         WHERE id='$PT_PAY';
+DELETE FROM pt_packages      WHERE id='$PT_PKG';
+SQL
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 reset_state
