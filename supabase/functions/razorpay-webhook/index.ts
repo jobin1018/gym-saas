@@ -82,8 +82,8 @@ function formatRupees(amount: number): string {
 // selected before).
 const PAYMENT_SELECT =
   "id,organization_id,membership_id,amount,status,provider_payment_id,razorpay_link_id," +
-  "memberships(id,member_id,status,current_period_end,members(id,name,phone)," +
-  "membership_plans(name,duration_months))";
+  "memberships(id,member_id,status,current_period_end,duration_months," +
+  "members(id,name,phone),membership_plans(name))";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -120,8 +120,9 @@ interface PaymentRow {
     member_id: string;
     status: string;
     current_period_end: string;
+    duration_months: number;
     members: { id: string; name: string; phone: string } | null;
-    membership_plans: { name: string; duration_months: number } | null;
+    membership_plans: { name: string } | null;
   } | null;
 }
 
@@ -159,10 +160,11 @@ function todayInBillingTimezone(): string {
  * Naive `Date.setMonth()` would overflow to March 3 and silently hand out
  * three extra days.
  *
- * `months` comes from membership_plans.duration_months (1 for the legacy
- * monthly plans, via that column's DEFAULT — see
- * 20260829098000_membership_plans_duration_months.sql), so a monthly plan
- * still gets exactly the old +1-month behaviour.
+ * `months` comes from memberships.duration_months (1 for legacy monthly
+ * signups, via that column's DEFAULT — see
+ * 20260829099000_move_duration_to_memberships.sql), so a monthly membership
+ * still gets exactly the old +1-month behaviour. Duration is a property of
+ * the signup, not the plan.
  */
 function addMonths(isoDate: string, months: number): string {
   const [year, month, day] = isoDate.split("-").map(Number);
@@ -561,10 +563,11 @@ async function handlePaymentSuccess(
       todayInBillingTimezone(),
       membership.current_period_end,
     );
-    // duration_months drives the length. `?? 1` is defensive only: the embed
-    // above always selects it and the column is NOT NULL DEFAULT 1, so a
-    // monthly plan yields exactly the previous +1-month behaviour.
-    const durationMonths = membership.membership_plans?.duration_months ?? 1;
+    // The MEMBERSHIP's own duration drives the length. `?? 1` is defensive
+    // only: the embed above always selects it and the column is NOT NULL
+    // DEFAULT 1, so a monthly signup yields exactly the previous +1-month
+    // behaviour.
+    const durationMonths = membership.duration_months ?? 1;
     newPeriodEnd = addMonths(extendFrom, durationMonths);
 
     const { error: membershipError } = await supabase

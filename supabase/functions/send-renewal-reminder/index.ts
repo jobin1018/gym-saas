@@ -76,7 +76,7 @@ const REMINDER_TIMEZONE = Deno.env.get("REMINDER_TIMEZONE") ??
 
 // One round trip gets the membership, the member to message, and the plan price.
 const MEMBERSHIP_SELECT =
-  "id,organization_id,member_id,plan_id,status,current_period_end," +
+  "id,organization_id,member_id,plan_id,status,current_period_end,duration_months," +
   "members(id,name,phone,whatsapp_opt_in)," +
   "membership_plans(id,name,amount)";
 
@@ -106,6 +106,7 @@ interface MembershipRow {
   plan_id: string;
   status: string;
   current_period_end: string;
+  duration_months: number;
   members: {
     id: string;
     name: string;
@@ -587,13 +588,18 @@ async function handleReminder(req: Request): Promise<Response> {
     `renewal-${membership.id}-${membership.current_period_end}`;
   const referenceId = await referenceIdFor(idempotencyKey);
 
-  const amountRupees = Number(plan.amount);
-  if (!Number.isFinite(amountRupees) || amountRupees <= 0) {
+  const monthlyRupees = Number(plan.amount);
+  if (!Number.isFinite(monthlyRupees) || monthlyRupees <= 0) {
     console.error(
       `[${TAG}] plan ${plan.id} has a non-chargeable amount: ${plan.amount}`,
     );
     return json({ ok: false, error: "plan_amount_invalid" }, 500);
   }
+  // A renewal renews for the membership's full committed duration, so the
+  // charge is the monthly rate x duration_months (1 for legacy monthly
+  // signups). See 20260829099000_move_duration_to_memberships.sql — duration
+  // is a property of the signup, not the plan.
+  const amountRupees = monthlyRupees * (membership.duration_months ?? 1);
 
   // --- (e) Reuse an existing payments row for this period if there is one ---
   // Checked BEFORE calling Razorpay so the ordinary repeat case (a second

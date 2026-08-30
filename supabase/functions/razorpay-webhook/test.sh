@@ -517,25 +517,27 @@ assert_contains "a payment with unrelated notes is still unattributable" \
 assert_contains "unattributable payments are still acked, not retried forever" '"ok":true' "$got"
 
 # ---------------------------------------------------------------------------
-# 11. Multi-month plan — current_period_end extends by duration_months, not 1
+# 11. Multi-month membership — current_period_end extends by the MEMBERSHIP's
+#     duration_months, not 1, and not anything on the plan
 # ---------------------------------------------------------------------------
-printf '\n%s-- multi-month plan period extension --%s\n' "$B" "$N"
+printf '\n%s-- multi-month membership period extension --%s\n' "$B" "$N"
 reset_state
 
-# Throwaway fixture, fully self-contained: a 3-month plan, a membership on it
-# (reusing an existing member), and a pending payment. Torn down at the end of
-# this section so nothing else sees it.
+# Throwaway fixture, fully self-contained: an ordinary (monthly-rate) plan, a
+# membership on it with duration_months = 3, and a pending payment. Torn down
+# at the end of this section so nothing else sees it. duration lives on the
+# membership now (20260829099000), NOT the plan.
 Q_ORG=11111111-1111-1111-1111-111111111111
 Q_PLAN=d0000000-0000-0000-0000-0000000000d1
 Q_MEM=d0000000-0000-0000-0000-0000000000d2
 Q_PAY=d0000000-0000-0000-0000-0000000000d3
 docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
-INSERT INTO membership_plans (id, organization_id, name, amount, duration_months)
-VALUES ('$Q_PLAN','$Q_ORG','Quarterly Test', 4000, 3)
-ON CONFLICT (id) DO UPDATE SET duration_months = 3;
-INSERT INTO memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end)
-VALUES ('$Q_MEM','$Q_ORG','e1111111-1111-1111-1111-111111111111','$Q_PLAN','active', CURRENT_DATE, CURRENT_DATE + 30)
-ON CONFLICT (id) DO UPDATE SET status='active', current_period_end = CURRENT_DATE + 30, plan_id = '$Q_PLAN';
+INSERT INTO membership_plans (id, organization_id, name, amount)
+VALUES ('$Q_PLAN','$Q_ORG','Quarterly Test Plan', 4000)
+ON CONFLICT (id) DO UPDATE SET amount = 4000;
+INSERT INTO memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end, duration_months)
+VALUES ('$Q_MEM','$Q_ORG','e1111111-1111-1111-1111-111111111111','$Q_PLAN','active', CURRENT_DATE, CURRENT_DATE + 30, 3)
+ON CONFLICT (id) DO UPDATE SET status='active', current_period_end = CURRENT_DATE + 30, plan_id = '$Q_PLAN', duration_months = 3;
 INSERT INTO payments (id, organization_id, membership_id, amount, provider, provider_payment_id, status, idempotency_key)
 VALUES ('$Q_PAY','$Q_ORG','$Q_MEM', 4000, 'razorpay', 'pay_QUARTERLY_TEST', 'pending', 'razpay-test-quarterly')
 ON CONFLICT (id) DO UPDATE SET status='pending', reconciled_at=NULL, provider_payment_id='pay_QUARTERLY_TEST';
@@ -545,15 +547,24 @@ expected_3mo=$(sql "select (CURRENT_DATE + 30 + interval '3 months')::date;")
 one_month=$(sql "select (CURRENT_DATE + 30 + interval '1 month')::date;")
 
 got=$(post "$(payment_event "payment.captured" "evt_$RUN.q3" "pay_QUARTERLY_TEST" 400000)")
-assert_contains "quarterly-plan capture is handled"        '"handled":"payment_success"' "$got"
+assert_contains "3-month-membership capture is handled"        '"handled":"payment_success"' "$got"
 
 new_end=$(sql "select current_period_end from memberships where id='$Q_MEM';")
-assert_db "3-month plan extends current_period_end by 3 months" "$expected_3mo" "$new_end"
+assert_db "membership.duration_months=3 extends current_period_end by 3 months" "$expected_3mo" "$new_end"
 if [ "$new_end" = "$one_month" ]; then
-  bad "3-month plan did NOT fall back to the old +1-month behaviour" "$expected_3mo" "$new_end"
+  bad "3-month membership did NOT fall back to the old +1-month behaviour" "$expected_3mo" "$new_end"
 else
-  ok "3-month plan did NOT fall back to the old +1-month behaviour"
+  ok "3-month membership did NOT fall back to the old +1-month behaviour"
 fi
+
+# total_price is a SIGNUP SNAPSHOT: the derive trigger set it to
+# amount(4000) x duration_months(3) at insert...
+assert_db "membership total_price snapshots amount x duration_months (12000)" \
+  "12000.00" "$(sql "select total_price from memberships where id='$Q_MEM';")"
+# ...and it does NOT drift when the plan's monthly rate later changes.
+sql "update membership_plans set amount = 5000 where id='$Q_PLAN';" >/dev/null
+assert_db "total_price stays frozen after a plan rate change (still 12000, not 15000)" \
+  "12000.00" "$(sql "select total_price from memberships where id='$Q_MEM';")"
 
 docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
 DELETE FROM whatsapp_messages WHERE related_payment_id='$Q_PAY';

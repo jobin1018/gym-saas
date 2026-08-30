@@ -520,6 +520,15 @@ PKG_OVERRIDE="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"coach
 got=$(rest_post "$PRIYA" "pt_packages?select=sessions_purchased" "$PKG_OVERRIDE")
 assert_contains "an explicit sessions_purchased overrides the derived value (25, not 24)" '"sessions_purchased":25' "$got"
 
+# --- duration_months sanity bound 1..36 (migration 20260829099500) ---
+PKG_DUR_HI="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"coach_id\":\"$GIRISH_UID\",\"goal\":\"fat_loss\",\"duration_months\":40,\"sessions_per_month\":2,\"price\":4321.40}"
+assert_equals "pt_package with duration_months = 40 is rejected (>36)" "400" "$(rest_post_status "$PRIYA" "pt_packages" "$PKG_DUR_HI")"
+PKG_DUR_LO="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"coach_id\":\"$GIRISH_UID\",\"goal\":\"fat_loss\",\"duration_months\":0,\"sessions_per_month\":2,\"price\":4321.41}"
+assert_equals "pt_package with duration_months = 0 is rejected (<1)" "400" "$(rest_post_status "$PRIYA" "pt_packages" "$PKG_DUR_LO")"
+PKG_DUR_MAX="{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"coach_id\":\"$GIRISH_UID\",\"goal\":\"fat_loss\",\"duration_months\":36,\"sessions_per_month\":1,\"price\":4321.42}"
+got=$(rest_post "$PRIYA" "pt_packages?select=duration_months,sessions_purchased" "$PKG_DUR_MAX")
+assert_contains "pt_package with duration_months = 36 is accepted (boundary)" '"duration_months":36' "$got"
+
 # --- cross-org isolation with a valid coach session ---
 assert_equals "Hema (FlexFit coach) reading Iron pt_packages -> 0"    "0" "$(count_rows "$(rest "$HEMA" "pt_packages?organization_id=eq.$ORG_IRON&select=id")")"
 assert_equals "Hema reading Iron training_notes -> 0"                 "0" "$(count_rows "$(rest "$HEMA" "training_notes?organization_id=eq.$ORG_IRON&select=id")")"
