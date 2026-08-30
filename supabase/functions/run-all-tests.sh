@@ -31,6 +31,7 @@ SUITES=(
   razorpay-webhook
   staff-login
   staff-lookup-by-phone
+  staff-pin-reset
 )
 
 if [ -t 1 ]; then

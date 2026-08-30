@@ -498,6 +498,18 @@ verify_jwt = true
 import_map = "./functions/staff-lookup-by-phone/deno.json"
 entrypoint = "./functions/staff-lookup-by-phone/index.ts"
 
+[functions.staff-pin-reset]
+enabled = true
+# Called by a logged-in OWNER from the admin UI, so the credential is the
+# caller's own staff-login session token. verify_jwt = true rejects
+# keyless/garbage at the gateway; the function then RE-validates the token
+# via admin.auth.getUser() and reads role/org from the users table rather
+# than trusting the JWT's claims (see the function header). No service-role
+# gate — the whole point is that an owner does this with their own session.
+verify_jwt = true
+import_map = "./functions/staff-pin-reset/deno.json"
+entrypoint = "./functions/staff-pin-reset/index.ts"
+
 [functions.razorpay-webhook]
 enabled = true
 # Razorpay authenticates with X-Razorpay-Signature (HMAC), not a Supabase JWT.

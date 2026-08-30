@@ -1,0 +1,31 @@
+-- Grants for the staff-pin-reset Edge Function.
+--
+-- ============================================================================
+-- WHY THESE TWO, AND ONLY THESE TWO
+-- ============================================================================
+-- 20260824130500 (staff-login's grants) gave service_role SELECT on users and
+-- a COLUMN-SCOPED UPDATE (auth_user_id) ONLY — deliberately withholding
+-- pin_hash, name, role, phone, so that staff-login could never change a
+-- credential or an identity. Its own comment: "Withholding those columns is
+-- what keeps 'staff-login cannot change who someone is or what they can do'
+-- enforced by the database rather than by convention."
+--
+-- staff-pin-reset is the function whose ENTIRE JOB is to change pin_hash —
+-- for an owner recovering a staff member of their own org. So it gets exactly
+-- that one column, still nothing else. name / role / phone stay ungrantable.
+--
+-- login_attempts: staff-login's grants gave SELECT, INSERT (record an
+-- attempt, read the lockout window) and nothing more — the two lockout RPCs
+-- are the only sanctioned way in. A PIN reset is also how a LOCKED-OUT
+-- staffer is recovered, so this function additionally needs to clear their
+-- recent failures. DELETE, scoped in the function to (organization_id, phone)
+-- of the target, is the minimum that allows that.
+--
+-- No RLS change: users has no policy that applies to service_role (BYPASSRLS),
+-- and login_attempts has RLS disabled entirely (it is security infrastructure,
+-- see 20260824130000). The function scopes every statement by the caller's
+-- own organization_id explicitly — see its header.
+-- ============================================================================
+
+GRANT UPDATE (pin_hash) ON public.users TO service_role;
+GRANT DELETE ON public.login_attempts TO service_role;
