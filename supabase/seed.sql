@@ -670,4 +670,255 @@ INSERT INTO body_measurements (organization_id, member_id, recorded_by, weight_k
   ('11111111-1111-1111-1111-111111111111', '80000000-0000-0000-0000-000000000002',
    'c0ac0000-0000-0000-0000-000000000002', 71.0, 172.0, now() - interval '3 days');
 
+-- Two more historical points for Asha so her weight/BMI trend chart is a real
+-- line, not 3 dots. Both OLDER than the -2d point above, so rls-test's
+-- "most recent measurement = 72.0/176, bmi 23.2" assertion is untouched.
+INSERT INTO body_measurements (organization_id, member_id, recorded_by, weight_kg, height_cm, recorded_at) VALUES
+  ('11111111-1111-1111-1111-111111111111', 'e1111111-1111-1111-1111-111111111111',
+   'c0ac0000-0000-0000-0000-000000000001', 68.8, 176.0, now() - interval '46 days'),
+  ('11111111-1111-1111-1111-111111111111', 'e1111111-1111-1111-1111-111111111111',
+   'c0ac0000-0000-0000-0000-000000000001', 70.9, 176.0, now() - interval '16 days');
+
+-- ===========================================================================
+-- APEX STRENGTH CO. — comprehensive staging fixture for every feature added in
+-- migrations 20260829090000..20260829103000: coach role, pt_packages + the
+-- derived-session model, training_notes / body_measurements + session-count
+-- auto-complete, corrected memberships.duration_months (free 1..36) +
+-- total_price trigger, membership_plans CRUD (incl. a deactivated plan),
+-- payments.pt_package_id + the pt_packages_record_payment trigger,
+-- v_daily_revenue_by_source, v_pt_packages_attention, v_members_pt_status.
+--
+-- Deliberately ONE new, self-contained org: every existing function/rls suite
+-- is scoped to Iron / FlexFit / PowerHouse / Fitline / Bodyline by id, so
+-- nothing here can perturb them.
+--
+-- status = 'suspended' ON PURPOSE. Suspension is NOT RLS-enforced (an owner
+-- still logs in and every view/query works), but it keeps this org out of the
+-- daily-owner-brief cron and its "4 briefable orgs" test invariant. For a
+-- fully-live demo, flip to 'active' AND bump daily-owner-brief/test.sh's
+-- 4 -> 5 in the same change.
+--
+-- LOGINS (real bcrypt via pgcrypto crypt(), cost 12 — verified compatible
+-- with staff-login's bcryptjs verify):
+--   919100000001  Nisha Raman     owner       —                 PIN 2580
+--   919100000002  Tomas Ferreira  front_desk  Apex — Central     PIN 1470
+--   919100000003  Rhea Kapoor     coach       Apex — Central     PIN 3690
+--                   ^ most recent session ~2 days ago  => dashboard "logging sessions": TRUE
+--   919100000004  Sam Okafor      coach       Apex — Riverside   PIN 7410
+--                   ^ most recent session ~26 days ago => dashboard "logging sessions": FALSE
+--   919100000005  Lena Fischer    coach       Apex — Central     PIN 9630
+--                   ^ most recent session ~9 days ago  (in-between)
+-- ===========================================================================
+
+INSERT INTO organizations (id, name, owner_phone, status) VALUES
+  ('a9ec0000-0000-0000-0000-0000000000a1', 'Apex Strength Co.', '919100000001', 'suspended');
+
+INSERT INTO locations (id, organization_id, name) VALUES
+  ('a9ec0000-0000-0000-0000-0000000000b1', 'a9ec0000-0000-0000-0000-0000000000a1', 'Apex — Central'),
+  ('a9ec0000-0000-0000-0000-0000000000b2', 'a9ec0000-0000-0000-0000-0000000000a1', 'Apex — Riverside');
+
+INSERT INTO users (id, organization_id, name, phone, role, location_id, pin_hash) VALUES
+  ('a9ec0000-0000-0000-0000-0000000000c1', 'a9ec0000-0000-0000-0000-0000000000a1', 'Nisha Raman',
+   '919100000001', 'owner',      NULL,                                   crypt('2580', gen_salt('bf', 12))),
+  ('a9ec0000-0000-0000-0000-0000000000c2', 'a9ec0000-0000-0000-0000-0000000000a1', 'Tomas Ferreira',
+   '919100000002', 'front_desk', 'a9ec0000-0000-0000-0000-0000000000b1', crypt('1470', gen_salt('bf', 12))),
+  ('a9ec0000-0000-0000-0000-0000000000d1', 'a9ec0000-0000-0000-0000-0000000000a1', 'Rhea Kapoor',
+   '919100000003', 'coach',      'a9ec0000-0000-0000-0000-0000000000b1', crypt('3690', gen_salt('bf', 12))),
+  ('a9ec0000-0000-0000-0000-0000000000d2', 'a9ec0000-0000-0000-0000-0000000000a1', 'Sam Okafor',
+   '919100000004', 'coach',      'a9ec0000-0000-0000-0000-0000000000b2', crypt('7410', gen_salt('bf', 12))),
+  ('a9ec0000-0000-0000-0000-0000000000d3', 'a9ec0000-0000-0000-0000-0000000000a1', 'Lena Fischer',
+   '919100000005', 'coach',      'a9ec0000-0000-0000-0000-0000000000b1', crypt('9630', gen_salt('bf', 12)));
+
+-- e3 'Legacy Annual' is deactivated (active=false) but membership m7 below
+-- still references it — proves a soft-deleted plan keeps serving its members.
+INSERT INTO membership_plans (id, organization_id, name, amount, active) VALUES
+  ('a9ec0000-0000-0000-0000-0000000000e1', 'a9ec0000-0000-0000-0000-0000000000a1', 'Monthly',       1800.00, true),
+  ('a9ec0000-0000-0000-0000-0000000000e2', 'a9ec0000-0000-0000-0000-0000000000a1', 'Off-Peak',      1200.00, true),
+  ('a9ec0000-0000-0000-0000-0000000000e3', 'a9ec0000-0000-0000-0000-0000000000a1', 'Legacy Annual', 1500.00, false);
+
+INSERT INTO members (id, organization_id, location_id, name, phone, whatsapp_opt_in, source) VALUES
+  ('a9ec0000-0000-0000-0000-0000000000f1', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000b1', 'Aditya Rao',      '919100010001', true,  'manual'),
+  ('a9ec0000-0000-0000-0000-0000000000f2', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000b1', 'Bela Nair',       '919100010002', true,  'whatsapp_self'),
+  ('a9ec0000-0000-0000-0000-0000000000f3', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000b1', 'Carlos Mendez',   '919100010003', true,  'manual'),
+  ('a9ec0000-0000-0000-0000-0000000000f4', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000b2', 'Divya Krishnan',  '919100010004', true,  'manual'),
+  ('a9ec0000-0000-0000-0000-0000000000f5', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000b2', 'Ethan Wright',    '919100010005', true,  'whatsapp_self'),
+  ('a9ec0000-0000-0000-0000-0000000000f6', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000b1', 'Fatima Sheikh',   '919100010006', false, 'manual'),
+  ('a9ec0000-0000-0000-0000-0000000000f7', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000b2', 'Gaurav Malhotra', '919100010007', true,  'manual'),
+  ('a9ec0000-0000-0000-0000-0000000000f8', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000b1', 'Hannah Cole',     '919100010008', true,  'whatsapp_self'),
+  ('a9ec0000-0000-0000-0000-0000000000f9', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000b2', 'Ishaan Verma',    '919100010009', true,  'manual'),
+  ('a9ec0000-0000-0000-0000-0000000000fa', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000b1', 'Julia Santos',    '919100010010', false, 'manual'),
+  ('a9ec0000-0000-0000-0000-0000000000fb', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000b2', 'Kabir Anand',     '919100010011', true,  'manual'),
+  ('a9ec0000-0000-0000-0000-0000000000fc', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000b1', 'Priya Das',       '919100010012', true,  'manual');
+
+-- Memberships — VARIED duration_months (1,2,3,3,7,12,12,6,1,3,2,12): exercises
+-- the free-integer model (not fixed tiers) incl. the required 2 / 3 / 7 / 12.
+-- total_price is INTENTIONALLY omitted so trg_memberships_derive_total_price
+-- fills it (= plan.amount * duration_months); verify it is non-null after seed.
+-- current_period_end = start_date + duration_months, and every ACTIVE row is
+-- kept well clear of today+3 / today+7 so renewal-scan does not pick them up.
+INSERT INTO memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end, duration_months) VALUES
+  ('a9ec0000-0000-0000-0001-0000000000f1', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f1', 'a9ec0000-0000-0000-0000-0000000000e1', 'active',   CURRENT_DATE - 6,   (CURRENT_DATE - 6)   + make_interval(months => 1),  1),
+  ('a9ec0000-0000-0000-0001-0000000000f2', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f2', 'a9ec0000-0000-0000-0000-0000000000e1', 'active',   CURRENT_DATE - 35,  (CURRENT_DATE - 35)  + make_interval(months => 2),  2),
+  ('a9ec0000-0000-0000-0001-0000000000f3', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f3', 'a9ec0000-0000-0000-0000-0000000000e2', 'active',   CURRENT_DATE - 20,  (CURRENT_DATE - 20)  + make_interval(months => 3),  3),
+  ('a9ec0000-0000-0000-0001-0000000000f4', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f4', 'a9ec0000-0000-0000-0000-0000000000e1', 'active',   CURRENT_DATE - 55,  (CURRENT_DATE - 55)  + make_interval(months => 3),  3),
+  ('a9ec0000-0000-0000-0001-0000000000f5', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f5', 'a9ec0000-0000-0000-0000-0000000000e1', 'active',   CURRENT_DATE - 40,  (CURRENT_DATE - 40)  + make_interval(months => 7),  7),
+  ('a9ec0000-0000-0000-0001-0000000000f6', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f6', 'a9ec0000-0000-0000-0000-0000000000e1', 'active',   CURRENT_DATE - 100, (CURRENT_DATE - 100) + make_interval(months => 12), 12),
+  ('a9ec0000-0000-0000-0001-0000000000f7', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f7', 'a9ec0000-0000-0000-0000-0000000000e3', 'active',   CURRENT_DATE - 200, (CURRENT_DATE - 200) + make_interval(months => 12), 12),
+  ('a9ec0000-0000-0000-0001-0000000000f8', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f8', 'a9ec0000-0000-0000-0000-0000000000e2', 'active',   CURRENT_DATE - 33,  (CURRENT_DATE - 33)  + make_interval(months => 6),  6),
+  ('a9ec0000-0000-0000-0001-0000000000f9', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f9', 'a9ec0000-0000-0000-0000-0000000000e1', 'past_due', CURRENT_DATE - 45,  (CURRENT_DATE - 45)  + make_interval(months => 1),  1),
+  ('a9ec0000-0000-0000-0001-0000000000fa', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000fa', 'a9ec0000-0000-0000-0000-0000000000e2', 'active',   CURRENT_DATE - 15,  (CURRENT_DATE - 15)  + make_interval(months => 3),  3),
+  ('a9ec0000-0000-0000-0001-0000000000fb', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000fb', 'a9ec0000-0000-0000-0000-0000000000e1', 'expired',  CURRENT_DATE - 120, (CURRENT_DATE - 120) + make_interval(months => 2),  2),
+  ('a9ec0000-0000-0000-0001-0000000000fc', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000fc', 'a9ec0000-0000-0000-0000-0000000000e1', 'active',   CURRENT_DATE - 10,  (CURRENT_DATE - 10)  + make_interval(months => 12), 12);
+
+-- PT packages — sessions_used starts at 0; the training_notes loop below
+-- drives it up (one note = one session), so package 04 auto-completes at 8/8
+-- via trg_training_notes_bump_session_count. Goals mixed; duration_months x
+-- sessions_per_month deliberately varied (6x2, 3x4, 3x3, 2x4, 12x2, 4x2, 12x3).
+-- Each row also spawns a 'manual' payment via trg_pt_packages_record_payment.
+--   attention view (v_pt_packages_attention) will show:
+--     low sessions  -> pkg 02 (2 left), 08 (1 left), 09 (1 left)
+--     expiring <=7d -> pkg 05, 06   (dur 3, started ~87d ago)
+INSERT INTO pt_packages (id, organization_id, member_id, coach_id, goal,
+                         duration_months, sessions_per_month, sessions_purchased,
+                         sessions_used, price, status, start_date) VALUES
+  ('a9ec0000-0000-0000-0002-000000000001', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f1', 'a9ec0000-0000-0000-0000-0000000000d1', 'muscle_gain',     6, 2, 12, 0, 14400.00, 'active', CURRENT_DATE - 70),
+  ('a9ec0000-0000-0000-0002-000000000002', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f3', 'a9ec0000-0000-0000-0000-0000000000d1', 'fat_loss',        3, 4, 12, 0, 13200.00, 'active', CURRENT_DATE - 25),
+  ('a9ec0000-0000-0000-0002-000000000003', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f8', 'a9ec0000-0000-0000-0000-0000000000d1', 'general_fitness', 3, 3,  9, 0,  9900.00, 'active', CURRENT_DATE - 15),
+  ('a9ec0000-0000-0000-0002-000000000004', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f4', 'a9ec0000-0000-0000-0000-0000000000d1', 'fat_loss',        2, 4,  8, 0,  8800.00, 'active', CURRENT_DATE - 120),
+  ('a9ec0000-0000-0000-0002-000000000005', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f5', 'a9ec0000-0000-0000-0000-0000000000d2', 'general_fitness', 3, 4, 12, 0, 12000.00, 'active', CURRENT_DATE - 87),
+  ('a9ec0000-0000-0000-0002-000000000006', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f7', 'a9ec0000-0000-0000-0000-0000000000d2', 'muscle_gain',     3, 3,  9, 0, 10800.00, 'active', CURRENT_DATE - 86),
+  ('a9ec0000-0000-0000-0002-000000000007', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f2', 'a9ec0000-0000-0000-0000-0000000000d2', 'fat_loss',       12, 2, 24, 0, 26400.00, 'active', CURRENT_DATE - 90),
+  ('a9ec0000-0000-0000-0002-000000000008', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f9', 'a9ec0000-0000-0000-0000-0000000000d3', 'muscle_gain',     6, 2, 12, 0, 15000.00, 'active', CURRENT_DATE - 40),
+  ('a9ec0000-0000-0000-0002-000000000009', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f6', 'a9ec0000-0000-0000-0000-0000000000d3', 'general_fitness', 4, 2,  8, 0,  8000.00, 'active', CURRENT_DATE - 50),
+  ('a9ec0000-0000-0000-0002-000000000010', 'a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000fc', 'a9ec0000-0000-0000-0000-0000000000d3', 'muscle_gain',    12, 3, 36, 0, 39600.00, 'active', CURRENT_DATE - 10);
+
+-- Session history: one note per session (drives sessions_used), spread over
+-- realistic dates. Recency by coach — Rhea ~2d, Lena ~9d, Sam ~26d — so the
+-- owner dashboard's "coach is logging sessions" reads TRUE for Rhea, FALSE
+-- for Sam. Every 2nd note for members f1/f2/f3/f5 also gets a linked
+-- body_measurement so their weight/BMI trend chart is a real line.
+DO $$
+DECLARE
+  pk       RECORD;
+  n_notes  INT;
+  recent   INT;
+  i        INT;
+  sdate    DATE;
+  nid      UUID;
+  wt       NUMERIC(5,2);
+  ht       NUMERIC(5,2);
+  link_ms  BOOLEAN;
+  blurbs   TEXT[] := ARRAY[
+    'worked compound lifts, form focus',
+    'conditioning + core circuit',
+    'deload — lighter loads, higher reps',
+    'tested a top set, small PR',
+    'mobility + accessory volume',
+    'steady-state cardio, zone 2',
+    'technique drills, tempo work'];
+BEGIN
+  FOR pk IN
+    SELECT id, organization_id, member_id, coach_id
+    FROM pt_packages
+    WHERE organization_id = 'a9ec0000-0000-0000-0000-0000000000a1'
+    ORDER BY id
+  LOOP
+    n_notes := CASE pk.id
+      WHEN 'a9ec0000-0000-0000-0002-000000000001' THEN 8
+      WHEN 'a9ec0000-0000-0000-0002-000000000002' THEN 10
+      WHEN 'a9ec0000-0000-0000-0002-000000000003' THEN 4
+      WHEN 'a9ec0000-0000-0000-0002-000000000004' THEN 8
+      WHEN 'a9ec0000-0000-0000-0002-000000000005' THEN 6
+      WHEN 'a9ec0000-0000-0000-0002-000000000006' THEN 5
+      WHEN 'a9ec0000-0000-0000-0002-000000000007' THEN 14
+      WHEN 'a9ec0000-0000-0000-0002-000000000008' THEN 11
+      WHEN 'a9ec0000-0000-0000-0002-000000000009' THEN 7
+      WHEN 'a9ec0000-0000-0000-0002-000000000010' THEN 5
+    END;
+    recent := CASE pk.coach_id
+      WHEN 'a9ec0000-0000-0000-0000-0000000000d1' THEN 2
+      WHEN 'a9ec0000-0000-0000-0000-0000000000d2' THEN 26
+      ELSE 9
+    END;
+    link_ms := pk.member_id IN (
+      'a9ec0000-0000-0000-0000-0000000000f1', 'a9ec0000-0000-0000-0000-0000000000f2',
+      'a9ec0000-0000-0000-0000-0000000000f3', 'a9ec0000-0000-0000-0000-0000000000f5');
+    ht := CASE pk.member_id
+      WHEN 'a9ec0000-0000-0000-0000-0000000000f1' THEN 178
+      WHEN 'a9ec0000-0000-0000-0000-0000000000f2' THEN 172
+      WHEN 'a9ec0000-0000-0000-0000-0000000000f3' THEN 165
+      WHEN 'a9ec0000-0000-0000-0000-0000000000f5' THEN 170
+      ELSE 172 END;
+
+    FOR i IN 1..n_notes LOOP
+      sdate := CURRENT_DATE - (recent + (n_notes - i) * 4);
+      nid   := gen_random_uuid();
+      INSERT INTO training_notes (id, organization_id, member_id, coach_id, pt_package_id, note_text, session_date)
+      VALUES (nid, pk.organization_id, pk.member_id, pk.coach_id, pk.id,
+              'Session ' || i || ' of ' || n_notes || ' — ' || blurbs[1 + (i % 7)], sdate);
+
+      IF link_ms AND i % 2 = 0 THEN
+        wt := CASE pk.member_id
+          WHEN 'a9ec0000-0000-0000-0000-0000000000f1' THEN 68.0 + i * 0.55   -- muscle_gain, rising
+          WHEN 'a9ec0000-0000-0000-0000-0000000000f2' THEN 91.0 - i * 0.55   -- fat_loss, falling
+          WHEN 'a9ec0000-0000-0000-0000-0000000000f3' THEN 84.0 - i * 0.80   -- fat_loss, falling
+          ELSE 77.0 + ((i % 3) - 1) * 0.4                                    -- general, wobble
+        END;
+        INSERT INTO body_measurements (organization_id, member_id, recorded_by, weight_kg, height_cm, training_note_id, recorded_at)
+        VALUES (pk.organization_id, pk.member_id, pk.coach_id, wt, ht, nid,
+                sdate::timestamptz + interval '10 hours');
+      END IF;
+    END LOOP;
+  END LOOP;
+END $$;
+
+-- A few STANDALONE weigh-ins (no training_note_id) — matches how a coach
+-- logs inconsistently, and gives the "measurement without a note" case.
+INSERT INTO body_measurements (organization_id, member_id, recorded_by, weight_kg, height_cm, recorded_at) VALUES
+  ('a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f1', 'a9ec0000-0000-0000-0000-0000000000d1', 67.4, 178.0, now() - interval '75 days'),
+  ('a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f3', 'a9ec0000-0000-0000-0000-0000000000d1', 85.2, 165.0, now() - interval '33 days'),
+  ('a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f8', 'a9ec0000-0000-0000-0000-0000000000d1', 74.0, 169.0, now() - interval '12 days');
+
+-- Membership payments — one 'success' per membership (amount = monthly rate x
+-- duration_months, the real charge under the corrected model), reconciled on
+-- the signup date; a prior renewal for the 6+ month commitments.
+DO $$
+DECLARE
+  m   RECORD;
+  idx INT := 0;
+BEGIN
+  FOR m IN
+    SELECT ms.id, ms.organization_id, ms.start_date, ms.duration_months, mp.amount
+    FROM memberships ms JOIN membership_plans mp ON mp.id = ms.plan_id
+    WHERE ms.organization_id = 'a9ec0000-0000-0000-0000-0000000000a1'
+    ORDER BY ms.id
+  LOOP
+    idx := idx + 1;
+    INSERT INTO payments (organization_id, membership_id, amount, provider, provider_payment_id,
+                          status, idempotency_key, created_at, reconciled_at)
+    VALUES (m.organization_id, m.id, m.amount * m.duration_months, 'razorpay', 'pay_apex_' || idx,
+            'success', 'seed-apex-mem-' || m.id::text,
+            m.start_date::timestamptz + interval '9 hours',
+            m.start_date::timestamptz + interval '9 hours 20 minutes');
+    IF m.duration_months >= 6 THEN
+      INSERT INTO payments (organization_id, membership_id, amount, provider, provider_payment_id,
+                            status, idempotency_key, created_at, reconciled_at)
+      VALUES (m.organization_id, m.id, m.amount * m.duration_months, 'razorpay', 'pay_apex_prev_' || idx,
+              'success', 'seed-apex-memprev-' || m.id::text,
+              (m.start_date - (m.duration_months * 30))::timestamptz + interval '9 hours',
+              (m.start_date - (m.duration_months * 30))::timestamptz + interval '9 hours 20 minutes');
+    END IF;
+  END LOOP;
+END $$;
+
+-- Spread the PT payments (auto-created by trg_pt_packages_record_payment as
+-- status='manual', reconciled_at=now()) back onto each package's start date,
+-- so v_daily_revenue_by_source shows a real membership-vs-PT split over time.
+UPDATE payments p
+   SET created_at    = pk.start_date::timestamptz + interval '11 hours',
+       reconciled_at = pk.start_date::timestamptz + interval '11 hours'
+  FROM pt_packages pk
+ WHERE p.pt_package_id = pk.id
+   AND pk.organization_id = 'a9ec0000-0000-0000-0000-0000000000a1';
+
 COMMIT;
