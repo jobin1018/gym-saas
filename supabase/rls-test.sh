@@ -191,6 +191,8 @@ DELETE FROM pt_packages
 -- stable).
 UPDATE pt_packages SET sessions_used = 8, status = 'active'
  WHERE id = '9c000000-0000-0000-0000-000000000001';
+-- section 10: membership_plans CRUD test rows (no memberships attached, safe to drop)
+DELETE FROM membership_plans WHERE name LIKE 'rls-test plan%';
 SQL
 }
 
@@ -651,6 +653,39 @@ assert_equals "owner reads the same completed-package history org-wide" "5" \
 xo_note=$(sql "select id from training_notes where member_id='$RITU' and note_text='rls-test S1'")
 assert_equals "a measurement cannot link to a note from a different member (validate trigger)" "400" \
   "$(rest_post_status "$FARAH" "body_measurements" "{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"recorded_by\":\"c0ac0000-0000-0000-0000-000000000001\",\"weight_kg\":77.77,\"height_cm\":180,\"training_note_id\":\"$xo_note\"}")"
+
+# ---------------------------------------------------------------------------
+# 10. membership_plans CRUD — owner/front_desk write, everyone else read-only
+#     (migration 20260829100000)
+# ---------------------------------------------------------------------------
+printf '\n%s-- membership_plans CRUD --%s\n' "$B" "$N"
+
+assert_equals "owner CAN create a plan" "201" \
+  "$(rest_post_status "$RAVI"  "membership_plans" "{\"organization_id\":\"$ORG_IRON\",\"name\":\"rls-test plan A\",\"amount\":999.00}")"
+assert_equals "front_desk CAN create a plan" "201" \
+  "$(rest_post_status "$PRIYA" "membership_plans" "{\"organization_id\":\"$ORG_IRON\",\"name\":\"rls-test plan B\",\"amount\":1499.00}")"
+assert_equals "a coach CANNOT create a plan" "403" \
+  "$(rest_post_status "$FARAH" "membership_plans" "{\"organization_id\":\"$ORG_IRON\",\"name\":\"rls-test plan C\",\"amount\":100.00}")"
+assert_equals "owner of Iron CANNOT create a plan for FlexFit (cross-org)" "403" \
+  "$(rest_post_status "$RAVI" "membership_plans" "{\"organization_id\":\"$ORG_FLEX\",\"name\":\"rls-test plan X\",\"amount\":500.00}")"
+assert_equals "an absurd amount is rejected (sanity bound)" "400" \
+  "$(rest_post_status "$RAVI" "membership_plans" "{\"organization_id\":\"$ORG_IRON\",\"name\":\"rls-test plan huge\",\"amount\":9999999.00}")"
+assert_equals "a negative amount is rejected" "400" \
+  "$(rest_post_status "$RAVI" "membership_plans" "{\"organization_id\":\"$ORG_IRON\",\"name\":\"rls-test plan neg\",\"amount\":-5.00}")"
+
+plan_id=$(sql "select id from membership_plans where name='rls-test plan A'")
+assert_equals "owner CAN rename + reprice a plan" "200" \
+  "$(rest_patch_status "$RAVI" "membership_plans?id=eq.$plan_id" '{"name":"rls-test plan A2","amount":1250.00}')"
+assert_equals "owner CAN soft-deactivate a plan (active=false, no hard delete)" "200" \
+  "$(rest_patch_status "$RAVI" "membership_plans?id=eq.$plan_id" '{"active":false}')"
+assert_equals "a coach CANNOT edit a plan" "403" \
+  "$(rest_patch_status "$FARAH" "membership_plans?id=eq.$plan_id" '{"amount":1.00}')"
+
+got=$(rest "$FARAH" "membership_plans?organization_id=eq.$ORG_IRON&select=id,name")
+assert_contains "a coach still reads the plan catalogue (USING unchanged)" "rls-test plan A2" "$got"
+
+assert_equals "anon CANNOT create a plan" "401" \
+  "$(rest_post_status "$ANON_KEY" "membership_plans" "{\"organization_id\":\"$ORG_IRON\",\"name\":\"rls-test plan anon\",\"amount\":1.00}")"
 
 # ---------------------------------------------------------------------------
 # Summary
