@@ -744,6 +744,24 @@ assert_equals   "a coach sees nothing in the attention view (owner-only)" "0" \
 assert_equals   "cross-org: FlexFit owner sees no Iron attention rows" "0" \
   "$(count_rows "$(rest "$SANJAY" "v_pt_packages_attention?select=id")")"
 
+# --- v_members_pt_status: has_active_pt per member, RLS-scoped (20260829103000) ---
+got=$(rest "$RAVI" "v_members_pt_status?organization_id=eq.$ORG_IRON&select=id,has_active_pt,active_pt_count")
+assert_contains "owner: a member WITH an active package is flagged" \
+  "\"id\":\"$ASHA\",\"has_active_pt\":true" "$got"
+got2=$(rest "$RAVI" "v_members_pt_status?id=eq.$BHARAT&select=has_active_pt,active_pt_count")
+assert_contains "owner: a member with NO package is has_active_pt:false" '"has_active_pt":false' "$got2"
+assert_contains "  ...active_pt_count 0"                               '"active_pt_count":0' "$got2"
+# a coach sees only assigned members, still with the right flag
+got3=$(rest "$FARAH" "v_members_pt_status?select=id,has_active_pt")
+assert_contains     "coach: assigned member flagged has_active_pt:true" "\"id\":\"$ASHA\",\"has_active_pt\":true" "$got3"
+assert_not_contains "coach: an unassigned member is absent entirely"    "$BHARAT" "$got3"
+# front_desk sees their location's members with the flag; owner-only PT rows still don't leak an unscoped count
+assert_equals "front_desk reads v_members_pt_status: 200 not 403" "200" \
+  "$(rest_status "$PRIYA" "v_members_pt_status?select=id&limit=1")"
+# cross-org
+assert_equals "cross-org: FlexFit owner sees no Iron members here" "0" \
+  "$(count_rows "$(rest "$SANJAY" "v_members_pt_status?organization_id=eq.$ORG_IRON&select=id")")"
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
