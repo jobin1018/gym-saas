@@ -649,16 +649,16 @@ INSERT INTO pt_packages (id, organization_id, member_id, coach_id, goal,
    'e4444444-4444-4444-4444-444444444444', 'c0ac0000-0000-0000-0000-000000000003',
    'muscle_gain', 3, 4, 12, 5, 15000.00, 'active', CURRENT_DATE - 30);
 
-INSERT INTO training_notes (organization_id, member_id, coach_id, pt_package_id, note_text, session_date) VALUES
+INSERT INTO training_notes (organization_id, member_id, coach_id, pt_package_id, note_text, session_date, created_at) VALUES
   ('11111111-1111-1111-1111-111111111111', 'e1111111-1111-1111-1111-111111111111',
    'c0ac0000-0000-0000-0000-000000000001', '9c000000-0000-0000-0000-000000000001',
-   'Increased squat to 80kg, form solid throughout.', CURRENT_DATE - 2),
+   'Increased squat to 80kg, form solid throughout.', CURRENT_DATE - 2, (CURRENT_DATE - 2)::timestamptz + interval '18 hours'),
   ('11111111-1111-1111-1111-111111111111', 'e1111111-1111-1111-1111-111111111111',
    'c0ac0000-0000-0000-0000-000000000001', '9c000000-0000-0000-0000-000000000001',
-   'Bench stalled; deloaded to 60kg and rebuilt.', CURRENT_DATE - 9),
+   'Bench stalled; deloaded to 60kg and rebuilt.', CURRENT_DATE - 9, (CURRENT_DATE - 9)::timestamptz + interval '18 hours'),
   ('11111111-1111-1111-1111-111111111111', '80000000-0000-0000-0000-000000000002',
    'c0ac0000-0000-0000-0000-000000000002', '9c000000-0000-0000-0000-000000000003',
-   'Mobility work — hip flexors loosening up.', CURRENT_DATE - 3);
+   'Mobility work — hip flexors loosening up.', CURRENT_DATE - 3, (CURRENT_DATE - 3)::timestamptz + interval '18 hours');
 
 INSERT INTO body_measurements (organization_id, member_id, recorded_by, weight_kg, height_cm, recorded_at) VALUES
   ('11111111-1111-1111-1111-111111111111', 'e1111111-1111-1111-1111-111111111111',
@@ -853,9 +853,14 @@ BEGIN
     FOR i IN 1..n_notes LOOP
       sdate := CURRENT_DATE - (recent + (n_notes - i) * 4);
       nid   := gen_random_uuid();
-      INSERT INTO training_notes (id, organization_id, member_id, coach_id, pt_package_id, note_text, session_date)
+      -- created_at is backdated to the session date (+ a plausible evening
+      -- time) so "logged in the last 7 days" recency — which the owner
+      -- dashboard and the COACHES WhatsApp command both key on created_at —
+      -- is meaningful against seed data, not just "everything was seeded today".
+      INSERT INTO training_notes (id, organization_id, member_id, coach_id, pt_package_id, note_text, session_date, created_at)
       VALUES (nid, pk.organization_id, pk.member_id, pk.coach_id, pk.id,
-              'Session ' || i || ' of ' || n_notes || ' — ' || blurbs[1 + (i % 7)], sdate);
+              'Session ' || i || ' of ' || n_notes || ' — ' || blurbs[1 + (i % 7)], sdate,
+              sdate::timestamptz + interval '18 hours');
 
       IF link_ms AND i % 2 = 0 THEN
         wt := CASE pk.member_id
@@ -920,5 +925,17 @@ UPDATE payments p
   FROM pt_packages pk
  WHERE p.pt_package_id = pk.id
    AND pk.organization_id = 'a9ec0000-0000-0000-0000-0000000000a1';
+
+-- A little activity dated TODAY so the owner's WhatsApp "TODAY" command has
+-- something to report on a fresh reset: 3 check-ins and 1 PT session logged.
+INSERT INTO attendance (organization_id, member_id, checked_in_at, source) VALUES
+  ('a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f1', now() - interval '2 hours',  'whatsapp_self'),
+  ('a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f3', now() - interval '4 hours',  'front_desk'),
+  ('a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f8', now() - interval '30 minutes','whatsapp_self');
+
+INSERT INTO training_notes (organization_id, member_id, coach_id, pt_package_id, note_text, session_date, created_at) VALUES
+  ('a9ec0000-0000-0000-0000-0000000000a1', 'a9ec0000-0000-0000-0000-0000000000f1',
+   'a9ec0000-0000-0000-0000-0000000000d1', 'a9ec0000-0000-0000-0002-000000000001',
+   'Quick technique check-in, felt strong.', CURRENT_DATE, now() - interval '1 hour');
 
 COMMIT;

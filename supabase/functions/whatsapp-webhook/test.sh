@@ -95,6 +95,14 @@ assert_contains() {
   esac
 }
 
+# assert_not_contains <label> <forbidden-substring> <actual>
+assert_not_contains() {
+  case "$3" in
+    *"$2"*) bad "$1" "does NOT contain '$2'" "$3" ;;
+    *)      ok "$1" ;;
+  esac
+}
+
 # assert_equals <label> <expected> <actual>
 assert_equals() {
   if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$2" "$3"; fi
@@ -436,6 +444,212 @@ assert_contains "unparseable body is acked, not crashed" '"ignored":"unparseable
 
 got=$(curl -s -X DELETE "$BASE_URL")
 assert_contains "unsupported method is rejected" 'method_not_allowed' "$got"
+
+# ---------------------------------------------------------------------------
+# 8. Owner / coach read-only commands
+# ---------------------------------------------------------------------------
+printf '\n%s-- owner / coach commands --%s\n' "$B" "$N"
+
+reset_state
+
+# Seeded "Apex Strength Co." fixture (supabase/seed.sql):
+#   919100000001  Nisha Raman   owner
+#   919100000003  Rhea Kapoor   coach   (clients: Aditya, Carlos, Hannah)
+ORG_APEX=a9ec0000-0000-0000-0000-0000000000a1
+PHONE_OWNER=919100000001
+PHONE_COACH=919100000003
+PHONE_OWNER_IRON=919000000001      # Ravi Krishnan, Iron Temple
+
+# last outbound reply body scoped to an org (owner/coach replies have member_id NULL)
+last_out_org() { sql "select body_preview from whatsapp_messages
+  where direction='outbound' and organization_id='$1' order by created_at desc limit 1;"; }
+
+send_cmd() { send_message "$1" "wamid.$RUN.$2" "$3" >/dev/null; }
+
+if ! $have_psql; then
+  skipped "owner/coach command suite" "requires docker/psql for data assertions"
+else
+  # a little TODAY-dated activity (reset_state truncated attendance + messages)
+  sql "insert into attendance (organization_id, member_id, source) values
+        ('$ORG_APEX','a9ec0000-0000-0000-0000-0000000000f1','whatsapp_self'),
+        ('$ORG_APEX','a9ec0000-0000-0000-0000-0000000000f3','front_desk'),
+        ('$ORG_APEX','a9ec0000-0000-0000-0000-0000000000f8','whatsapp_self');
+      insert into whatsapp_messages (organization_id, direction, body_preview, status)
+        values ('$ORG_APEX','outbound','seed failed test','failed');" >/dev/null
+
+  # --- 8a. each owner command returns correct data ---
+  send_cmd "$PHONE_OWNER" o-rev "REVENUE"
+  r=$(last_out_org "$ORG_APEX")
+  assert_contains "REVENUE names the org + both sources" "Revenue — Apex Strength Co." "$r"
+  assert_contains "REVENUE has the membership line"      "Memberships:" "$r"
+  assert_contains "REVENUE has the PT line"              "PT packages:" "$r"
+  assert_contains "REVENUE has last-month comparison"    "Last month:" "$r"
+
+  send_cmd "$PHONE_OWNER" o-alr "ALERTS"
+  r=$(last_out_org "$ORG_APEX")
+  assert_contains "ALERTS summarises overdue"            "Overdue:" "$r"
+  assert_contains "ALERTS summarises PT attention"       "PT attention:" "$r"
+  assert_contains "ALERTS points to detail commands"     "Text OVERDUE or PT" "$r"
+
+  send_cmd "$PHONE_OWNER" o-tod "TODAY"
+  r=$(last_out_org "$ORG_APEX")
+  assert_contains "TODAY counts the 3 check-ins"         "Check-ins: 3" "$r"
+  assert_contains "TODAY counts the failed send (24h)"   "Failed sends (24h): 1" "$r"
+  assert_contains "TODAY has the renewals line"          "Renewals due today:" "$r"
+  assert_contains "TODAY has the PT sessions line"       "PT sessions logged:" "$r"
+
+  send_cmd "$PHONE_OWNER" o-ovr "OVERDUE"
+  r=$(last_out_org "$ORG_APEX")
+  assert_contains "OVERDUE lists the past_due member"    "Ishaan Verma" "$r"
+  assert_contains "OVERDUE shows an amount owed"         "1,800" "$r"
+  assert_contains "OVERDUE shows days late"              " late" "$r"
+
+  send_cmd "$PHONE_OWNER" o-pt "PT"
+  r=$(last_out_org "$ORG_APEX")
+  assert_contains "PT shows active package count"        "Active packages:" "$r"
+  assert_contains "PT shows this month's PT revenue"     "PT revenue this month:" "$r"
+  assert_contains "PT shows the low-sessions list"       "Low on sessions" "$r"
+  assert_contains "PT shows the expiring-soon list"      "Expiring soon" "$r"
+
+  send_cmd "$PHONE_OWNER" o-coa "COACHES"
+  r=$(last_out_org "$ORG_APEX")
+  assert_contains "COACHES lists Rhea as logging"        "Rhea Kapoor" "$r"
+  assert_contains "COACHES flags an active logger"       "logging ✅" "$r"
+  assert_contains "COACHES flags a quiet coach (Sam, 26d)" "quiet ⚠️" "$r"
+
+  send_cmd "$PHONE_OWNER" o-lap "LAPSED"
+  r=$(last_out_org "$ORG_APEX")
+  assert_contains "LAPSED highlights the total + window" "haven't checked in for 14+ days" "$r"
+
+  send_cmd "$PHONE_OWNER" o-new "NEW"
+  r=$(last_out_org "$ORG_APEX")
+  assert_contains "NEW shows this vs last month"         "This month: 12" "$r"
+  assert_contains "NEW lists a joiner with their plan"   "Aditya Rao" "$r"
+  assert_contains "NEW caps the list at 10 with +N more" "+2 more" "$r"
+
+  # --- 8b. HELP + unknown-owner-command fallback (owner-tailored) ---
+  send_cmd "$PHONE_OWNER" o-hlp "zzznotacommand"
+  r=$(last_out_org "$ORG_APEX")
+  assert_contains "unknown owner command falls back to owner HELP" "Commands — Apex Strength Co." "$r"
+  assert_contains "owner HELP lists REVENUE"             "REVENUE" "$r"
+  assert_contains "owner HELP lists LAPSED"              "LAPSED" "$r"
+  case "$r" in
+    *"Reply IN to check in"*) bad "owner HELP must not show member help text" "no member copy" "$r" ;;
+    *) ok "owner HELP does not leak member-facing copy" ;;
+  esac
+
+  # --- 8c. coach path ---
+  send_cmd "$PHONE_COACH" c-my "MYCLIENTS"
+  r=$(last_out_org "$ORG_APEX")
+  assert_contains "MYCLIENTS returns the coach's own list"  "Your clients (3)" "$r"
+  assert_contains "MYCLIENTS shows a client name + goal"    "Aditya Rao — Muscle gain" "$r"
+  assert_contains "MYCLIENTS shows sessions used/purchased" "sessions" "$r"
+  assert_not_contains "MYCLIENTS never leaks Sam's client"  "Ethan Wright" "$r"
+  assert_not_contains "MYCLIENTS never leaks Lena's client" "Ishaan Verma" "$r"
+
+  send_cmd "$PHONE_COACH" c-rev "REVENUE"
+  r=$(last_out_org "$ORG_APEX")
+  assert_contains "a coach texting an owner command gets coach help" "reply MYCLIENTS" "$r"
+  assert_contains "coach help says owner reports are owner-only"     "owner-only" "$r"
+  case "$r" in
+    *"Revenue —"*) bad "coach must not receive the owner REVENUE report" "coach help" "$r" ;;
+    *) ok "coach does not receive owner REVENUE data" ;;
+  esac
+
+  # --- 8d. cross-org isolation: an owner only ever sees their own org ---
+  send_cmd "$PHONE_OWNER_IRON" x-rev "REVENUE"
+  r=$(last_out_org "$ORG_IRON")
+  assert_contains "Iron owner's REVENUE names Iron Temple"  "Iron Temple Gym" "$r"
+  assert_not_contains "Iron owner's REVENUE never shows Apex" "Apex Strength Co." "$r"
+  send_cmd "$PHONE_OWNER_IRON" x-ovr "OVERDUE"
+  r=$(last_out_org "$ORG_IRON")
+  assert_not_contains "Iron owner's OVERDUE never shows an Apex member" "Ishaan Verma" "$r"
+  send_cmd "$PHONE_OWNER_IRON" x-coa "COACHES"
+  r=$(last_out_org "$ORG_IRON")
+  assert_not_contains "Iron owner's COACHES never shows an Apex coach" "Sam Okafor" "$r"
+
+  # --- 8e. a phone that is not an owner / coach / member ---
+  got=$(send_message 919333000777 "wamid.$RUN.nf" "REVENUE")
+  assert_contains "unknown phone gets a clean not_found (not an error)" '"resolution":"not_found"' "$got"
+  assert_contains "unknown phone response is still ok:true"             '"ok":true' "$got"
+
+  # Throwaway-org fixtures for 8f/8g. Both are status='suspended': every read
+  # in these handlers is scoped by organization_id, so status is irrelevant to
+  # the assertions — but 'suspended' means that even if teardown here somehow
+  # fails, a leaked row can't be picked up by the daily-owner-brief batch (its
+  # "4 briefable orgs" invariant) or any renewal/overdue cron. Teardown runs
+  # via a heredoc (statement-per-statement, continues past errors) rather than
+  # a single multi-statement -c string.
+  BULK_ORG=0daded00-0000-0000-0000-0000000b0001
+  TWIN_ORG=0daded00-0000-0000-0000-00000000abba
+  bulk_teardown() {
+    docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+DELETE FROM whatsapp_messages WHERE organization_id IN ('$BULK_ORG', '$TWIN_ORG');
+DELETE FROM memberships      WHERE organization_id = '$BULK_ORG';
+DELETE FROM members          WHERE organization_id = '$BULK_ORG';
+DELETE FROM membership_plans  WHERE organization_id = '$BULK_ORG';
+DELETE FROM locations         WHERE organization_id = '$BULK_ORG';
+DELETE FROM organizations     WHERE id = '$BULK_ORG';
+DELETE FROM organizations     WHERE id = '$TWIN_ORG';
+SQL
+  }
+  bulk_teardown   # defensive: clear any leak from a previously aborted run
+
+  # --- 8f. multi-org owner_phone collision -> graceful disambiguation ---
+  docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+INSERT INTO organizations (id, name, owner_phone, status)
+VALUES ('$TWIN_ORG', 'Twin Peaks Gym', '$PHONE_OWNER_IRON', 'suspended');
+SQL
+  send_cmd "$PHONE_OWNER_IRON" amb "REVENUE"
+  r=$(sql "select body_preview from whatsapp_messages where direction='outbound' and organization_id is null order by created_at desc limit 1;")
+  assert_contains "multi-org owner_phone is flagged, not guessed" "more than one gym" "$r"
+  assert_contains "the ambiguous reply names both orgs"           "Twin Peaks Gym" "$r"
+
+  # --- 8g. a genuinely long list is capped + summarised, not malformed ---
+  docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+INSERT INTO organizations (id, name, owner_phone, status)
+VALUES ('$BULK_ORG', 'Bulk Test Gym', '919555000111', 'suspended');
+INSERT INTO locations (id, organization_id, name)
+VALUES ('0daded00-0000-0000-0000-0000000b0000', '$BULK_ORG', 'Bulk HQ');
+INSERT INTO membership_plans (id, organization_id, name, amount)
+VALUES ('0daded00-0000-0000-0000-0000000b0002', '$BULK_ORG', 'Bulk Plan', 1000);
+DO \$\$
+BEGIN
+  FOR i IN 1..15 LOOP
+    INSERT INTO members (id, organization_id, location_id, name, phone)
+    VALUES (('0daded00-0000-0000-0000-0000000c00' || lpad(i::text, 2, '0'))::uuid,
+            '$BULK_ORG', '0daded00-0000-0000-0000-0000000b0000',
+            'Bulk Member ' || i, '9195551' || lpad(i::text, 5, '0'));
+    INSERT INTO memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end, duration_months)
+    VALUES (('0daded00-0000-0000-0000-0000000d00' || lpad(i::text, 2, '0'))::uuid,
+            '$BULK_ORG', ('0daded00-0000-0000-0000-0000000c00' || lpad(i::text, 2, '0'))::uuid,
+            '0daded00-0000-0000-0000-0000000b0002', 'past_due',
+            CURRENT_DATE - 40, CURRENT_DATE - 10, 1);
+  END LOOP;
+END \$\$;
+SQL
+
+  send_cmd 919555000111 bulk-ovr "OVERDUE"
+  r=$(last_out_org "$BULK_ORG")
+  assert_contains "long OVERDUE shows the true total"    "(15 total)" "$r"
+  assert_contains "long OVERDUE caps at 10 + summarises" "+5 more" "$r"
+  if [ "${#r}" -lt 3500 ]; then ok "long OVERDUE reply stays a sane length (${#r} bytes)"
+  else bad "long OVERDUE reply length" "< 3500 bytes" "${#r} bytes"; fi
+
+  send_cmd 919555000111 bulk-lap "LAPSED"
+  r=$(last_out_org "$BULK_ORG")
+  assert_contains "long LAPSED caps at 10 + summarises"  "+5 more" "$r"
+  if [ "${#r}" -lt 3500 ]; then ok "long LAPSED reply stays a sane length (${#r} bytes)"
+  else bad "long LAPSED reply length" "< 3500 bytes" "${#r} bytes"; fi
+
+  bulk_teardown
+
+  # --- 8h. existing member intents are completely unaffected ---
+  reset_state
+  got=$(send_message "$PHONE_ACTIVE" "wamid.$RUN.mem-in" "in")
+  assert_contains "member IN still resolves + checks in" '"resolution":"resolved"' "$got"
+  assert_db       "member IN still writes an attendance row" "1" "$(attendance_count "$PHONE_ACTIVE")"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

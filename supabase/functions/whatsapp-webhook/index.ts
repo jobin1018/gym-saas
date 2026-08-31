@@ -35,6 +35,11 @@ import { expectedServiceRoleKey } from "../_shared/auth.ts";
 
 const SOURCE = "meta" as const;
 
+// Fixed-offset billing zone (Asia/Kolkata, no DST) — matches BILLING_TIMEZONE
+// in razorpay-webhook / renewal-scan / daily-owner-brief. Used only by the
+// owner-command handlers for "today" / month boundaries.
+const BILLING_TZ = Deno.env.get("BILLING_TIMEZONE") ?? "Asia/Kolkata";
+
 // ---------------------------------------------------------------------------
 // Reply copy — kept in one place so it is easy to swap for Meta message
 // templates later (approved templates are required for business-initiated
@@ -562,6 +567,549 @@ async function handleSwitch(
   return formatGymList(options, "You're registered at multiple gyms.");
 }
 
+// ===========================================================================
+// OWNER / COACH COMMANDS — a parallel, read-only intent path
+// ===========================================================================
+// If the inbound phone is an organization's owner_phone (not a member), it is
+// routed here instead of the member flow; a users row with role='coach' and a
+// matching phone gets the single coach command. All replies are free-form text
+// inside the 24h service window — no templates — and every read is scoped to
+// the ONE org resolved from the phone. NOTHING here writes business data or is
+// callable from a cron.
+//
+// PHONE RESOLUTION PRIORITY (see resolveSender):  owner  >  coach  >  member.
+// Each tier is an exact equality match on a distinct column
+// (organizations.owner_phone / users.phone WHERE role='coach' / members.phone),
+// so a person who is e.g. both an owner and a registered member deterministically
+// gets owner commands. front_desk/owner-role staff who are not an org's literal
+// owner_phone fall through to the member path unchanged.
+// ===========================================================================
+
+type SenderRole =
+  | { kind: "owner"; organizationId: string; orgName: string }
+  | { kind: "owner_ambiguous"; orgs: { id: string; name: string }[] }
+  | { kind: "coach"; userId: string; organizationId: string; name: string }
+  | { kind: "coach_ambiguous"; names: string[] }
+  | { kind: "member" };
+
+type OwnerCommand =
+  | "revenue" | "alerts" | "today" | "overdue" | "pt"
+  | "coaches" | "lapsed" | "new" | "help";
+
+async function resolveSender(
+  supabase: SupabaseClient,
+  phone: string,
+): Promise<SenderRole> {
+  const { data: orgs, error: orgErr } = await supabase
+    .from("organizations")
+    .select("id, name")
+    .eq("owner_phone", phone);
+  if (orgErr) throw orgErr;
+  if (orgs && orgs.length === 1) {
+    return { kind: "owner", organizationId: orgs[0].id, orgName: orgs[0].name };
+  }
+  if (orgs && orgs.length > 1) {
+    return { kind: "owner_ambiguous", orgs: orgs.map((o: any) => ({ id: o.id, name: o.name })) };
+  }
+
+  const { data: coaches, error: coachErr } = await supabase
+    .from("users")
+    .select("id, name, organization_id")
+    .eq("role", "coach")
+    .eq("phone", phone);
+  if (coachErr) throw coachErr;
+  if (coaches && coaches.length === 1) {
+    return {
+      kind: "coach",
+      userId: coaches[0].id,
+      organizationId: coaches[0].organization_id,
+      name: coaches[0].name,
+    };
+  }
+  if (coaches && coaches.length > 1) {
+    return { kind: "coach_ambiguous", names: coaches.map((c: any) => c.name) };
+  }
+
+  return { kind: "member" };
+}
+
+// --- command parsing ------------------------------------------------------
+
+function normalizeCommand(body: string): string {
+  return body.trim().toLowerCase().replace(/\s+/g, "");
+}
+
+function parseOwnerCommand(body: string): OwnerCommand {
+  const map: Record<string, OwnerCommand> = {
+    revenue: "revenue", rev: "revenue",
+    alerts: "alerts", alert: "alerts",
+    today: "today",
+    overdue: "overdue", due: "overdue",
+    pt: "pt",
+    coaches: "coaches", coach: "coaches",
+    lapsed: "lapsed",
+    new: "new",
+    help: "help", menu: "help", commands: "help", hi: "help",
+  };
+  return map[normalizeCommand(body)] ?? "help";
+}
+
+/** Coach path has exactly one real command; everything else is coach help. */
+function parseCoachCommand(body: string): "myclients" | "help" {
+  const t = normalizeCommand(body);
+  return t === "myclients" || t === "clients" ? "myclients" : "help";
+}
+
+// --- formatting helpers -------------------------------------------------
+
+function rupees(n: number): string {
+  return "₹" + Math.round(Number(n) || 0).toLocaleString("en-IN");
+}
+
+/** Today's date (YYYY-MM-DD) in the billing zone. */
+function todayDateStr(): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: BILLING_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+/** UTC instant of 00:00 today in the billing zone (fixed +05:30, no DST). */
+function startOfTodayIso(): string {
+  const OFFSET = 5.5 * 3600 * 1000;
+  const istMidnight = Math.floor((Date.now() + OFFSET) / 86400000) * 86400000 - OFFSET;
+  return new Date(istMidnight).toISOString();
+}
+
+/** First day (YYYY-MM-DD) of the month `offset` months from the current one. */
+function monthStartStr(offset: number): string {
+  const [y, m] = todayDateStr().split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1 + offset, 1)).toISOString().slice(0, 10);
+}
+
+/** Whole days between a past YYYY-MM-DD and today (billing zone). */
+function daysSince(dateStr: string): number {
+  const [y, m, d] = dateStr.slice(0, 10).split("-").map(Number);
+  const [ty, tm, td] = todayDateStr().split("-").map(Number);
+  return Math.round((Date.UTC(ty, tm - 1, td) - Date.UTC(y, m - 1, d)) / 86400000);
+}
+
+/** Add months to YYYY-MM-DD, clamping to month end — same rule as razorpay-webhook. */
+function addMonthsStr(dateStr: string, months: number): string {
+  const [y, m, d] = dateStr.slice(0, 10).split("-").map(Number);
+  const total = y * 12 + (m - 1) + months;
+  const ty = Math.floor(total / 12);
+  const tm = (total % 12) + 1;
+  const lastDay = new Date(Date.UTC(ty, tm, 0)).getUTCDate();
+  const cd = Math.min(d, lastDay);
+  return `${String(ty).padStart(4, "0")}-${String(tm).padStart(2, "0")}-${String(cd).padStart(2, "0")}`;
+}
+
+function fmtDay(dateStr: string | null): string {
+  if (!dateStr) return "never";
+  const [y, m, d] = dateStr.slice(0, 10).split("-").map(Number);
+  // en-GB → "5 Sep" (en-IN renders "5 Sept").
+  return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", timeZone: "UTC" })
+    .format(new Date(Date.UTC(y, m - 1, d)));
+}
+
+function goalLabel(g: string): string {
+  return ({ muscle_gain: "Muscle gain", fat_loss: "Fat loss", general_fitness: "General fitness" } as Record<string, string>)[g] ?? g;
+}
+
+/**
+ * Render at most `cap` items, then a "+N more" line. Keeps OVERDUE / LAPSED /
+ * NEW from producing a message long enough to be truncated by WhatsApp.
+ */
+function capList<T>(items: T[], cap: number, render: (t: T, i: number) => string): string {
+  const shown = items.slice(0, cap).map((t, i) => render(t, i));
+  const more = items.length - cap;
+  return shown.join("\n") + (more > 0 ? `\n+${more} more` : "");
+}
+
+const LIST_CAP = 10;
+
+// --- the "attention" predicate, recomputed from pt_packages ---------------
+// v_pt_packages_attention's own WHERE is bound to auth.jwt(); a keyless
+// service_role caller always gets zero rows from it. This is the identical
+// rule, scoped to `org`.
+interface AttentionPkg {
+  memberName: string;
+  coachName: string;
+  goal: string;
+  remaining: number;
+  daysUntilEnd: number;
+  endDate: string;
+  low: boolean;
+  expiring: boolean;
+}
+
+async function loadAttention(
+  supabase: SupabaseClient,
+  org: string,
+): Promise<AttentionPkg[]> {
+  const { data, error } = await supabase
+    .from("pt_packages")
+    .select("sessions_purchased, sessions_used, start_date, duration_months, goal, members(name), coach:users(name)")
+    .eq("organization_id", org)
+    .eq("status", "active");
+  if (error) throw error;
+
+  const out: AttentionPkg[] = [];
+  for (const p of (data ?? []) as any[]) {
+    const remaining = Number(p.sessions_purchased) - Number(p.sessions_used);
+    const endDate = addMonthsStr(p.start_date, Number(p.duration_months));
+    const daysUntilEnd = -daysSince(endDate);
+    const low = remaining <= 2;
+    const expiring = daysUntilEnd <= 7;
+    if (low || expiring) {
+      out.push({
+        memberName: p.members?.name ?? "Member",
+        coachName: p.coach?.name ?? "coach",
+        goal: p.goal,
+        remaining,
+        daysUntilEnd,
+        endDate,
+        low,
+        expiring,
+      });
+    }
+  }
+  return out;
+}
+
+// --- owner command handlers ---------------------------------------------
+
+async function ownerRevenue(supabase: SupabaseClient, org: string, orgName: string): Promise<string> {
+  const from = monthStartStr(-1);
+  const { data, error } = await supabase
+    .from("v_daily_revenue_by_source")
+    .select("day, source, total")
+    .eq("organization_id", org)
+    .gte("day", from);
+  if (error) throw error;
+
+  const thisStart = monthStartStr(0);
+  let thisMem = 0, thisPt = 0, lastTotal = 0;
+  for (const r of (data ?? []) as any[]) {
+    const day = String(r.day).slice(0, 10);
+    const amt = Number(r.total) || 0;
+    if (day >= thisStart) {
+      if (r.source === "pt_package") thisPt += amt; else thisMem += amt;
+    } else {
+      lastTotal += amt;
+    }
+  }
+  const monthName = new Intl.DateTimeFormat("en-IN", { month: "long", timeZone: "UTC" })
+    .format(new Date(thisStart + "T00:00:00Z"));
+
+  return [
+    `💰 Revenue — ${orgName} (${monthName})`,
+    `Total: ${rupees(thisMem + thisPt)}`,
+    `  • Memberships: ${rupees(thisMem)}`,
+    `  • PT packages: ${rupees(thisPt)}`,
+    `Last month: ${rupees(lastTotal)}`,
+  ].join("\n");
+}
+
+async function ownerOverdueRows(supabase: SupabaseClient, org: string) {
+  const { data, error } = await supabase
+    .from("memberships")
+    .select("current_period_end, total_price, members(name)")
+    .eq("organization_id", org)
+    .eq("status", "past_due")
+    .order("current_period_end", { ascending: true });
+  if (error) throw error;
+  return ((data ?? []) as any[]).map((m) => ({
+    name: m.members?.name ?? "Member",
+    amount: Number(m.total_price) || 0,
+    daysLate: daysSince(m.current_period_end),
+  }));
+}
+
+async function ownerAlerts(supabase: SupabaseClient, org: string, orgName: string): Promise<string> {
+  const overdue = await ownerOverdueRows(supabase, org);
+  const owed = overdue.reduce((s, r) => s + r.amount, 0);
+  const attn = await loadAttention(supabase, org);
+  const low = attn.filter((a) => a.low).length;
+  const expiring = attn.filter((a) => a.expiring).length;
+
+  return [
+    `⚠️ Alerts — ${orgName}`,
+    `Overdue: ${overdue.length} member${overdue.length === 1 ? "" : "s"} · ${rupees(owed)} owed`,
+    `PT attention: ${attn.length} package${attn.length === 1 ? "" : "s"} (${low} low on sessions, ${expiring} expiring soon)`,
+    ``,
+    `Text OVERDUE or PT for the full list.`,
+  ].join("\n");
+}
+
+async function ownerToday(supabase: SupabaseClient, org: string, orgName: string): Promise<string> {
+  const today = todayDateStr();
+  const dayStart = startOfTodayIso();
+  const since24h = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+
+  const [checkins, renewals, sessions, failed] = await Promise.all([
+    supabase.from("attendance").select("id", { count: "exact", head: true })
+      .eq("organization_id", org).gte("checked_in_at", dayStart),
+    supabase.from("memberships").select("id", { count: "exact", head: true })
+      .eq("organization_id", org).in("status", ["active", "past_due"]).eq("current_period_end", today),
+    supabase.from("training_notes").select("id", { count: "exact", head: true })
+      .eq("organization_id", org).eq("session_date", today),
+    supabase.from("whatsapp_messages").select("id", { count: "exact", head: true })
+      .eq("organization_id", org).eq("direction", "outbound").eq("status", "failed").gte("created_at", since24h),
+  ]);
+  for (const r of [checkins, renewals, sessions, failed]) if (r.error) throw r.error;
+
+  return [
+    `📅 Today — ${orgName}`,
+    `Check-ins: ${checkins.count ?? 0}`,
+    `Renewals due today: ${renewals.count ?? 0}`,
+    `PT sessions logged: ${sessions.count ?? 0}`,
+    `Failed sends (24h): ${failed.count ?? 0}`,
+  ].join("\n");
+}
+
+async function ownerOverdue(supabase: SupabaseClient, org: string, orgName: string): Promise<string> {
+  const rows = await ownerOverdueRows(supabase, org);
+  if (rows.length === 0) return `🔴 Overdue — ${orgName}\nNo past-due memberships. 🎉`;
+  return [
+    `🔴 Overdue — ${orgName} (${rows.length} total)`,
+    capList(rows, LIST_CAP, (r, i) => `${i + 1}. ${r.name} — ${rupees(r.amount)} · ${r.daysLate}d late`),
+  ].join("\n");
+}
+
+async function ownerPt(supabase: SupabaseClient, org: string, orgName: string): Promise<string> {
+  const [pkgCount, ptMembers, rev, attn] = await Promise.all([
+    supabase.from("pt_packages").select("id", { count: "exact", head: true })
+      .eq("organization_id", org).eq("status", "active"),
+    supabase.from("v_members_pt_status").select("id", { count: "exact", head: true })
+      .eq("organization_id", org).eq("has_active_pt", true),
+    supabase.from("v_daily_revenue_by_source").select("total")
+      .eq("organization_id", org).eq("source", "pt_package").gte("day", monthStartStr(0)),
+    loadAttention(supabase, org),
+  ]);
+  for (const r of [pkgCount, ptMembers, rev] as any[]) if (r.error) throw r.error;
+
+  const ptRevenue = ((rev.data ?? []) as any[]).reduce((s, r) => s + (Number(r.total) || 0), 0);
+  const low = attn.filter((a) => a.low);
+  const expiring = attn.filter((a) => a.expiring && !a.low);
+
+  const lines = [
+    `🏋️ PT — ${orgName}`,
+    `Active packages: ${pkgCount.count ?? 0} · ${ptMembers.count ?? 0} member${(ptMembers.count ?? 0) === 1 ? "" : "s"}`,
+    `PT revenue this month: ${rupees(ptRevenue)}`,
+  ];
+  if (low.length) {
+    lines.push("", `Low on sessions (${low.length}):`);
+    lines.push(capList(low, LIST_CAP, (a) => ` • ${a.memberName} — ${a.remaining} left (${a.coachName})`));
+  }
+  if (expiring.length) {
+    lines.push("", `Expiring soon (${expiring.length}):`);
+    lines.push(capList(expiring, LIST_CAP, (a) => ` • ${a.memberName} — ends ${fmtDay(a.endDate)} (${a.coachName})`));
+  }
+  if (!low.length && !expiring.length) lines.push("", "No packages need attention right now.");
+  return lines.join("\n");
+}
+
+async function ownerCoaches(supabase: SupabaseClient, org: string, orgName: string): Promise<string> {
+  const recentSince = new Date(Date.now() - 7 * 86400000).toISOString(); // same 7-day window as OwnerDashboard
+  const [coachRes, activeRes, recentRes, lastRes] = await Promise.all([
+    supabase.from("users").select("id, name").eq("organization_id", org).eq("role", "coach"),
+    supabase.from("pt_packages").select("coach_id").eq("organization_id", org).eq("status", "active"),
+    supabase.from("training_notes").select("coach_id").eq("organization_id", org).gte("created_at", recentSince),
+    supabase.from("training_notes").select("coach_id, session_date").eq("organization_id", org),
+  ]);
+  for (const r of [coachRes, activeRes, recentRes, lastRes]) if (r.error) throw r.error;
+
+  const activeCount = new Map<string, number>();
+  for (const r of (activeRes.data ?? []) as any[]) activeCount.set(r.coach_id, (activeCount.get(r.coach_id) ?? 0) + 1);
+  const loggedRecently = new Set(((recentRes.data ?? []) as any[]).map((r) => r.coach_id));
+  const lastSession = new Map<string, string>();
+  for (const r of (lastRes.data ?? []) as any[]) {
+    const cur = lastSession.get(r.coach_id);
+    if (!cur || r.session_date > cur) lastSession.set(r.coach_id, r.session_date);
+  }
+
+  const coaches = (coachRes.data ?? []) as any[];
+  if (coaches.length === 0) return `🧑‍🏫 Coaches — ${orgName}\nNo coaches on the team yet.`;
+
+  const lines = coaches.map((c) => {
+    const clients = activeCount.get(c.id) ?? 0;
+    const last = lastSession.get(c.id) ?? null;
+    const ago = last ? `last ${daysSince(last)}d ago` : "no sessions yet";
+    const status = loggedRecently.has(c.id) ? "logging ✅" : "quiet ⚠️";
+    return `${c.name} — ${clients} client${clients === 1 ? "" : "s"} · ${status} (${ago})`;
+  });
+  return [`🧑‍🏫 Coaches — ${orgName}`, ...lines].join("\n");
+}
+
+async function ownerLapsed(supabase: SupabaseClient, org: string, orgName: string): Promise<string> {
+  const { data, error } = await supabase
+    .from("v_lapsed_members")
+    .select("name, last_visit")
+    .eq("organization_id", org)
+    .order("last_visit", { ascending: true, nullsFirst: true });
+  if (error) throw error;
+  const rows = (data ?? []) as any[];
+  if (rows.length === 0) return `😴 Lapsed — ${orgName}\nEveryone has checked in within the last 14 days. 💪`;
+  return [
+    `😴 Lapsed — ${orgName}`,
+    `${rows.length} member${rows.length === 1 ? "" : "s"} haven't checked in for 14+ days.`,
+    ``,
+    capList(rows, LIST_CAP, (r, i) =>
+      `${i + 1}. ${r.name} — ${r.last_visit ? "last seen " + fmtDay(r.last_visit) : "never checked in"}`),
+  ].join("\n");
+}
+
+async function ownerNew(supabase: SupabaseClient, org: string, orgName: string): Promise<string> {
+  const thisStart = monthStartStr(0);
+  const lastStart = monthStartStr(-1);
+  const [thisRes, lastRes] = await Promise.all([
+    supabase.from("members")
+      .select("id, name, memberships(membership_plans(name)), pt_packages(id)")
+      .eq("organization_id", org).gte("created_at", thisStart).order("created_at", { ascending: true }),
+    supabase.from("members").select("id", { count: "exact", head: true })
+      .eq("organization_id", org).gte("created_at", lastStart).lt("created_at", thisStart),
+  ]);
+  if (thisRes.error) throw thisRes.error;
+  if (lastRes.error) throw lastRes.error;
+
+  const rows = (thisRes.data ?? []) as any[];
+  const lines = [
+    `✨ New members — ${orgName}`,
+    `This month: ${rows.length}  (last month: ${lastRes.count ?? 0})`,
+  ];
+  if (rows.length) {
+    lines.push("");
+    lines.push(capList(rows, LIST_CAP, (r, i) => {
+      const plan = r.memberships?.[0]?.membership_plans?.name ?? null;
+      const hasPt = (r.pt_packages?.length ?? 0) > 0;
+      const tag = [plan, hasPt ? "PT" : null].filter(Boolean).join(" + ") || "no plan yet";
+      return `${i + 1}. ${r.name} — ${tag}`;
+    }));
+  }
+  return lines.join("\n");
+}
+
+function ownerHelp(orgName: string): string {
+  return [
+    `🤖 Commands — ${orgName}`,
+    `REVENUE  — this month's total + membership/PT split, vs last month`,
+    `ALERTS   — overdue + PT-attention summary`,
+    `TODAY    — check-ins, renewals due, PT sessions, failed sends (24h)`,
+    `OVERDUE  — every past-due member: name, amount, days late`,
+    `PT       — active packages, PT revenue, low/expiring list`,
+    `COACHES  — each coach's client count + logging activity`,
+    `LAPSED   — members with no check-in for 14+ days`,
+    `NEW      — members who joined this month`,
+    `HELP     — this list`,
+  ].join("\n");
+}
+
+async function handleOwnerCommand(
+  supabase: SupabaseClient,
+  cmd: OwnerCommand,
+  org: string,
+  orgName: string,
+): Promise<string> {
+  switch (cmd) {
+    case "revenue": return await ownerRevenue(supabase, org, orgName);
+    case "alerts": return await ownerAlerts(supabase, org, orgName);
+    case "today": return await ownerToday(supabase, org, orgName);
+    case "overdue": return await ownerOverdue(supabase, org, orgName);
+    case "pt": return await ownerPt(supabase, org, orgName);
+    case "coaches": return await ownerCoaches(supabase, org, orgName);
+    case "lapsed": return await ownerLapsed(supabase, org, orgName);
+    case "new": return await ownerNew(supabase, org, orgName);
+    default: return ownerHelp(orgName);
+  }
+}
+
+// --- coach command -----------------------------------------------------
+
+async function coachMyClients(
+  supabase: SupabaseClient,
+  coachUserId: string,
+  coachOrg: string,
+  coachName: string,
+): Promise<string> {
+  // Scoped to THIS coach's id — never another coach's clients. The
+  // organization_id filter is defence in depth; coach_id alone is sufficient.
+  const { data, error } = await supabase
+    .from("pt_packages")
+    .select("goal, sessions_used, sessions_purchased, members(name)")
+    .eq("organization_id", coachOrg)
+    .eq("coach_id", coachUserId)
+    .eq("status", "active")
+    .order("start_date", { ascending: true });
+  if (error) throw error;
+
+  const rows = (data ?? []) as any[];
+  if (rows.length === 0) return `🏋️ ${coachName} — you have no active clients right now.`;
+  return [
+    `🏋️ Your clients (${rows.length}) — ${coachName}`,
+    capList(rows, 20, (r, i) =>
+      `${i + 1}. ${r.members?.name ?? "Member"} — ${goalLabel(r.goal)} · ${r.sessions_used}/${r.sessions_purchased} sessions`),
+  ].join("\n");
+}
+
+function coachHelp(coachName: string): string {
+  return `🏋️ ${coachName} — reply MYCLIENTS for your active client list (name, goal, sessions used/purchased). Owner reports (REVENUE, ALERTS, etc.) are owner-only.`;
+}
+
+// --- dispatcher: owns the whole request for an owner/coach sender -------
+
+async function handleStaffCommand(
+  supabase: SupabaseClient,
+  sender: Exclude<SenderRole, { kind: "member" }>,
+  message: InboundMessage,
+  phone: string,
+  eventRowId: string,
+  eventId: string,
+): Promise<Response> {
+  let reply: string;
+  let orgForLog: string | null = null;
+
+  if (sender.kind === "owner") {
+    orgForLog = sender.organizationId;
+    const cmd = parseOwnerCommand(message.body);
+    console.log(`[whatsapp-webhook] owner phone=${phone} org=${sender.organizationId} cmd=${cmd}`);
+    reply = await handleOwnerCommand(supabase, cmd, sender.organizationId, sender.orgName);
+  } else if (sender.kind === "coach") {
+    orgForLog = sender.organizationId;
+    const cmd = parseCoachCommand(message.body);
+    console.log(`[whatsapp-webhook] coach phone=${phone} org=${sender.organizationId} cmd=${cmd}`);
+    reply = cmd === "myclients"
+      ? await coachMyClients(supabase, sender.userId, sender.organizationId, sender.name)
+      : coachHelp(sender.name);
+  } else if (sender.kind === "owner_ambiguous") {
+    // No owner_active_context table and no conversation state (see the
+    // TODO(convo) notes) — the same "can only show the list" limitation the
+    // member `ambiguous` path has. Flagged, not silently guessed.
+    const names = sender.orgs.map((o) => o.name).join(", ");
+    reply =
+      `This number is the registered owner contact for more than one gym (${names}). ` +
+      `WhatsApp commands can't tell them apart yet — please use the owner dashboard, ` +
+      `or contact support to split the numbers.`;
+  } else {
+    const names = sender.names.join(", ");
+    reply =
+      `This number is registered as a coach at more than one gym (${names}). ` +
+      `WhatsApp commands can't tell them apart yet — please use the coach app.`;
+  }
+
+  await logInboundMessage(supabase, message, { memberId: null, organizationId: orgForLog });
+  await sendWhatsAppMessage(supabase, phone, reply, { memberId: null, organizationId: orgForLog });
+
+  const { error: processedError } = await supabase
+    .from("webhook_events").update({ processed: true }).eq("id", eventRowId);
+  if (processedError) console.error("[whatsapp-webhook] failed to mark processed:", processedError);
+
+  return json({ ok: true, event_id: eventId, resolution: sender.kind });
+}
+
 // ---------------------------------------------------------------------------
 // POST authentication — X-Hub-Signature-256
 //
@@ -705,6 +1253,16 @@ async function handleWebhook(req: Request): Promise<Response> {
   try {
     // --- (b) Normalize the sender phone. ---
     const phone = normalizePhone(message.from);
+
+    // --- (b2) Owner / coach command path. Checked BEFORE member resolution:
+    // --- an owner_phone / coach phone is never in the member flow. Returns
+    // --- the full 200 response itself (logs inbound, sends reply, marks the
+    // --- event processed). The member path below is untouched for everyone
+    // --- else (in / pay / switch).
+    const sender = await resolveSender(supabase, phone);
+    if (sender.kind !== "member") {
+      return await handleStaffCommand(supabase, sender, message, phone, event.id, eventId);
+    }
 
     // --- (c) Resolve the tenant. ---
     const resolution = await resolvePhone(supabase, phone);
