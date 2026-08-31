@@ -165,12 +165,18 @@ reset_state() {
   $have_psql || return 0
   docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
 DELETE FROM whatsapp_messages WHERE template_name IN ('daily_owner_brief','renewal_reminder')
-                                 OR organization_id = '$ORG_SUSPENDED';
+                                 OR organization_id IN ('$ORG_SUSPENDED', '0daded00-0000-0000-0000-00000000c0c0');
 DELETE FROM payments   WHERE idempotency_key LIKE 'renewal-%';
 DELETE FROM attendance WHERE organization_id IN ('$ORG_IRON','$ORG_FLEX','$ORG_SUSPENDED');
-DELETE FROM organizations WHERE id = '$ORG_SUSPENDED';
+DELETE FROM users         WHERE organization_id = '0daded00-0000-0000-0000-00000000c0c0';
+DELETE FROM organizations WHERE id IN ('$ORG_SUSPENDED', '0daded00-0000-0000-0000-00000000c0c0');
 UPDATE organizations SET status='active', owner_phone='919000000001' WHERE id='$ORG_IRON';
 UPDATE organizations SET status='active', owner_phone='919000000002' WHERE id='$ORG_FLEX';
+-- daily-owner-brief now also fans the brief out to users role='owner'; the
+-- error-path sections below break owner_phone AND the owner-user phone, so
+-- restore both here.
+UPDATE users SET phone='919000000001' WHERE organization_id='$ORG_IRON' AND role='owner';
+UPDATE users SET phone='919000000002' WHERE organization_id='$ORG_FLEX' AND role='owner';
 UPDATE memberships SET status='active',   current_period_end=CURRENT_DATE + 20 WHERE id='$MEM_ASHA';
 UPDATE memberships SET status='past_due', current_period_end=CURRENT_DATE - 10 WHERE id='$MEM_BHARAT';
 UPDATE memberships SET status='active',   current_period_end=CURRENT_DATE + 25 WHERE id='$MEM_CHITRA_IT';
@@ -479,7 +485,12 @@ else
   # real (non-dry-run) send yet at this point in the suite, and section 5's
   # Iron Temple "already sent today" state (needed by section 6, next) must
   # survive untouched.
-  sql "update organizations set owner_phone='0000000000' where id='$ORG_FLEX';" >/dev/null
+  # Point BOTH recipient sources (owner_phone AND the owner-user) at
+  # MOCK_FAILURE_PHONE so every send for this org fails — that is what makes
+  # the whole org 'error', now that a reachable co-owner would otherwise
+  # carry it to 'sent'.
+  sql "update organizations set owner_phone='0000000000' where id='$ORG_FLEX';
+       update users set phone='0000000000' where organization_id='$ORG_FLEX' and role='owner';" >/dev/null
 
   got=$(post "{\"organization_id\":\"$ORG_FLEX\"}")
 
@@ -499,7 +510,8 @@ else
   assert_db "still exactly one row for this org" \
     "1" "$(sql "select count(*) from whatsapp_messages where template_name='daily_owner_brief' and organization_id='$ORG_FLEX';")"
 
-  sql "update organizations set owner_phone='919000000002' where id='$ORG_FLEX';" >/dev/null
+  sql "update organizations set owner_phone='919000000002' where id='$ORG_FLEX';
+       update users set phone='919000000002' where organization_id='$ORG_FLEX' and role='owner';" >/dev/null
 fi
 
 # ---------------------------------------------------------------------------
@@ -539,9 +551,11 @@ else
   arrange_checkins
   add_suspended_org
 
-  # owner_phone is NOT NULL in the schema, so the realistic bad-data case is an
-  # empty one — an org row that exists but has nobody to message.
-  sql "update organizations set owner_phone='' where id='$ORG_IRON';" >/dev/null
+  # The realistic "nobody to message" case: owner_phone empty AND no
+  # owner-role user with a usable phone. (owner_phone is NOT NULL, users.phone
+  # is NOT NULL — empty string is the bad-data shape both take.)
+  sql "update organizations set owner_phone='' where id='$ORG_IRON';
+       update users set phone='' where organization_id='$ORG_IRON' and role='owner';" >/dev/null
 
   got=$(post '{}')
 
@@ -567,7 +581,8 @@ else
 
   # Fixing the data and re-running must brief the org that failed, and must NOT
   # re-brief the one that already succeeded today.
-  sql "update organizations set owner_phone='919000000001' where id='$ORG_IRON';" >/dev/null
+  sql "update organizations set owner_phone='919000000001' where id='$ORG_IRON';
+       update users set phone='919000000001' where organization_id='$ORG_IRON' and role='owner';" >/dev/null
   got=$(post '{}')
   assert_equals   "the repaired org is briefed on the next run" "1" "$(field_num sent "$got")"
   assert_equals   "nothing errors after the repair"             "0" "$(field_num errored "$got")"
@@ -619,6 +634,48 @@ assert_db "batch dry run wrote nothing" "0" "$(briefs_all)"
 got=$(post '{"dry_run":true,"limit":1}')
 assert_contains "limit truncates the batch" '"truncated":true' "$got"
 assert_contains "limit is echoed back"      '"limit":1' "$got"
+
+# ---------------------------------------------------------------------------
+# 10. Co-owners — the brief goes to organizations.owner_phone AND every
+#     users role='owner' for the org, one copy per distinct phone, once/day.
+# ---------------------------------------------------------------------------
+printf '\n%s-- co-owner brief fan-out --%s\n' "$B" "$N"
+
+if ! $have_psql; then
+  skipped "co-owner brief fan-out" "requires docker/psql for the fixture org"
+else
+  reset_state
+  CO_ORG=0daded00-0000-0000-0000-00000000c0c0
+  co_teardown() {
+    docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+DELETE FROM whatsapp_messages WHERE organization_id = '$CO_ORG';
+DELETE FROM users            WHERE organization_id = '$CO_ORG';
+DELETE FROM organizations    WHERE id = '$CO_ORG';
+SQL
+  }
+  co_teardown   # defensive: clear any leak from a prior aborted run
+  # Owner A's phone IS organizations.owner_phone; Owner B is a second
+  # users role='owner' at the SAME org. Distinct recipients = 2, not 3.
+  docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+INSERT INTO organizations (id, name, owner_phone, status)
+VALUES ('$CO_ORG', 'Co-Owned Test Gym', '919555200001', 'active');
+INSERT INTO users (id, organization_id, name, phone, role, location_id) VALUES
+  ('0daded00-0000-0000-0000-00000000c0a1', '$CO_ORG', 'Owner A', '919555200001', 'owner', NULL),
+  ('0daded00-0000-0000-0000-00000000c0a2', '$CO_ORG', 'Owner B', '919555200002', 'owner', NULL);
+SQL
+
+  got=$(post "{\"organization_id\":\"$CO_ORG\"}")
+  assert_contains "co-owner brief is sent"                        '"outcome":"sent"' "$got"
+  assert_contains "co-owner brief has 2 distinct recipients"      '"recipients":2' "$got"
+  assert_contains "co-owner brief reached both (deduped, not 3)"  '"recipients_delivered":2' "$got"
+  assert_db       "one brief row per distinct owner phone (2), not 3" "2" "$(briefs_for "$CO_ORG")"
+
+  got=$(post "{\"organization_id\":\"$CO_ORG\"}")
+  assert_contains "co-owner brief re-run same day is skipped"     '"reason":"already_sent_today"' "$got"
+  assert_db       "co-owner brief re-run re-messaged nobody (still 2)" "2" "$(briefs_for "$CO_ORG")"
+
+  co_teardown
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

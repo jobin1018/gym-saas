@@ -701,6 +701,7 @@ INSERT INTO body_measurements (organization_id, member_id, recorded_by, weight_k
 -- LOGINS (real bcrypt via pgcrypto crypt(), cost 12 — verified compatible
 -- with staff-login's bcryptjs verify):
 --   919100000001  Nisha Raman     owner       —                 PIN 2580
+--   919100000009  Priya Balan     owner       —                 PIN 2581   <- CO-OWNER: same gym, own phone/login, identical access
 --   919100000002  Tomas Ferreira  front_desk  Apex — Central     PIN 1470
 --   919100000003  Rhea Kapoor     coach       Apex — Central     PIN 3690
 --                   ^ most recent session ~2 days ago  => dashboard "logging sessions": TRUE
@@ -720,6 +721,12 @@ INSERT INTO locations (id, organization_id, name) VALUES
 INSERT INTO users (id, organization_id, name, phone, role, location_id, pin_hash) VALUES
   ('a9ec0000-0000-0000-0000-0000000000c1', 'a9ec0000-0000-0000-0000-0000000000a1', 'Nisha Raman',
    '919100000001', 'owner',      NULL,                                   crypt('2580', gen_salt('bf', 12))),
+  -- Co-owner: a real second owner of the SAME gym, own phone + login. Her
+  -- phone is NOT organizations.owner_phone (that is Nisha's) — she resolves as
+  -- an owner purely via this users row. Exercises the co-owner path in
+  -- whatsapp-webhook resolveSender() and daily-owner-brief's recipient fan-out.
+  ('a9ec0000-0000-0000-0000-0000000000c3', 'a9ec0000-0000-0000-0000-0000000000a1', 'Priya Balan',
+   '919100000009', 'owner',      NULL,                                   crypt('2581', gen_salt('bf', 12))),
   ('a9ec0000-0000-0000-0000-0000000000c2', 'a9ec0000-0000-0000-0000-0000000000a1', 'Tomas Ferreira',
    '919100000002', 'front_desk', 'a9ec0000-0000-0000-0000-0000000000b1', crypt('1470', gen_salt('bf', 12))),
   ('a9ec0000-0000-0000-0000-0000000000d1', 'a9ec0000-0000-0000-0000-0000000000a1', 'Rhea Kapoor',

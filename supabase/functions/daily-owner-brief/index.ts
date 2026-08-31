@@ -24,12 +24,14 @@
 //       runs.
 //
 // ============================================================================
-// THE RECIPIENT IS AN ORGANIZATION, NOT A MEMBER
+// THE RECIPIENTS ARE AN ORGANIZATION'S OWNERS, NOT A MEMBER
 // ============================================================================
 // Every other outbound message in this system goes to a member. This one goes
-// to organizations.owner_phone, so the whatsapp_messages row it writes has
-// member_id = NULL. That is allowed (the column has no NOT NULL constraint) and
-// it does not disturb anything downstream:
+// to EVERY owner of the gym — organizations.owner_phone AND every users row
+// with role='owner' for that org, deduped by phone (a gym can have 2+ real
+// co-owners). Each distinct phone gets its own copy; the whatsapp_messages row
+// for each has member_id = NULL. That is allowed (the column has no NOT NULL
+// constraint) and it does not disturb anything downstream:
 //
 //   - send-renewal-reminder's once-per-day guard filters on
 //     .eq("member_id", <uuid>), which a NULL row can never match.
@@ -143,6 +145,10 @@ interface OrgResult {
   stats?: BriefStats;
   message?: string;
   whatsapp_message_id?: string | null;
+  /** distinct owner phones this org's brief was addressed to */
+  recipients?: number;
+  /** of those, how many the send actually reached (queued/sent, not failed) */
+  recipients_delivered?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +490,36 @@ async function alreadySentToday(
   return (data ?? []).length > 0;
 }
 
+/**
+ * Every phone that should receive this org's brief: organizations.owner_phone
+ * PLUS every users row with role='owner' for the org, trimmed and deduped.
+ *
+ * owner_phone is kept in the mix on purpose (see requirement/DECISION note in
+ * the header): it is the signup / billing contact and the only recipient for
+ * an org that has no owner-role users bridged yet. If the same person is both
+ * owner_phone and an owner-role user, the Set collapses them to one send.
+ */
+async function loadOwnerRecipients(
+  supabase: SupabaseClient,
+  org: OrgRow,
+): Promise<string[]> {
+  const { data, error } = await supabase
+    .from("users")
+    .select("phone")
+    .eq("organization_id", org.id)
+    .eq("role", "owner");
+  if (error) throw error;
+
+  const phones = new Set<string>();
+  const add = (p: string | null | undefined) => {
+    const t = (p ?? "").trim();
+    if (t) phones.add(t);
+  };
+  add(org.owner_phone);
+  for (const u of data ?? []) add((u as { phone: string | null }).phone);
+  return [...phones];
+}
+
 // ---------------------------------------------------------------------------
 // One organization
 // ---------------------------------------------------------------------------
@@ -540,84 +576,97 @@ async function briefOneOrg(
     return { ...base, outcome: "computed", stats, message };
   }
 
-  // --- Recipient check happens AFTER the compute, so a dry run can still show
-  // --- the brief for an org whose owner_phone is broken.
-  const phone = (org.owner_phone ?? "").trim();
-  if (!phone) {
+  // --- Recipient list is resolved AFTER the compute, so a dry run can still
+  // --- show the brief for an org whose owner contacts are broken.
+  const recipients = await loadOwnerRecipients(supabase, org);
+  if (recipients.length === 0) {
     console.error(
-      `[${TAG}] org ${org.id} (${org.name}) has no owner_phone — nobody to send to.`,
+      `[${TAG}] org ${org.id} (${org.name}) has no owner recipient — no ` +
+        "organizations.owner_phone and no users role='owner'.",
     );
     return {
       ...base,
       outcome: "error",
-      error: "owner_phone_missing",
-      detail: "organizations.owner_phone is empty",
+      error: "owner_phone_missing", // kept for callers/tests; detail widened
+      detail: "no organizations.owner_phone and no users role='owner'",
       stats,
     };
   }
 
-  const send = await sendWhatsAppMessage(supabase, phone, message, {
-    tag: TAG,
-    // NULL on purpose — the recipient is the org's owner, not a member.
-    memberId: null,
-    organizationId: org.id,
-    templateName: TEMPLATE_NAME,
-    relatedPaymentId: null,
-  }, {
-    name: TEMPLATE_NAME,
-    language: TEMPLATE_LANGUAGE,
-    // Same order as the template body: "Good morning! {{1}} — {{2}}.
-    // Renewals due this week: {{3}} (₹{{4}}). Overdue: {{5}} members,
-    // ₹{{6}} pending. Yesterday: {{7}} check-ins. Reply DETAILS for the
-    // full list." Exactly 7 — no 8th param for failed_sends; that line is
-    // buildBrief()'s preview/body_preview content only (see the header note).
-    bodyParams: [
-      org.name,
-      formatDateForOwner(todayLocal),
-      String(stats.renewals_due_count),
-      formatRupees(stats.renewals_due_amount),
-      String(stats.overdue_count),
-      formatRupees(stats.overdue_amount),
-      String(stats.checkins_yesterday),
-    ],
-  });
+  const bodyParams = [
+    org.name,
+    formatDateForOwner(todayLocal),
+    String(stats.renewals_due_count),
+    formatRupees(stats.renewals_due_amount),
+    String(stats.overdue_count),
+    formatRupees(stats.overdue_amount),
+    String(stats.checkins_yesterday),
+  ];
 
-  if (!send.logged) {
-    // The whatsapp_messages row IS the once-per-day guard, so without it a
-    // re-run today would message the owner again. Reported, not swallowed.
+  // One send per distinct owner phone. The once-per-day guard above is
+  // per-ORG, so a re-run the same day skips the whole org (nobody is
+  // re-messaged); within THIS run the deduped list guarantees each phone is
+  // messaged once. Each send writes its own whatsapp_messages row.
+  let logged = 0;
+  let delivered = 0;
+  let lastMessageId: string | null = null;
+  for (const phone of recipients) {
+    const send = await sendWhatsAppMessage(supabase, phone, message, {
+      tag: TAG,
+      memberId: null, // NULL on purpose — the recipient is an owner, not a member.
+      organizationId: org.id,
+      templateName: TEMPLATE_NAME,
+      relatedPaymentId: null,
+    }, {
+      name: TEMPLATE_NAME,
+      language: TEMPLATE_LANGUAGE,
+      // Same order as the template body: "Good morning! {{1}} — {{2}}.
+      // Renewals due this week: {{3}} (₹{{4}}). Overdue: {{5}} members,
+      // ₹{{6}} pending. Yesterday: {{7}} check-ins." Exactly 7 — failed_sends
+      // is buildBrief()'s body_preview content only (see the header note).
+      bodyParams,
+    });
+    if (send.logged) logged++;
+    if (send.status !== "failed") delivered++;
+    if (send.messageId) lastMessageId = send.messageId;
+  }
+
+  if (logged === 0) {
+    // The whatsapp_messages row IS the once-per-day guard, so with none
+    // written a re-run today would message every owner again.
     console.error(
-      `[${TAG}] brief for org ${org.id} was not logged — the once-per-day ` +
-        "guard cannot see it.",
+      `[${TAG}] brief for org ${org.id} wrote NO whatsapp_messages row across ` +
+        `${recipients.length} recipient(s) — the once-per-day guard cannot see it.`,
     );
     return {
       ...base,
       outcome: "error",
       error: "message_not_logged",
-      detail: "the send happened but whatsapp_messages could not be written",
+      detail: "sends happened but no whatsapp_messages row could be written",
       stats,
       message,
+      recipients: recipients.length,
+      recipients_delivered: 0,
     };
   }
 
-  if (send.status === "failed") {
-    // Logged and Meta-rejected are independent: sendWhatsAppMessage always
-    // writes the row (so the once-per-day guard still sees it and this org
-    // won't be retried until tomorrow), but a 400 from Meta means the owner
-    // never actually got the brief. Checking send.logged alone here previously
-    // reported this as "sent" — the row write had succeeded even though the
-    // delivery hadn't.
+  if (delivered === 0) {
+    // At least one row was logged (so the org won't be retried today), but
+    // Meta rejected every send — no owner actually received the brief.
     console.error(
-      `[${TAG}] brief for org ${org.id} was logged but Meta rejected the ` +
-        "send (status=failed).",
+      `[${TAG}] brief for org ${org.id} was logged but Meta rejected all ` +
+        `${recipients.length} owner send(s) (status=failed).`,
     );
     return {
       ...base,
       outcome: "error",
       error: "send_failed",
-      detail: "whatsapp_messages was written but the Meta API call failed",
+      detail: `whatsapp_messages rows were written but every Meta send failed`,
       stats,
       message,
-      whatsapp_message_id: send.messageId,
+      recipients: recipients.length,
+      recipients_delivered: 0,
+      whatsapp_message_id: lastMessageId,
     };
   }
 
@@ -626,7 +675,9 @@ async function briefOneOrg(
     outcome: "sent",
     stats,
     message,
-    whatsapp_message_id: send.messageId,
+    recipients: recipients.length,
+    recipients_delivered: delivered,
+    whatsapp_message_id: lastMessageId,
   };
 }
 

@@ -538,6 +538,20 @@ else
     *) ok "owner HELP does not leak member-facing copy" ;;
   esac
 
+  # --- 8b'. co-owners: a second users role='owner' at the same gym (own
+  #          phone, NOT organizations.owner_phone) gets identical command
+  #          access. PHONE_OWNER also matches a users row, so this proves the
+  #          combined (owner_phone OR users role='owner') check + no regression.
+  PHONE_COOWNER=919100000009        # Priya Balan, Apex co-owner (seed.sql)
+  send_cmd "$PHONE_OWNER"   co-a "REVENUE"; r_primary=$(last_out_org "$ORG_APEX")
+  send_cmd "$PHONE_COOWNER" co-b "REVENUE"; r_coowner=$(last_out_org "$ORG_APEX")
+  assert_contains "primary owner (matches owner_phone) gets the Apex REVENUE report" "Revenue — Apex Strength Co." "$r_primary"
+  assert_contains "co-owner (matches only a users role='owner' row) also gets it"    "Revenue — Apex Strength Co." "$r_coowner"
+  assert_equals   "both co-owners see byte-identical data" "$r_primary" "$r_coowner"
+  send_cmd "$PHONE_COOWNER" co-c "zzznope"
+  assert_contains "co-owner unknown command -> owner HELP (routed as owner, not not_found)" \
+    "Commands — Apex Strength Co." "$(last_out_org "$ORG_APEX")"
+
   # --- 8c. coach path ---
   send_cmd "$PHONE_COACH" c-my "MYCLIENTS"
   r=$(last_out_org "$ORG_APEX")

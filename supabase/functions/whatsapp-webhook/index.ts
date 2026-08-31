@@ -578,11 +578,15 @@ async function handleSwitch(
 // callable from a cron.
 //
 // PHONE RESOLUTION PRIORITY (see resolveSender):  owner  >  coach  >  member.
-// Each tier is an exact equality match on a distinct column
-// (organizations.owner_phone / users.phone WHERE role='coach' / members.phone),
-// so a person who is e.g. both an owner and a registered member deterministically
-// gets owner commands. front_desk/owner-role staff who are not an org's literal
-// owner_phone fall through to the member path unchanged.
+//   owner  = organizations.owner_phone = phone  OR  a users row with
+//            role='owner' AND phone = phone  (co-owners: a gym can have 2+).
+//   coach  = a users row with role='coach' AND phone = phone.
+//   member = the existing member_active_context / members path, unchanged.
+// Each check is an exact phone equality; owner is deduped by org id so a
+// person who is both owner_phone and an owner-role user for one gym resolves
+// once. A person who owns 2+ gyms (by either mechanism) is owner_ambiguous.
+// front_desk staff who are not an owner or coach fall through to the member
+// path unchanged.
 // ===========================================================================
 
 type SenderRole =
@@ -600,16 +604,37 @@ async function resolveSender(
   supabase: SupabaseClient,
   phone: string,
 ): Promise<SenderRole> {
-  const { data: orgs, error: orgErr } = await supabase
-    .from("organizations")
-    .select("id, name")
-    .eq("owner_phone", phone);
-  if (orgErr) throw orgErr;
-  if (orgs && orgs.length === 1) {
-    return { kind: "owner", organizationId: orgs[0].id, orgName: orgs[0].name };
-  }
-  if (orgs && orgs.length > 1) {
-    return { kind: "owner_ambiguous", orgs: orgs.map((o: any) => ({ id: o.id, name: o.name })) };
+  // OWNER — a gym can have multiple co-owners, so this matches BOTH ways:
+  //   (a) organizations.owner_phone = phone   (the signup / billing contact,
+  //       and the fallback for an org that has no owner-role users yet)
+  //   (b) a users row with role='owner' AND phone = phone
+  // The union of org ids from both is the set this phone owns. Deduping by
+  // org id means a person who is BOTH owner_phone AND a users role='owner'
+  // row for the same gym still resolves to one org, and a single-owner org
+  // relying only on owner_phone behaves exactly as before.
+  const [byOwnerPhone, ownerUsers] = await Promise.all([
+    supabase.from("organizations").select("id, name").eq("owner_phone", phone),
+    supabase.from("users").select("organization_id").eq("role", "owner").eq("phone", phone),
+  ]);
+  if (byOwnerPhone.error) throw byOwnerPhone.error;
+  if (ownerUsers.error) throw ownerUsers.error;
+
+  const ownedOrgIds = new Set<string>();
+  for (const o of byOwnerPhone.data ?? []) ownedOrgIds.add(o.id);
+  for (const u of ownerUsers.data ?? []) ownedOrgIds.add(u.organization_id);
+
+  if (ownedOrgIds.size >= 1) {
+    const ids = [...ownedOrgIds];
+    const { data: ownedOrgs, error: ownedErr } = await supabase
+      .from("organizations").select("id, name").in("id", ids);
+    if (ownedErr) throw ownedErr;
+    const list = (ownedOrgs ?? []).map((o: any) => ({ id: o.id, name: o.name }));
+    if (list.length === 1) {
+      return { kind: "owner", organizationId: list[0].id, orgName: list[0].name };
+    }
+    // Owner of 2+ gyms (via either mechanism) — same "can't disambiguate over
+    // WhatsApp" limitation the member `ambiguous` path has.
+    return { kind: "owner_ambiguous", orgs: list };
   }
 
   const { data: coaches, error: coachErr } = await supabase
