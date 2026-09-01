@@ -1,8 +1,25 @@
-// staff-manage — an OWNER creates / deactivates / reactivates a staff member
-// in their OWN organization.
+// staff-manage — an OWNER creates / edits / deactivates / reactivates a staff
+// member in their OWN organization.
 //
-// POST { action: "create" | "deactivate" | "reactivate", ... }
+// POST { action: "create" | "edit" | "deactivate" | "reactivate", ... }
 // Authorization: Bearer <the owner's own staff-login access token>
+//
+// ============================================================================
+// "edit" — name / phone / role / location_id ONLY
+// ============================================================================
+// The PIN is deliberately NOT editable through this path. PIN changes go
+// exclusively through staff-pin-reset (rate-limit ledger reset, its own audit
+// line). `pin` / `pin_hash` in an edit payload are ignored, never written.
+//
+// ROLE CHANGE AWAY FROM 'coach' WITH ACTIVE PACKAGES — BLOCKED. If the target
+// is currently a coach and still has pt_packages at status='active', the edit
+// is refused (409 coach_has_active_packages, with the count). Reason: the
+// pt_packages_validate_refs trigger enforces "coach_id must be an active
+// coach" on every write to that table, so silently orphaning those rows makes
+// them un-updatable (can't mark completed, can't edit) until coach_id is
+// repointed — and an active package is a paid, in-progress client
+// relationship, not just a dangling FK. The owner must reassign or complete
+// those packages first. Completed / cancelled packages do NOT block.
 //
 // ============================================================================
 // TRUST MODEL — identical to staff-pin-reset
@@ -120,15 +137,8 @@ async function doCreate(
     if (!locationId || !UUID_RE.test(locationId)) {
       return json({ ok: false, error: "location_id_required", detail: `for role ${role}` }, 400);
     }
-    const { data: loc, error: locErr } = await admin
-      .from("locations")
-      .select("id, organization_id")
-      .eq("id", locationId)
-      .maybeSingle();
-    if (locErr) throw locErr;
-    if (!loc || (loc as any).organization_id !== caller.organization_id) {
-      return json({ ok: false, error: "location_not_in_org" }, 400);
-    }
+    const locErr = await assertLocationInOrg(admin, caller, locationId);
+    if (locErr) return locErr;
   }
 
   const pinHash = await bcrypt.hash(pin, BCRYPT_COST);
@@ -159,18 +169,28 @@ async function doCreate(
   return json({ ok: true, action: "create", user_id: (created as any).id });
 }
 
+interface TargetUser {
+  id: string;
+  auth_user_id: string | null;
+  active: boolean;
+  role: string;
+  name: string;
+  phone: string;
+  location_id: string | null;
+}
+
 async function loadSameOrgTarget(
   admin: SupabaseClient,
   caller: CallerUser,
   body: any,
-): Promise<{ id: string; auth_user_id: string | null; active: boolean } | Response> {
+): Promise<TargetUser | Response> {
   const targetId = typeof body?.target_user_id === "string" ? body.target_user_id.trim() : "";
   if (!targetId || !UUID_RE.test(targetId)) {
     return json({ ok: false, error: "target_user_id_malformed" }, 400);
   }
   const { data: target, error } = await admin
     .from("users")
-    .select("id, organization_id, auth_user_id, active")
+    .select("id, organization_id, auth_user_id, active, role, name, phone, location_id")
     .eq("id", targetId)
     .maybeSingle();
   if (error) throw error;
@@ -184,7 +204,135 @@ async function loadSameOrgTarget(
     id: (target as any).id,
     auth_user_id: (target as any).auth_user_id ?? null,
     active: (target as any).active,
+    role: (target as any).role,
+    name: (target as any).name,
+    phone: (target as any).phone,
+    location_id: (target as any).location_id ?? null,
   };
+}
+
+/**
+ * Validate a location_id belongs to the caller's org. Returns null on success,
+ * or the error Response. Shared by doCreate and doEdit.
+ */
+async function assertLocationInOrg(
+  admin: SupabaseClient,
+  caller: CallerUser,
+  locationId: string,
+): Promise<Response | null> {
+  const { data: loc, error: locErr } = await admin
+    .from("locations")
+    .select("id, organization_id")
+    .eq("id", locationId)
+    .maybeSingle();
+  if (locErr) throw locErr;
+  if (!loc || (loc as any).organization_id !== caller.organization_id) {
+    return json({ ok: false, error: "location_not_in_org" }, 400);
+  }
+  return null;
+}
+
+async function doEdit(
+  admin: SupabaseClient,
+  caller: CallerUser,
+  body: any,
+): Promise<Response> {
+  const target = await loadSameOrgTarget(admin, caller, body);
+  if (target instanceof Response) return target;
+
+  // Only these four are editable here. `pin` / `pin_hash` are intentionally
+  // never read — see the header.
+  const hasName = typeof body?.name === "string";
+  const hasPhone = typeof body?.phone === "string";
+  const hasRole = typeof body?.role === "string";
+  const hasLocation = "location_id" in (body ?? {});
+  if (!hasName && !hasPhone && !hasRole && !hasLocation) {
+    return json({ ok: false, error: "no_editable_fields", detail: "name|phone|role|location_id" }, 400);
+  }
+
+  const patch: Record<string, unknown> = {};
+
+  if (hasName) {
+    const name = String(body.name).trim();
+    if (!name) return json({ ok: false, error: "name_required" }, 400);
+    patch.name = name;
+  }
+
+  if (hasPhone) {
+    const phone = String(body.phone).replace(/\D/g, "");
+    if (!PHONE_RE.test(phone)) {
+      return json({ ok: false, error: "phone_malformed", detail: "expected 7-15 digits" }, 400);
+    }
+    patch.phone = phone;
+  }
+
+  // Resolve the *effective* role and location after this edit, then apply the
+  // same owner-has-no-location / non-owner-needs-one invariant doCreate uses.
+  const finalRole = hasRole ? String(body.role).trim() : target.role;
+  if (hasRole && !(ROLES as readonly string[]).includes(finalRole)) {
+    return json({ ok: false, error: "role_invalid", detail: `one of ${ROLES.join("/")}` }, 400);
+  }
+
+  let finalLocation: string | null = target.location_id;
+  if (hasLocation) {
+    const raw = body.location_id;
+    finalLocation = typeof raw === "string" && raw.trim() ? raw.trim() : null;
+  }
+  if (finalRole === "owner") {
+    finalLocation = null; // owners are never branch-scoped
+  }
+
+  if (finalRole === "owner") {
+    if (hasLocation && body.location_id) {
+      return json({ ok: false, error: "owner_has_no_location" }, 400);
+    }
+  } else {
+    if (!finalLocation || !UUID_RE.test(finalLocation)) {
+      return json({ ok: false, error: "location_id_required", detail: `for role ${finalRole}` }, 400);
+    }
+    const locErr = await assertLocationInOrg(admin, caller, finalLocation);
+    if (locErr) return locErr;
+  }
+
+  if (hasRole || hasLocation) {
+    patch.role = finalRole;
+    patch.location_id = finalLocation;
+  }
+
+  // Role change away from coach while active packages exist — blocked. See header.
+  if (target.role === "coach" && finalRole !== "coach") {
+    const { count, error: cntErr } = await admin
+      .from("pt_packages")
+      .select("id", { count: "exact", head: true })
+      .eq("coach_id", target.id)
+      .eq("status", "active");
+    if (cntErr) throw cntErr;
+    if ((count ?? 0) > 0) {
+      return json({
+        ok: false,
+        error: "coach_has_active_packages",
+        active_package_count: count ?? 0,
+        detail: "reassign or complete these packages before changing this coach's role",
+      }, 409);
+    }
+  }
+
+  const { error: updErr } = await admin
+    .from("users")
+    .update(patch)
+    .eq("id", target.id)
+    .eq("organization_id", caller.organization_id);
+  if (updErr) {
+    if ((updErr as any).code === "23505") {
+      return json({ ok: false, error: "phone_already_in_org" }, 409);
+    }
+    throw updErr;
+  }
+
+  console.log(
+    `[${TAG}] owner ${caller.id} edited ${target.id} (org ${caller.organization_id}) fields=${Object.keys(patch).join(",")}`,
+  );
+  return json({ ok: true, action: "edit", user_id: target.id, updated: Object.keys(patch) });
 }
 
 async function doSetActive(
@@ -245,8 +393,8 @@ async function handle(req: Request): Promise<Response> {
   }
 
   const action = typeof body?.action === "string" ? body.action.trim() : "";
-  if (!["create", "deactivate", "reactivate"].includes(action)) {
-    return json({ ok: false, error: "action_invalid", detail: "create|deactivate|reactivate" }, 400);
+  if (!["create", "edit", "deactivate", "reactivate"].includes(action)) {
+    return json({ ok: false, error: "action_invalid", detail: "create|edit|deactivate|reactivate" }, 400);
   }
 
   const admin = createAdminClient();
@@ -259,6 +407,8 @@ async function handle(req: Request): Promise<Response> {
   switch (action) {
     case "create":
       return await doCreate(admin, caller, body);
+    case "edit":
+      return await doEdit(admin, caller, body);
     case "deactivate":
       return await doSetActive(admin, caller, body, false);
     case "reactivate":

@@ -72,9 +72,11 @@ manage_status() { curl -s -o /dev/null -w '%{http_code}' -X POST "$MANAGE_URL" -
 reset_state() {
   $have_psql || return 0
   docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
-DELETE FROM login_attempts WHERE phone IN ('$NEW_COACH_PHONE', '$DEACT_PHONE');
-DELETE FROM users WHERE phone IN ('$NEW_COACH_PHONE', '$DEACT_PHONE') OR id = '$DEACT_ID';
+DELETE FROM login_attempts WHERE phone IN ('$NEW_COACH_PHONE', '919000078803', '$DEACT_PHONE');
+DELETE FROM users WHERE phone IN ('$NEW_COACH_PHONE', '919000078803', '$DEACT_PHONE') OR id = '$DEACT_ID';
 DELETE FROM auth.users WHERE email LIKE '0daded00-8888-%@staff.internal.invalid';
+-- 2b edits the seeded Iron coach's role only when it has no active packages;
+-- the WITH-active-packages case is blocked so Farah is never actually changed.
 SQL
 }
 arrange() {
@@ -147,6 +149,46 @@ assert_contains "owner WITH a location -> 400"     '"error":"owner_has_no_locati
   "$(manage "$RAVI" "{\"action\":\"create\",\"name\":\"X\",\"phone\":\"919000078890\",\"role\":\"owner\",\"location_id\":\"$LOC_IRON\",\"pin\":\"1234\"}")"
 assert_contains "location in ANOTHER org -> 400"   '"error":"location_not_in_org"' \
   "$(manage "$RAVI" "{\"action\":\"create\",\"name\":\"X\",\"phone\":\"919000078891\",\"role\":\"coach\",\"location_id\":\"$LOC_FLEX\",\"pin\":\"1234\"}")"
+
+# ---------------------------------------------------------------------------
+# 2b. edit — name / phone / role / location_id, never pin_hash
+# ---------------------------------------------------------------------------
+printf '\n%s-- edit staff --%s\n' "$B" "$N"
+FARAH_ID=c0ac0000-0000-0000-0000-000000000001   # seeded Iron coach WITH active packages
+
+assert_contains "edit name -> ok" '"ok":true' \
+  "$(manage "$RAVI" "{\"action\":\"edit\",\"target_user_id\":\"$NEW_ID\",\"name\":\"Renamed Coach\"}")"
+assert_equals   "  ...name persisted" "Renamed Coach" "$(sql "select name from users where id='$NEW_ID'")"
+assert_contains "edit phone -> ok" '"ok":true' \
+  "$(manage "$RAVI" "{\"action\":\"edit\",\"target_user_id\":\"$NEW_ID\",\"phone\":\"919000078803\"}")"
+assert_equals   "  ...phone persisted" "919000078803" "$(sql "select phone from users where id='$NEW_ID'")"
+assert_contains "edit with an empty payload -> 400" '"error":"no_editable_fields"' \
+  "$(manage "$RAVI" "{\"action\":\"edit\",\"target_user_id\":\"$NEW_ID\"}")"
+assert_contains "edit location to another org -> 400" '"error":"location_not_in_org"' \
+  "$(manage "$RAVI" "{\"action\":\"edit\",\"target_user_id\":\"$NEW_ID\",\"location_id\":\"$LOC_FLEX\"}")"
+assert_contains "an owner of ANOTHER org cannot edit this org's staff -> 404" '"error":"target_not_found"' \
+  "$(manage "$SANJAY" "{\"action\":\"edit\",\"target_user_id\":\"$NEW_ID\",\"name\":\"Hijack\"}")"
+
+# pin_hash / pin in the payload are ignored, never written.
+OLD_HASH=$(sql "select pin_hash from users where id='$DEACT_ID'")
+assert_contains "edit ignoring a pin_hash in the payload -> ok" '"ok":true' \
+  "$(manage "$RAVI" "{\"action\":\"edit\",\"target_user_id\":\"$DEACT_ID\",\"name\":\"Still 3101\",\"pin_hash\":\"\$2a\$12\$totallyfakehashvaluethatmustneverbestored000000000000\",\"pin\":\"9999\"}")"
+assert_equals   "  ...name changed"              "Still 3101" "$(sql "select name from users where id='$DEACT_ID'")"
+assert_equals   "  ...pin_hash UNCHANGED"        "$OLD_HASH" "$(sql "select pin_hash from users where id='$DEACT_ID'")"
+assert_equals   "  ...original PIN 3101 still logs in" "200" "$(login_status "$ORG_IRON" "$DEACT_PHONE" 3101)"
+
+# role change coach -> front_desk, NO active packages: allowed.
+assert_contains "coach -> front_desk (no active packages) -> ok" '"ok":true' \
+  "$(manage "$RAVI" "{\"action\":\"edit\",\"target_user_id\":\"$NEW_ID\",\"role\":\"front_desk\",\"location_id\":\"$LOC_IRON\"}")"
+assert_equals   "  ...role persisted" "front_desk" "$(sql "select role from users where id='$NEW_ID'")"
+# put it back so section 6 (coaches_directory) still has a coach to test with
+manage "$RAVI" "{\"action\":\"edit\",\"target_user_id\":\"$NEW_ID\",\"role\":\"coach\",\"location_id\":\"$LOC_IRON\"}" >/dev/null
+
+# role change coach -> front_desk WITH active packages: blocked.
+got=$(manage "$RAVI" "{\"action\":\"edit\",\"target_user_id\":\"$FARAH_ID\",\"role\":\"front_desk\",\"location_id\":\"$LOC_IRON\"}")
+assert_contains "coach -> front_desk WITH active packages -> 409" '"error":"coach_has_active_packages"' "$got"
+assert_contains "  ...reports the count"        '"active_package_count":' "$got"
+assert_equals   "  ...Farah is still a coach"   "coach" "$(sql "select role from users where id='$FARAH_ID'")"
 
 # ---------------------------------------------------------------------------
 # 3. deactivate — the actual "revoke access" mechanism
