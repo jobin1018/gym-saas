@@ -763,6 +763,42 @@ assert_equals "cross-org: FlexFit owner sees no Iron members here" "0" \
   "$(count_rows "$(rest "$SANJAY" "v_members_pt_status?organization_id=eq.$ORG_IRON&select=id")")"
 
 # ---------------------------------------------------------------------------
+# 12. coaches_workload — client counts for the assign-a-coach decision
+#     (migration 20260901091000)
+# ---------------------------------------------------------------------------
+printf '\n%s-- coaches_workload --%s\n' "$B" "$N"
+
+# Readable by owner AND front_desk (front_desk assigns coaches).
+assert_equals "owner reads coaches_workload: 200"      "200" "$(rest_status "$RAVI"  "coaches_workload?select=id")"
+assert_equals "front_desk reads coaches_workload: 200" "200" "$(rest_status "$PRIYA" "coaches_workload?select=id")"
+
+wl=$(rest "$RAVI" "coaches_workload?select=id,name,active_client_count,most_recent_session_date")
+assert_contains "coaches_workload lists Farah" "\"id\":\"$FARAH_UID\"" "$wl"
+assert_contains "coaches_workload lists Girish" "\"id\":\"$GIRISH_UID\"" "$wl"
+assert_contains "Farah has a most_recent_session_date (she has notes)" "\"most_recent_session_date\":\"20" "$wl"
+
+# active_client_count must equal the LIVE count of active packages for that
+# coach, and completed packages must NOT be in it. Farah's seed set includes
+# the COMPLETED Chitra package (9c..004) — proof there is one to exclude.
+farah_wl=$(printf '%s' "$(rest "$RAVI" "coaches_workload?select=active_client_count&id=eq.$FARAH_UID")" | sed -n 's/.*"active_client_count":\([0-9]*\).*/\1/p')
+farah_active=$(count_rows "$(rest "$RAVI" "pt_packages?coach_id=eq.$FARAH_UID&status=eq.active&select=id")")
+farah_completed=$(count_rows "$(rest "$RAVI" "pt_packages?coach_id=eq.$FARAH_UID&status=eq.completed&select=id")")
+assert_equals "coaches_workload count == live active-package count for Farah" "$farah_active" "$farah_wl"
+if [ "${farah_completed:-0}" -ge 1 ] 2>/dev/null; then
+  ok "Farah has >=1 completed package that coaches_workload correctly excludes"
+else
+  bad "a completed package exists to prove exclusion" ">=1" "$farah_completed"
+fi
+
+# Org scoping: an Iron owner never sees a FlexFit coach and vice-versa.
+assert_not_contains "Iron owner's coaches_workload has no FlexFit coach (Hema)" \
+  "c0ac0000-0000-0000-0000-000000000003" "$wl"
+assert_equals "FlexFit owner's coaches_workload has zero Iron coaches" "0" \
+  "$(count_rows "$(rest "$SANJAY" "coaches_workload?id=in.($FARAH_UID,$GIRISH_UID)&select=id")")"
+assert_contains "FlexFit owner DOES see their own coach (Hema)" \
+  "c0ac0000-0000-0000-0000-000000000003" "$(rest "$SANJAY" "coaches_workload?select=id")"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 reset_state
