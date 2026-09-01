@@ -34,6 +34,7 @@ SUITES=(
   staff-pin-reset
   staff-manage
   validate-magic-link
+  send-welcome-message
 )
 
 if [ -t 1 ]; then

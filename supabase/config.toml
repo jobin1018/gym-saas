@@ -520,6 +520,18 @@ verify_jwt = true
 import_map = "./functions/staff-manage/deno.json"
 entrypoint = "./functions/staff-manage/index.ts"
 
+[functions.send-welcome-message]
+enabled = true
+# Called by the frontend right after a member is created, with the creating
+# owner's / front_desk's own staff-login session token. verify_jwt = true gates
+# the door; the function re-validates the token and reads role/org/active from
+# public.users, and confirms the member is in the caller's org. No service-role
+# gate on top — this is a browser-initiated action by an authenticated staffer,
+# same as staff-manage.
+verify_jwt = true
+import_map = "./functions/send-welcome-message/deno.json"
+entrypoint = "./functions/send-welcome-message/index.ts"
+
 [functions.validate-magic-link]
 enabled = true
 # Called PRE-session, directly by the coach quick-log page, with only the anon
