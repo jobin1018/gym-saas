@@ -54,6 +54,12 @@ import "@supabase/functions-js/edge-runtime.d.ts";
 import bcrypt from "bcryptjs";
 import { createAdminClient, createAnonClient, type SupabaseClient } from "../_shared/supabase.ts";
 import { corsJson as json, corsPreflightResponse } from "../_shared/cors.ts";
+import {
+  ensureAuthUser,
+  mintSession,
+  syncUserMetadata,
+  syntheticEmail,
+} from "../_shared/staff-session.ts";
 
 const TAG = "staff-login";
 
@@ -72,17 +78,10 @@ const DUMMY_PIN_HASH = "$2a$12$mLcIlAVv3xGKT9aAKamRUey2mMyiAy8SLF7ZV1rZOHq3TPm1j
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
-
-/**
- * The non-deliverable email that bridges a phone-only staff user into
- * Supabase Auth, which is email-centric at the Admin API surface we need
- * (`generateLink({type:'magiclink'})`). `.invalid` is the RFC 2606 TLD
- * reserved for addresses that must never resolve — this is never emailed
- * anywhere; we only ever redeem the link token directly (see mintSession).
- */
-function syntheticEmail(userId: string): string {
-  return `${userId}@staff.internal.invalid`;
-}
+// The auth.users bridge + session minting (syntheticEmail / ensureAuthUser /
+// syncUserMetadata / mintSession) now live in ../_shared/staff-session.ts so
+// validate-magic-link mints sessions the exact same way. Behaviour here is
+// unchanged.
 
 interface UserRow {
   id: string;
@@ -173,166 +172,6 @@ async function recordAttempt(
 }
 
 // ---------------------------------------------------------------------------
-// Auth bridge — auth.users provisioning + real session minting
-// ---------------------------------------------------------------------------
-
-/**
- * Returns the user's auth_user_id, creating the bridging auth.users row (and
- * writing it back) on first login. Compare-and-set on the write: if a
- * concurrent request already won, this returns THEIR auth_user_id and treats
- * the auth.users row just created here as a harmless orphan — same
- * acceptance as send-renewal-reminder's orphaned-Razorpay-link case. Never
- * two auth_user_id values in play for one users row.
- */
-async function ensureAuthUser(admin: SupabaseClient, user: UserRow): Promise<string> {
-  if (user.auth_user_id) return user.auth_user_id;
-
-  const email = syntheticEmail(user.id);
-
-  const { data: created, error: createErr } = await admin.auth.admin.createUser({
-    email,
-    email_confirm: true,
-    user_metadata: { staff_user_id: user.id, name: user.name, role: user.role },
-  });
-
-  if (createErr || !created?.user) {
-    throw new Error(`auth.admin.createUser failed: ${createErr?.message ?? "no user returned"}`);
-  }
-
-  const newAuthUserId = created.user.id;
-
-  const { data: updated, error: updateErr } = await admin
-    .from("users")
-    .update({ auth_user_id: newAuthUserId })
-    .eq("id", user.id)
-    .is("auth_user_id", null)
-    .select("auth_user_id")
-    .maybeSingle();
-
-  if (updateErr) throw updateErr;
-
-  if (updated) return newAuthUserId; // we won the race
-
-  // Lost the race — re-read the winner. Our freshly created auth.users row is
-  // now unreferenced but harmless; nothing ever reads auth_user_id except by
-  // following this same FK from `users`.
-  const { data: winner, error: reReadErr } = await admin
-    .from("users")
-    .select("auth_user_id")
-    .eq("id", user.id)
-    .single();
-
-  if (reReadErr || !winner?.auth_user_id) {
-    throw new Error("lost the auth_user_id race but could not re-read the winner");
-  }
-
-  return winner.auth_user_id;
-}
-
-/**
- * Keeps auth.users.user_metadata.name/role in sync with public.users on every
- * successful login — not just at first-time creation. Exists because the
- * frontend has no other safe way to re-fetch the logged-in staffer's display
- * name after a page refresh: `users` has no grant for `authenticated` at all
- * (see 20260824141000_revoke_local_dev_only_policies.sql's note on why —
- * pin_hash), and staff_lookup_directory is pre-login only (staff-lookup-by-
- * phone). supabase.auth.getUser() already exposes user_metadata to any
- * authenticated session with zero additional grants/views/RLS, so that's the
- * bridge instead.
- *
- * Self-healing: covers both the first-login case (createUser above already
- * set it, so this is a no-op read-and-compare) and every later login for an
- * already-provisioned account, including the future case where an owner
- * edits a staff member's name — the next login corrects the stale copy.
- *
- * Never throws: the PIN was already verified correct by the time this runs,
- * so a metadata sync failure must not cost the user their session. Logged
- * loudly instead — a stale display name is a real but non-blocking bug.
- */
-async function syncUserMetadata(
-  admin: SupabaseClient,
-  authUserId: string,
-  user: UserRow,
-): Promise<void> {
-  const { data, error } = await admin.auth.admin.getUserById(authUserId);
-
-  if (error || !data?.user) {
-    console.error(`[${TAG}] could not read auth.users ${authUserId} to sync metadata:`, error);
-    return;
-  }
-
-  const current = data.user.user_metadata ?? {};
-  if (current.name === user.name && current.role === user.role) return; // already correct
-
-  const { error: updateErr } = await admin.auth.admin.updateUserById(authUserId, {
-    user_metadata: { ...current, name: user.name, role: user.role },
-  });
-
-  if (updateErr) {
-    console.error(`[${TAG}] failed to sync user_metadata for ${authUserId}:`, updateErr);
-  }
-}
-
-interface MintedSession {
-  accessToken: string;
-  refreshToken: string;
-  expiresIn: number;
-  tokenType: string;
-}
-
-/**
- * Mint a real session for `authUserId` via the Admin API, no password flow.
- *
- * admin.generateLink({type:'magiclink'}) creates the redeemable token
- * server-side (no email is actually sent — we never call signInWithOtp);
- * verifyOtp() redeems it. Redemption deliberately uses a SEPARATE anon-keyed
- * client, not the admin one — /verify is a public GoTrue endpoint gated on
- * `apikey` alone, and keeping the two clients distinct keeps "mint" (needs
- * service_role) and "redeem" (does not) visible in the code, matching how
- * the underlying REST API itself separates /admin/generate_link from
- * /verify. Verified empirically against this project's local gotrue before
- * this function was written — see the plan notes for the raw-REST smoke test
- * this mirrors.
- */
-async function mintSession(
-  admin: SupabaseClient,
-  anon: SupabaseClient,
-  email: string,
-): Promise<MintedSession> {
-  const { data: linkData, error: linkErr } = await admin.auth.admin.generateLink({
-    type: "magiclink",
-    email,
-  });
-
-  if (linkErr || !linkData) {
-    throw new Error(`generateLink failed: ${linkErr?.message ?? "no data returned"}`);
-  }
-
-  const tokenHash = linkData.properties?.hashed_token;
-  if (!tokenHash) {
-    throw new Error("generateLink response missing properties.hashed_token");
-  }
-
-  const { data: verified, error: verifyErr } = await anon.auth.verifyOtp({
-    token_hash: tokenHash,
-    type: "magiclink",
-  });
-
-  if (verifyErr || !verified?.session) {
-    throw new Error(`verifyOtp failed: ${verifyErr?.message ?? "no session returned"}`);
-  }
-
-  const { access_token, refresh_token, expires_in, token_type } = verified.session;
-
-  return {
-    accessToken: access_token,
-    refreshToken: refresh_token,
-    expiresIn: expires_in,
-    tokenType: token_type,
-  };
-}
-
-// ---------------------------------------------------------------------------
 // Main flow
 // ---------------------------------------------------------------------------
 
@@ -412,8 +251,8 @@ async function handleLogin(req: Request): Promise<Response> {
   await recordAttempt(admin, organizationId, phone, true);
 
   try {
-    const authUserId = await ensureAuthUser(admin, user);
-    await syncUserMetadata(admin, authUserId, user);
+    const authUserId = await ensureAuthUser(admin, user, TAG);
+    await syncUserMetadata(admin, authUserId, user, TAG);
     const anon = createAnonClient();
     const session = await mintSession(admin, anon, syntheticEmail(user.id));
 

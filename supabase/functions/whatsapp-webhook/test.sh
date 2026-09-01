@@ -177,7 +177,7 @@ attendance_count() { # <phone>
 
 reset_state() {
   $have_psql || return 0
-  sql "truncate webhook_events, whatsapp_messages, attendance, member_active_context;" >/dev/null
+  sql "truncate webhook_events, whatsapp_messages, attendance, member_active_context, coach_magic_links;" >/dev/null
 }
 
 # assert_db <label> <expected> <actual>  — SKIPs when psql is unavailable
@@ -560,6 +560,22 @@ else
   assert_contains "MYCLIENTS shows sessions used/purchased" "sessions" "$r"
   assert_not_contains "MYCLIENTS never leaks Sam's client"  "Ethan Wright" "$r"
   assert_not_contains "MYCLIENTS never leaks Lena's client" "Ishaan Verma" "$r"
+
+  # SESSION / LOG -> a one-time magic link into the quick-log page. The reply
+  # is the generation audit; validate-magic-link/test.sh covers redemption.
+  send_cmd "$PHONE_COACH" c-ses "SESSION"
+  r=$(last_out_org "$ORG_APEX")
+  assert_contains "SESSION replies with a /coach/quick-log link" "/coach/quick-log?token=" "$r"
+  assert_contains "SESSION link says one use / 15 min"           "one use" "$r"
+  RHEA_ID=$(sql "select id from users where phone='$PHONE_COACH' and organization_id='$ORG_APEX'")
+  link_row=$(sql "select (used_at is null)||'|'||(expires_at > now())::text||'|'||coach_user_id
+                  from coach_magic_links where coach_user_id='$RHEA_ID' order by created_at desc limit 1")
+  assert_equals "  ...persisted a fresh coach_magic_links row for this coach" "true|true|$RHEA_ID" "$link_row"
+  assert_equals "  ...expiry is ~15 min out (13-15 min)" "t" \
+    "$(sql "select (expires_at between now() + interval '13 minutes' and now() + interval '15 minutes')
+            from coach_magic_links where coach_user_id='$RHEA_ID' order by created_at desc limit 1")"
+  send_cmd "$PHONE_COACH" c-log "LOG"
+  assert_contains "LOG is an alias for SESSION" "/coach/quick-log?token=" "$(last_out_org "$ORG_APEX")"
 
   send_cmd "$PHONE_COACH" c-rev "REVENUE"
   r=$(last_out_org "$ORG_APEX")

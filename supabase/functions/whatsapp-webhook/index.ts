@@ -679,10 +679,38 @@ function parseOwnerCommand(body: string): OwnerCommand {
   return map[normalizeCommand(body)] ?? "help";
 }
 
-/** Coach path has exactly one real command; everything else is coach help. */
-function parseCoachCommand(body: string): "myclients" | "help" {
+/**
+ * Coach path commands. MYCLIENTS lists active clients; SESSION / LOG generate a
+ * one-time magic link into the quick-log page (see coachStartSession). Anything
+ * else is coach help.
+ */
+function parseCoachCommand(body: string): "myclients" | "session" | "help" {
   const t = normalizeCommand(body);
-  return t === "myclients" || t === "clients" ? "myclients" : "help";
+  if (t === "myclients" || t === "clients") return "myclients";
+  if (t === "session" || t === "log") return "session";
+  return "help";
+}
+
+/**
+ * base64url (RFC 4648 §5, no padding) of raw bytes. 32 bytes -> 43 chars,
+ * matching validate-magic-link's TOKEN_RE and the coach_magic_links.token
+ * column. Local so whatsapp-webhook has no new shared-module dependency.
+ */
+function base64Url(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * Where the coach quick-log page lives. The SESSION magic link points a coach
+ * here with ?token=…. Set COACH_QUICK_LOG_BASE_URL in production
+ * (e.g. https://app.example.com); the default is the local Vite dev server.
+ */
+function coachQuickLogUrl(token: string): string {
+  const base = (Deno.env.get("COACH_QUICK_LOG_BASE_URL") ?? "http://localhost:5173")
+    .replace(/\/+$/, "");
+  return `${base}/coach/quick-log?token=${token}`;
 }
 
 // --- formatting helpers -------------------------------------------------
@@ -1080,8 +1108,59 @@ async function coachMyClients(
   ].join("\n");
 }
 
+/**
+ * SESSION / LOG — mint a single-use, 15-minute magic link into the coach
+ * quick-log page and reply with it.
+ *
+ * The link is an auth-bypass mechanism (validate-magic-link redeems the token
+ * for a real coach session with no PIN), so:
+ *   * the token is 256 bits of CSPRNG output — unguessable;
+ *   * the coach_magic_links row is written BEFORE the reply goes out, so
+ *     generation is always audited even if the Meta send then fails;
+ *   * expiry is short and single-use is enforced at redemption (see
+ *     validate-magic-link + the migration header).
+ * This function only GENERATES; it never establishes a session itself.
+ */
+async function coachStartSession(
+  supabase: SupabaseClient,
+  coachUserId: string,
+  coachOrg: string,
+  coachName: string,
+): Promise<string> {
+  const raw = new Uint8Array(32);
+  crypto.getRandomValues(raw);
+  const token = base64Url(raw);
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+  const { data: row, error } = await supabase
+    .from("coach_magic_links")
+    .insert({
+      coach_user_id: coachUserId,
+      organization_id: coachOrg,
+      token,
+      expires_at: expiresAt,
+    })
+    .select("id")
+    .single();
+  if (error) throw error;
+
+  // Generation audit line — pairs with validate-magic-link's redemption line
+  // (same link id) for the full trail on this auth-bypass path.
+  console.log(
+    `[whatsapp-webhook] magic-link generated id=${row.id} coach=${coachUserId} ` +
+      `org=${coachOrg} expires=${expiresAt}`,
+  );
+
+  return [
+    `🏋️ ${coachName} — tap to log a session:`,
+    coachQuickLogUrl(token),
+    ``,
+    `Valid for 15 minutes, one use. It signs you in on this device — don't forward it.`,
+  ].join("\n");
+}
+
 function coachHelp(coachName: string): string {
-  return `🏋️ ${coachName} — reply MYCLIENTS for your active client list (name, goal, sessions used/purchased). Owner reports (REVENUE, ALERTS, etc.) are owner-only.`;
+  return `🏋️ ${coachName} — reply MYCLIENTS for your active client list (name, goal, sessions used/purchased), or SESSION for a link to log a session. Owner reports (REVENUE, ALERTS, etc.) are owner-only.`;
 }
 
 // --- dispatcher: owns the whole request for an owner/coach sender -------
@@ -1108,6 +1187,8 @@ async function handleStaffCommand(
     console.log(`[whatsapp-webhook] coach phone=${phone} org=${sender.organizationId} cmd=${cmd}`);
     reply = cmd === "myclients"
       ? await coachMyClients(supabase, sender.userId, sender.organizationId, sender.name)
+      : cmd === "session"
+      ? await coachStartSession(supabase, sender.userId, sender.organizationId, sender.name)
       : coachHelp(sender.name);
   } else if (sender.kind === "owner_ambiguous") {
     // No owner_active_context table and no conversation state (see the

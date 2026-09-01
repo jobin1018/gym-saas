@@ -520,6 +520,20 @@ verify_jwt = true
 import_map = "./functions/staff-manage/deno.json"
 entrypoint = "./functions/staff-manage/index.ts"
 
+[functions.validate-magic-link]
+enabled = true
+# Called PRE-session, directly by the coach quick-log page, with only the anon
+# key — exactly like staff-login. verify_jwt = true rejects keyless/garbage at
+# the gateway (the anon key IS a valid Supabase JWT); real auth happens inside
+# the function by redeeming a single-use, 15-minute, 256-bit token from
+# coach_magic_links. No service-role gate on top — a pre-session caller has no
+# tighter credential. Internally it uses the SERVICE ROLE key for the atomic
+# token claim and to mint the coach's session via the shared staff-session
+# bridge (identical to staff-login's).
+verify_jwt = true
+import_map = "./functions/validate-magic-link/deno.json"
+entrypoint = "./functions/validate-magic-link/index.ts"
+
 [functions.razorpay-webhook]
 enabled = true
 # Razorpay authenticates with X-Razorpay-Signature (HMAC), not a Supabase JWT.

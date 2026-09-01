@@ -33,6 +33,7 @@ SUITES=(
   staff-lookup-by-phone
   staff-pin-reset
   staff-manage
+  validate-magic-link
 )
 
 if [ -t 1 ]; then
