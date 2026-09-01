@@ -12,16 +12,48 @@
 // WHAT IS REAL
 // ============================================================================
 // REAL: every number in the brief. They are computed from memberships,
-//       payments, attendance and whatsapp_messages at request time.
+//       payments, attendance, pt_packages, training_notes and whatsapp_messages
+//       at request time.
 //
 // REAL: the outbound send, via the shared helper in ../_shared/whatsapp.ts —
-//       a real call to Meta's Cloud API, using the APPROVED daily_owner_brief
-//       template (language "en_GB" — Meta's code for "English (UK)"). The
-//       template body has no "failed sends" line, so buildBrief()'s ❌ line
-//       (below) is preview/dry-run/body_preview content ONLY — it is never
-//       one of the template's 7 body params. WHATSAPP_SEND_MODE=mock skips
-//       the real call; this function's test.sh enforces that for automated
-//       runs.
+//       a real call to Meta's Cloud API, using an APPROVED template.
+//       WHATSAPP_SEND_MODE=mock skips the real call; this function's test.sh
+//       enforces that for automated runs.
+//
+// ============================================================================
+// TEMPLATE VERSION — v2 is the default, v1 is kept for rollback
+// ============================================================================
+// v1 (daily_owner_brief, 7 params): the original renewals/overdue/check-ins
+//     summary. buildBrief() + the 7-element bodyParams below. UNTOUCHED.
+// v2 (daily_owner_brief_v2, 12 params, approved): adds this-month revenue with
+//     the membership/PT split, an attention-items roll-up, and coach activity.
+//     buildBriefV2() + the 12-element bodyParams.
+//
+// Which one a send uses:
+//   * default: DAILY_BRIEF_TEMPLATE_VERSION env (unset => "v2").
+//   * per request: { "template_version": "v1" | "v2" } overrides it — so an
+//     operator can roll back one run, or a dry run can preview either format,
+//     without touching secrets.
+// Rollback to v1 everywhere: `supabase secrets set DAILY_BRIEF_TEMPLATE_VERSION=v1`.
+//
+// The v2 numbers are computed to MATCH the owner-facing WhatsApp commands
+// exactly — same sources, same rules — so the brief and REVENUE / PT / COACHES
+// never disagree for the same org:
+//   * revenue + membership/PT split : v_daily_revenue_by_source, current
+//     calendar month (ownerRevenue in whatsapp-webhook reads the same view).
+//   * PT alerts : the low-sessions / expiring-soon predicate recomputed from
+//     pt_packages (identical to loadAttention() / v_pt_packages_attention —
+//     the view's WHERE is auth.jwt()-bound so a service_role caller must
+//     recompute, exactly as whatsapp-webhook's PT/ALERTS commands already do).
+//   * coaches "active" + "need a check-in" : role='coach' count, and of those
+//     how many have no training_note in the last 7 days — the same
+//     logging-recently rule as ownerCoaches().
+//   * yesterday's sessions logged : training_notes.session_date = yesterday,
+//     same column ownerToday() counts on.
+//
+// The v1 template body has no "failed sends" line, so buildBrief()'s ❌ line is
+// preview/body_preview content only, never a v1 body param. v2 likewise carries
+// no failed-sends param.
 //
 // ============================================================================
 // THE RECIPIENTS ARE AN ORGANIZATION'S OWNERS, NOT A MEMBER
@@ -48,10 +80,25 @@ import { authorizeServiceRole } from "../_shared/auth.ts";
 import { sendWhatsAppMessage } from "../_shared/whatsapp.ts";
 
 const TAG = "daily-owner-brief";
-const TEMPLATE_NAME = "daily_owner_brief" as const;
-// Meta's locale code for the template's registered language, "English (UK)" —
-// not plain "en", which is a different template language variant to Meta.
+
+// v1 = the original 7-param template; v2 = the approved 12-param richer one.
+const TEMPLATE_NAME_V1 = "daily_owner_brief" as const;
+const TEMPLATE_NAME_V2 = "daily_owner_brief_v2" as const;
+// Both names, for the once-per-day-per-org guard: one brief per org per day
+// regardless of which template version produced it (so flipping the version
+// mid-day can never double-send).
+const BRIEF_TEMPLATE_NAMES = [TEMPLATE_NAME_V1, TEMPLATE_NAME_V2] as const;
+// Locale code the templates are registered under. Kept as one constant for
+// both versions — v2 was registered the same way v1 was.
 const TEMPLATE_LANGUAGE = "en" as const;
+
+type BriefVersion = "v1" | "v2";
+
+/** Default template version for a send. Per-request `template_version` overrides. */
+const DEFAULT_BRIEF_VERSION: BriefVersion =
+  (Deno.env.get("DAILY_BRIEF_TEMPLATE_VERSION") ?? "v2").trim().toLowerCase() === "v1"
+    ? "v1"
+    : "v2";
 
 // Orgs that get a brief. 'suspended' is excluded: a suspended account should not
 // be receiving daily operational messages.
@@ -132,12 +179,31 @@ interface BriefStats {
   overdue_amount: number;
   checkins_yesterday: number;
   failed_sends: number;
+
+  // --- v2 only. Left undefined on a v1 brief (so they don't appear in the
+  // --- v1 dry-run JSON at all). ---
+  /** This calendar month's collected revenue, membership + PT. */
+  revenue_month_total?: number;
+  revenue_month_membership?: number;
+  revenue_month_pt?: number;
+  /** PT packages flagged low-on-sessions OR expiring-soon (same rule as PT/ALERTS). */
+  pt_alert_count?: number;
+  /** overdue_count + pt_alert_count — the "needs attention" roll-up. */
+  attention_items?: number;
+  /** users with role='coach' for this org (same denominator as the COACHES command). */
+  coaches_active?: number;
+  /** of those, how many have logged no session in the last 7 days. */
+  coaches_need_checkin?: number;
+  /** training_notes with session_date = the org's yesterday. */
+  sessions_logged_yesterday?: number;
 }
 
 interface OrgResult {
   organization_id: string;
   organization_name: string;
   outcome: "sent" | "skipped" | "error" | "computed";
+  /** which template version produced (or would produce) this brief. */
+  brief_version?: BriefVersion;
   reason?: string;
   error?: string;
   detail?: string;
@@ -195,6 +261,29 @@ function localDate(timeZone: string, at = new Date()): string {
 function addDays(isoDate: string, days: number): string {
   const [y, m, d] = isoDate.split("-").map(Number);
   return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
+}
+
+/**
+ * Add whole months to YYYY-MM-DD, clamping the day to the target month's end.
+ * Matches whatsapp-webhook's addMonthsStr() and Postgres'
+ * `(start_date + make_interval(months => n))::date` that v_pt_packages_attention
+ * uses — so the "expiring soon" flag lines up exactly with the PT/ALERTS command.
+ */
+function addMonthsIso(isoDate: string, months: number): string {
+  const [y, m, d] = isoDate.split("-").map(Number);
+  const total = y * 12 + (m - 1) + months;
+  const ty = Math.floor(total / 12);
+  const tm = (total % 12) + 1;
+  const lastDay = new Date(Date.UTC(ty, tm, 0)).getUTCDate();
+  const cd = Math.min(d, lastDay);
+  return `${String(ty).padStart(4, "0")}-${String(tm).padStart(2, "0")}-${String(cd).padStart(2, "0")}`;
+}
+
+/** Whole days from `fromIso` to `toIso` (negative if `toIso` is earlier). */
+function daysBetweenIso(fromIso: string, toIso: string): number {
+  const [fy, fm, fd] = fromIso.split("-").map(Number);
+  const [ty, tm, td] = toIso.split("-").map(Number);
+  return Math.round((Date.UTC(ty, tm - 1, td) - Date.UTC(fy, fm - 1, fd)) / 86400000);
 }
 
 /**
@@ -295,6 +384,31 @@ function buildBrief(orgName: string, todayLocal: string, s: BriefStats): string 
   }
 
   return lines.join("\n");
+}
+
+/**
+ * v2 brief text — the body_preview / dry-run rendering of the approved
+ * daily_owner_brief_v2 template:
+ *
+ *   "Good morning! {{1}} — {{2}}. Revenue this month: ₹{{3}} (₹{{4}} membership,
+ *    ₹{{5}} PT). Needs attention: {{6}} items — {{7}} overdue, {{8}} PT alerts.
+ *    Coaches: {{9}} active, {{10}} need a check-in. Yesterday: {{11}} check-ins,
+ *    {{12}} sessions logged."
+ *
+ * Rendered as one paragraph so body_preview reads exactly like the delivered
+ * message. The 12 params handed to Meta are built separately in briefOneOrg().
+ */
+function buildBriefV2(orgName: string, todayLocal: string, s: BriefStats): string {
+  return (
+    `Good morning! ${orgName} — ${formatDateForOwner(todayLocal)}. ` +
+    `Revenue this month: ₹${formatRupees(s.revenue_month_total ?? 0)} ` +
+    `(₹${formatRupees(s.revenue_month_membership ?? 0)} membership, ` +
+    `₹${formatRupees(s.revenue_month_pt ?? 0)} PT). ` +
+    `Needs attention: ${s.attention_items ?? 0} items — ` +
+    `${s.overdue_count} overdue, ${s.pt_alert_count ?? 0} PT alerts. ` +
+    `Coaches: ${s.coaches_active ?? 0} active, ${s.coaches_need_checkin ?? 0} need a check-in. ` +
+    `Yesterday: ${s.checkins_yesterday} check-ins, ${s.sessions_logged_yesterday ?? 0} sessions logged.`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -459,12 +573,126 @@ async function countFailedSends(
   return total;
 }
 
+// ---------------------------------------------------------------------------
+// v2-only per-org data. Each mirrors the owner-facing WhatsApp command that
+// reports the same number, so the brief and the command can never disagree.
+// ---------------------------------------------------------------------------
+
+/**
+ * This calendar month's collected revenue, split membership vs PT.
+ *
+ * Same source and shape as ownerRevenue() in whatsapp-webhook: read
+ * v_daily_revenue_by_source, keep rows from the 1st of the current month
+ * onward, partition by `source`. The view is security_invoker=true; a
+ * service_role caller (this function) bypasses RLS and gets every org's rows,
+ * so the organization_id filter is what scopes it — exactly as ownerRevenue does.
+ */
+async function loadMonthRevenue(
+  supabase: SupabaseClient,
+  orgId: string,
+  todayLocal: string,
+): Promise<{ total: number; membership: number; pt: number }> {
+  const monthStart = `${todayLocal.slice(0, 7)}-01`; // YYYY-MM-01
+
+  const { data, error } = await supabase
+    .from("v_daily_revenue_by_source")
+    .select("source, total")
+    .eq("organization_id", orgId)
+    .gte("day", monthStart);
+  if (error) throw error;
+
+  let membership = 0;
+  let pt = 0;
+  for (const r of (data ?? []) as { source: string; total: number | string }[]) {
+    const amt = toAmount(r.total);
+    if (r.source === "pt_package") pt += amt;
+    else membership += amt;
+  }
+  return { total: membership + pt, membership, pt };
+}
+
+/**
+ * How many ACTIVE PT packages need attention: low on sessions OR expiring soon.
+ * Identical predicate to loadAttention() in whatsapp-webhook (PT / ALERTS
+ * commands) and to v_pt_packages_attention:
+ *   low       = sessions_purchased - sessions_used <= 2
+ *   expiring  = (start_date + duration_months months, clamped) is <= 7 days out
+ *               (negative days_until_end — already past — still counts)
+ * The view's own WHERE is auth.jwt()-bound, so a service_role caller must
+ * recompute from pt_packages, which is what the commands do too.
+ */
+async function countPtAlerts(
+  supabase: SupabaseClient,
+  orgId: string,
+  todayLocal: string,
+): Promise<number> {
+  const { data, error } = await supabase
+    .from("pt_packages")
+    .select("sessions_purchased, sessions_used, start_date, duration_months")
+    .eq("organization_id", orgId)
+    .eq("status", "active");
+  if (error) throw error;
+
+  let count = 0;
+  for (const p of (data ?? []) as any[]) {
+    const remaining = Number(p.sessions_purchased) - Number(p.sessions_used);
+    const endDate = addMonthsIso(String(p.start_date).slice(0, 10), Number(p.duration_months));
+    const daysUntilEnd = daysBetweenIso(todayLocal, endDate);
+    if (remaining <= 2 || daysUntilEnd <= 7) count++;
+  }
+  return count;
+}
+
+/**
+ * Coach activity: how many coaches on the team, and of those how many have not
+ * logged a session in the last 7 days. Same rule as ownerCoaches():
+ *   active       = users with role='coach' for this org
+ *   need-checkin = active coaches with no training_notes row whose created_at
+ *                  is within the last 7 days (rolling, not midnight-aligned)
+ */
+async function loadCoachActivity(
+  supabase: SupabaseClient,
+  orgId: string,
+): Promise<{ active: number; need_checkin: number }> {
+  const recentSince = new Date(Date.now() - 7 * 86_400_000).toISOString();
+
+  const [coachRes, recentRes] = await Promise.all([
+    supabase.from("users").select("id").eq("organization_id", orgId).eq("role", "coach"),
+    supabase.from("training_notes").select("coach_id").eq("organization_id", orgId)
+      .gte("created_at", recentSince),
+  ]);
+  if (coachRes.error) throw coachRes.error;
+  if (recentRes.error) throw recentRes.error;
+
+  const coachIds = (coachRes.data ?? []).map((c: any) => c.id as string);
+  const loggedRecently = new Set((recentRes.data ?? []).map((r: any) => r.coach_id as string));
+  const need = coachIds.filter((id) => !loggedRecently.has(id)).length;
+
+  return { active: coachIds.length, need_checkin: need };
+}
+
+/** PT sessions logged during the org's yesterday — training_notes.session_date. */
+async function countSessionsLoggedYesterday(
+  supabase: SupabaseClient,
+  orgId: string,
+  todayLocal: string,
+): Promise<number> {
+  const { count, error } = await supabase
+    .from("training_notes")
+    .select("id", { count: "exact", head: true })
+    .eq("organization_id", orgId)
+    .eq("session_date", addDays(todayLocal, -1));
+  if (error) throw error;
+  return count ?? 0;
+}
+
 /**
  * Guard: has this organization already had a brief today (its own calendar day)?
  *
  * Keyed on organization_id + template_name, not member_id — these rows have
  * member_id NULL. direction is pinned too, so a hypothetical inbound row
- * carrying the same template name could never suppress a brief.
+ * carrying the same template name could never suppress a brief. Matches EITHER
+ * template version's name: one brief per org per day, whichever produced it.
  */
 async function alreadySentToday(
   supabase: SupabaseClient,
@@ -480,7 +708,7 @@ async function alreadySentToday(
     .select("id")
     .eq("organization_id", orgId)
     .eq("direction", "outbound")
-    .eq("template_name", TEMPLATE_NAME)
+    .in("template_name", BRIEF_TEMPLATE_NAMES as unknown as string[])
     .gte("created_at", start.toISOString())
     .lt("created_at", end.toISOString())
     .limit(1);
@@ -529,11 +757,13 @@ async function briefOneOrg(
   org: OrgRow,
   timeZone: string,
   dryRun: boolean,
+  version: BriefVersion,
 ): Promise<OrgResult> {
   const base = {
     organization_id: org.id,
     organization_name: org.name,
     timezone: timeZone,
+    brief_version: version,
   };
 
   const todayLocal = localDate(timeZone);
@@ -570,7 +800,28 @@ async function briefOneOrg(
     failed_sends: await countFailedSends(supabase, org.id),
   };
 
-  const message = buildBrief(org.name, todayLocal, stats);
+  // --- v2 adds revenue, PT alerts, coach activity, yesterday's sessions. v1
+  // --- is left byte-for-byte as it was: none of this runs, none of it ships. ---
+  if (version === "v2") {
+    const [revenue, ptAlerts, coaches, sessionsYesterday] = await Promise.all([
+      loadMonthRevenue(supabase, org.id, todayLocal),
+      countPtAlerts(supabase, org.id, todayLocal),
+      loadCoachActivity(supabase, org.id),
+      countSessionsLoggedYesterday(supabase, org.id, todayLocal),
+    ]);
+    stats.revenue_month_total = revenue.total;
+    stats.revenue_month_membership = revenue.membership;
+    stats.revenue_month_pt = revenue.pt;
+    stats.pt_alert_count = ptAlerts;
+    stats.attention_items = stats.overdue_count + ptAlerts;
+    stats.coaches_active = coaches.active;
+    stats.coaches_need_checkin = coaches.need_checkin;
+    stats.sessions_logged_yesterday = sessionsYesterday;
+  }
+
+  const message = version === "v2"
+    ? buildBriefV2(org.name, todayLocal, stats)
+    : buildBrief(org.name, todayLocal, stats);
 
   if (dryRun) {
     return { ...base, outcome: "computed", stats, message };
@@ -593,15 +844,40 @@ async function briefOneOrg(
     };
   }
 
-  const bodyParams = [
-    org.name,
-    formatDateForOwner(todayLocal),
-    String(stats.renewals_due_count),
-    formatRupees(stats.renewals_due_amount),
-    String(stats.overdue_count),
-    formatRupees(stats.overdue_amount),
-    String(stats.checkins_yesterday),
-  ];
+  const templateName = version === "v2" ? TEMPLATE_NAME_V2 : TEMPLATE_NAME_V1;
+
+  // Body params in template order. v1 = 7 (unchanged). v2 = 12, matching the
+  // approved daily_owner_brief_v2 body:
+  //   {{1}} org  {{2}} date  {{3}} revenue total  {{4}} membership  {{5}} PT
+  //   {{6}} attention items  {{7}} overdue  {{8}} PT alerts
+  //   {{9}} coaches active  {{10}} coaches needing a check-in
+  //   {{11}} yesterday check-ins  {{12}} yesterday sessions logged
+  // The ₹ signs are literals IN the template, so {{3}}/{{4}}/{{5}} are the bare
+  // grouped numbers. failed_sends is never a param in either version.
+  const bodyParams = version === "v2"
+    ? [
+      org.name,
+      formatDateForOwner(todayLocal),
+      formatRupees(stats.revenue_month_total ?? 0),
+      formatRupees(stats.revenue_month_membership ?? 0),
+      formatRupees(stats.revenue_month_pt ?? 0),
+      String(stats.attention_items ?? 0),
+      String(stats.overdue_count),
+      String(stats.pt_alert_count ?? 0),
+      String(stats.coaches_active ?? 0),
+      String(stats.coaches_need_checkin ?? 0),
+      String(stats.checkins_yesterday),
+      String(stats.sessions_logged_yesterday ?? 0),
+    ]
+    : [
+      org.name,
+      formatDateForOwner(todayLocal),
+      String(stats.renewals_due_count),
+      formatRupees(stats.renewals_due_amount),
+      String(stats.overdue_count),
+      formatRupees(stats.overdue_amount),
+      String(stats.checkins_yesterday),
+    ];
 
   // One send per distinct owner phone. The once-per-day guard above is
   // per-ORG, so a re-run the same day skips the whole org (nobody is
@@ -615,15 +891,11 @@ async function briefOneOrg(
       tag: TAG,
       memberId: null, // NULL on purpose — the recipient is an owner, not a member.
       organizationId: org.id,
-      templateName: TEMPLATE_NAME,
+      templateName,
       relatedPaymentId: null,
     }, {
-      name: TEMPLATE_NAME,
+      name: templateName,
       language: TEMPLATE_LANGUAGE,
-      // Same order as the template body: "Good morning! {{1}} — {{2}}.
-      // Renewals due this week: {{3}} (₹{{4}}). Overdue: {{5}} members,
-      // ₹{{6}} pending. Yesterday: {{7}} check-ins." Exactly 7 — failed_sends
-      // is buildBrief()'s body_preview content only (see the header note).
       bodyParams,
     });
     if (send.logged) logged++;
@@ -717,6 +989,21 @@ async function handleBrief(req: Request): Promise<Response> {
   }
   const dryRun = dryRunRaw === true;
 
+  // Optional per-request override of DEFAULT_BRIEF_VERSION — lets an operator
+  // roll one run back to v1, or a dry run preview either format, without
+  // touching the DAILY_BRIEF_TEMPLATE_VERSION secret.
+  let version: BriefVersion = DEFAULT_BRIEF_VERSION;
+  if (body.template_version !== undefined) {
+    if (body.template_version !== "v1" && body.template_version !== "v2") {
+      return json({
+        ok: false,
+        error: "template_version_invalid",
+        detail: `expected "v1" or "v2", got ${JSON.stringify(body.template_version)}`,
+      }, 400);
+    }
+    version = body.template_version;
+  }
+
   let onlyOrgId: string | null = null;
   if (body.organization_id !== undefined) {
     if (typeof body.organization_id !== "string" || !UUID_RE.test(body.organization_id.trim())) {
@@ -782,6 +1069,7 @@ async function handleBrief(req: Request): Promise<Response> {
   const common = {
     ok: true,
     dry_run: dryRun,
+    brief_version: version,
     organization_count: orgs.length,
     truncated,
     limit,
@@ -816,7 +1104,7 @@ async function handleBrief(req: Request): Promise<Response> {
     const timeZone = timezones.get(org.id) ?? DEFAULT_TIMEZONE;
 
     try {
-      results.push(await briefOneOrg(supabase, org, timeZone, dryRun));
+      results.push(await briefOneOrg(supabase, org, timeZone, dryRun, version));
     } catch (err) {
       // (6) One organization's bad data must not cost every other owner their
       // brief. Everything below the org boundary is caught here.
@@ -826,6 +1114,7 @@ async function handleBrief(req: Request): Promise<Response> {
         organization_id: org.id,
         organization_name: org.name,
         timezone: timeZone,
+        brief_version: version,
         outcome: "error",
         error: "brief_failed",
         detail,

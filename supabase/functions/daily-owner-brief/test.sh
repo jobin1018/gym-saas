@@ -156,16 +156,19 @@ assert_db() {
   assert_equals "$1" "$2" "$3"
 }
 
-briefs_for() { sql "select count(*) from whatsapp_messages where template_name='daily_owner_brief' and organization_id='$1';"; }
-briefs_all() { sql "select count(*) from whatsapp_messages where template_name='daily_owner_brief';"; }
+# Either template version counts — the once-per-day guard spans both, and the
+# suite must not care which format a send used.
+briefs_for() { sql "select count(*) from whatsapp_messages where template_name like 'daily_owner_brief%' and organization_id='$1';"; }
+briefs_all() { sql "select count(*) from whatsapp_messages where template_name like 'daily_owner_brief%';"; }
 
 # Full restore to seed.sql state.
 # whatsapp_messages first — related_payment_id references payments.
 reset_state() {
   $have_psql || return 0
   docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
-DELETE FROM whatsapp_messages WHERE template_name IN ('daily_owner_brief','renewal_reminder')
+DELETE FROM whatsapp_messages WHERE template_name = 'renewal_reminder' OR template_name LIKE 'daily_owner_brief%'
                                  OR organization_id IN ('$ORG_SUSPENDED', '0daded00-0000-0000-0000-00000000c0c0');
+DELETE FROM training_notes WHERE note_text = 'dob-v2 yesterday marker';
 DELETE FROM payments   WHERE idempotency_key LIKE 'renewal-%';
 DELETE FROM attendance WHERE organization_id IN ('$ORG_IRON','$ORG_FLEX','$ORG_SUSPENDED');
 DELETE FROM users         WHERE organization_id = '0daded00-0000-0000-0000-00000000c0c0';
@@ -264,7 +267,7 @@ SQL
 
 clear_briefs() {
   $have_psql || return 0
-  sql "delete from whatsapp_messages where template_name='daily_owner_brief';" >/dev/null
+  sql "delete from whatsapp_messages where template_name like 'daily_owner_brief%';" >/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -354,9 +357,11 @@ assert_equals   "unknown organization_id returns 404" \
 assert_db "no rejected request sent a brief" "0" "$(briefs_all)"
 
 # ---------------------------------------------------------------------------
-# 3. dry_run for a single org — real numbers, exact text, zero side effects
+# 3. dry_run for a single org, v1 (rollback) template — real numbers, exact
+#    text, zero side effects. This is the OLD daily_owner_brief path; it must
+#    keep working byte-for-byte for a rollback. (v2, the default, is section 3b.)
 # ---------------------------------------------------------------------------
-printf '\n%s-- dry_run (single org) --%s\n' "$B" "$N"
+printf '\n%s-- dry_run (single org, v1 rollback path) --%s\n' "$B" "$N"
 
 reset_state
 arrange_activity
@@ -365,8 +370,9 @@ arrange_failed_sends
 
 msgs_before=$(sql "select count(*) from whatsapp_messages;")
 
-got=$(post "{\"dry_run\":true,\"organization_id\":\"$ORG_IRON\"}")
+got=$(post "{\"dry_run\":true,\"organization_id\":\"$ORG_IRON\",\"template_version\":\"v1\"}")
 
+assert_contains "v1 override is honoured"              '"brief_version":"v1"' "$got"
 assert_contains "response is flagged as a dry run"     '"dry_run":true' "$got"
 assert_contains "only the requested org is computed"   '"organization_count":1' "$got"
 assert_contains "outcome is computed, never sent"      '"outcome":"computed"' "$got"
@@ -394,30 +400,124 @@ assert_contains "failed sends counted"            '"failed_sends":2' "$got"
 # regression to a UTC day boundary fails with a readable name.
 ok "23:30 IST counts as yesterday and 00:30 IST does not (implied by count of 3)"
 
-# (7) The exact message text.
+# (7) The exact v1 message text — unchanged from before the v2 work.
 assert_contains "message greets with org name and date" \
   'Good morning! Iron Temple Gym — ' "$got"
-assert_contains "message has the renewals line"  '💰 Renewals due this week: 3 (₹4,200)' "$got"
-assert_contains "message has the overdue line"   '⚠️ Overdue: 3 members, ₹4,200 pending' "$got"
-assert_contains "message has the check-ins line" '✅ Yesterday: 3 check-ins' "$got"
-assert_contains "message has the failure line"   '❌ 2 messages failed to send — tap to review' "$got"
+assert_contains "v1 message has the renewals line"  '💰 Renewals due this week: 3 (₹4,200)' "$got"
+assert_contains "v1 message has the overdue line"   '⚠️ Overdue: 3 members, ₹4,200 pending' "$got"
+assert_contains "v1 message has the check-ins line" '✅ Yesterday: 3 check-ins' "$got"
+assert_contains "v1 message has the failure line"   '❌ 2 messages failed to send — tap to review' "$got"
+assert_not_contains "v1 message carries no v2-only phrasing" 'Revenue this month:' "$got"
 
 # The whole point of dry_run.
 assert_db "dry run wrote no brief"        "0" "$(briefs_for "$ORG_IRON")"
 assert_db "dry run wrote no rows at all"  "$msgs_before" "$(sql "select count(*) from whatsapp_messages;")"
 
-printf '\n  %sBRIEF THAT WOULD BE SENT%s (Iron Temple):\n' "$B" "$N"
+printf '\n  %sv1 BRIEF THAT WOULD BE SENT%s (Iron Temple):\n' "$B" "$N"
 printf '%s' "$got" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p' | head -1 \
   | sed 's/\\n/\n/g' | sed 's/^/    /'
 printf '\n'
 
 # ---------------------------------------------------------------------------
-# 4. Zero-activity org — a clean brief, NOT a skip and NOT an error
+# 3b. dry_run for a single org, v2 (DEFAULT) template — all 12 values, and
+#     each cross-referenced against the SAME source the owner's REVENUE / PT /
+#     COACHES commands read, so the brief and those commands can never disagree.
 # ---------------------------------------------------------------------------
-printf '\n%s-- zero-activity organization --%s\n' "$B" "$N"
+printf '\n%s-- dry_run (single org, v2 default) --%s\n' "$B" "$N"
+
+# reset_state above already ran; arrange_activity/checkins/failed_sends still in
+# place from section 3. Add ONE session logged YESTERDAY so {{12}} is non-zero.
+# training_notes_bump_session_count increments the package's sessions_used, so
+# capture it and restore it (plus status) in the cleanup below.
+V2_PKG=""; V2_PKG_USED=""
+if $have_psql; then
+  V2_COACH=c0ac0000-0000-0000-0000-000000000001   # Farah, Iron
+  V2_PKG=$(sql "select id from pt_packages where organization_id='$ORG_IRON' and coach_id='$V2_COACH' and status='active' order by id limit 1;")
+  V2_PKG_USED=$(sql "select sessions_used from pt_packages where id='$V2_PKG';")
+  V2_PKG_MEMBER=$(sql "select member_id from pt_packages where id='$V2_PKG';")
+  sql "delete from training_notes where note_text = 'dob-v2 yesterday marker';
+       insert into training_notes (organization_id, member_id, coach_id, pt_package_id, note_text, session_date)
+       values ('$ORG_IRON','$V2_PKG_MEMBER','$V2_COACH','$V2_PKG','dob-v2 yesterday marker', CURRENT_DATE - 1);" >/dev/null
+fi
+
+got=$(post "{\"dry_run\":true,\"organization_id\":\"$ORG_IRON\"}")
+
+assert_contains "default version is v2"            '"brief_version":"v2"' "$got"
+assert_contains "outcome is computed"              '"outcome":"computed"' "$got"
+
+# --- {{7}} overdue and {{11}} check-ins: same fixture as section 3 ---
+assert_contains "v2 keeps overdue_count"           '"overdue_count":3' "$got"
+assert_contains "v2 keeps checkins_yesterday"      '"checkins_yesterday":3' "$got"
+
+# --- {{3}}/{{4}}/{{5}} revenue: must equal v_daily_revenue_by_source for the
+#     current calendar month, exactly what ownerRevenue() reads ---
+if $have_psql; then
+  MONTH_TOTAL=$(sql "select coalesce(sum(total),0)::bigint from v_daily_revenue_by_source where organization_id='$ORG_IRON' and day >= date_trunc('month', CURRENT_DATE);")
+  MONTH_MEM=$(sql   "select coalesce(sum(total),0)::bigint from v_daily_revenue_by_source where organization_id='$ORG_IRON' and source='membership' and day >= date_trunc('month', CURRENT_DATE);")
+  MONTH_PT=$(sql    "select coalesce(sum(total),0)::bigint from v_daily_revenue_by_source where organization_id='$ORG_IRON' and source='pt_package' and day >= date_trunc('month', CURRENT_DATE);")
+  assert_equals "v2 {{3}} revenue_month_total == v_daily_revenue_by_source"       "$MONTH_TOTAL" "$(field_num revenue_month_total "$got")"
+  assert_equals "v2 {{4}} revenue_month_membership == view (membership rows)"      "$MONTH_MEM"   "$(field_num revenue_month_membership "$got")"
+  assert_equals "v2 {{5}} revenue_month_pt == view (pt_package rows)"             "$MONTH_PT"    "$(field_num revenue_month_pt "$got")"
+
+  # --- {{8}} PT alerts: recompute the loadAttention()/v_pt_packages_attention
+  #     predicate (low<=2 sessions OR <=7 days to expected end) on pt_packages ---
+  PT_ALERTS=$(sql "select count(*) from pt_packages
+                   where organization_id='$ORG_IRON' and status='active'
+                     and ( (sessions_purchased - sessions_used) <= 2
+                        or ((start_date + make_interval(months => duration_months))::date - CURRENT_DATE) <= 7 );")
+  assert_equals "v2 {{8}} pt_alert_count == the attention predicate on pt_packages" "$PT_ALERTS" "$(field_num pt_alert_count "$got")"
+
+  # --- {{6}} attention items == overdue + PT alerts ---
+  assert_equals "v2 {{6}} attention_items == overdue_count + pt_alert_count" \
+    "$((3 + PT_ALERTS))" "$(field_num attention_items "$got")"
+
+  # --- {{9}} active coaches == role='coach' count (same denominator as COACHES) ---
+  COACH_N=$(sql "select count(*) from users where organization_id='$ORG_IRON' and role='coach';")
+  assert_equals "v2 {{9}} coaches_active == users role='coach' count" "$COACH_N" "$(field_num coaches_active "$got")"
+
+  # --- {{10}} need-a-check-in == coaches with NO training_note in the last 7d ---
+  NEED_CHECKIN=$(sql "select count(*) from users u
+                      where u.organization_id='$ORG_IRON' and u.role='coach'
+                        and not exists (select 1 from training_notes tn
+                                        where tn.coach_id = u.id
+                                          and tn.created_at >= now() - interval '7 days');")
+  assert_equals "v2 {{10}} coaches_need_checkin == quiet-coach count (7d rule)" "$NEED_CHECKIN" "$(field_num coaches_need_checkin "$got")"
+
+  # --- {{12}} sessions logged yesterday (training_notes.session_date) ---
+  SESS_Y=$(sql "select count(*) from training_notes where organization_id='$ORG_IRON' and session_date = CURRENT_DATE - 1;")
+  assert_equals "v2 {{12}} sessions_logged_yesterday == training_notes yesterday" "$SESS_Y" "$(field_num sessions_logged_yesterday "$got")"
+  assert_contains "  ...and it is the non-zero we just arranged" '"sessions_logged_yesterday":1' "$got"
+fi
+
+# --- the v2 message text is the single-paragraph 12-value format ---
+assert_contains "v2 message greets + dates"        'Good morning! Iron Temple Gym — 1 ' "$got"
+assert_contains "v2 message has the revenue clause" 'Revenue this month: ₹' "$got"
+assert_contains "v2 message has membership/PT split" ' membership, ₹' "$got"
+assert_contains "v2 message has the attention clause" 'Needs attention: 4 items — 3 overdue, 1 PT alerts.' "$got"
+assert_contains "v2 message has the coaches clause"   'Coaches: 2 active, 0 need a check-in.' "$got"
+assert_contains "v2 message has the yesterday clause" 'Yesterday: 3 check-ins, 1 sessions logged.' "$got"
+
+assert_db "v2 dry run still wrote no brief" "0" "$(briefs_for "$ORG_IRON")"
+
+printf '\n  %sv2 BRIEF THAT WOULD BE SENT%s (Iron Temple):\n' "$B" "$N"
+printf '%s' "$got" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p' | head -1 | sed 's/^/    /'
+printf '\n'
+
+# Undo the marker AND the session-count bump the trigger applied.
+if $have_psql && [ -n "$V2_PKG" ]; then
+  sql "delete from training_notes where note_text = 'dob-v2 yesterday marker';
+       update pt_packages set sessions_used = $V2_PKG_USED, status = 'active' where id = '$V2_PKG';" >/dev/null
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Zero-activity org — a clean v1 brief, NOT a skip and NOT an error
+#    (the "reads as words" behaviour is v1's buildBrief(); v2 always shows the
+#    number, tested in 3b.)
+# ---------------------------------------------------------------------------
+printf '\n%s-- zero-activity organization (v1) --%s\n' "$B" "$N"
 
 arrange_flex_quiet
-got=$(post "{\"dry_run\":true,\"organization_id\":\"$ORG_FLEX\"}")
+got=$(post "{\"dry_run\":true,\"organization_id\":\"$ORG_FLEX\",\"template_version\":\"v1\"}")
 
 assert_contains "quiet org is still computed"      '"outcome":"computed"' "$got"
 assert_contains "quiet org has no renewals due"    '"renewals_due_count":0' "$got"
@@ -451,22 +551,22 @@ assert_contains "the logged message id is returned" '"whatsapp_message_id":"' "$
 
 assert_db "exactly one brief row was written" "1" "$(briefs_for "$ORG_IRON")"
 assert_db "brief is outbound and queued" \
-  "1" "$(sql "select count(*) from whatsapp_messages where template_name='daily_owner_brief' and direction='outbound' and status='queued';")"
+  "1" "$(sql "select count(*) from whatsapp_messages where template_name like 'daily_owner_brief%' and direction='outbound' and status='queued';")"
 # (4) The recipient is the org, not a member.
 assert_db "brief row has member_id NULL (recipient is the owner, not a member)" \
-  "1" "$(sql "select count(*) from whatsapp_messages where template_name='daily_owner_brief' and member_id is null;")"
+  "1" "$(sql "select count(*) from whatsapp_messages where template_name like 'daily_owner_brief%' and member_id is null;")"
 assert_db "brief row is scoped to the right tenant" \
-  "$ORG_IRON" "$(sql "select organization_id from whatsapp_messages where template_name='daily_owner_brief' limit 1;")"
+  "$ORG_IRON" "$(sql "select organization_id from whatsapp_messages where template_name like 'daily_owner_brief%' limit 1;")"
 assert_db "brief row has no related_payment_id" \
-  "1" "$(sql "select count(*) from whatsapp_messages where template_name='daily_owner_brief' and related_payment_id is null;")"
+  "1" "$(sql "select count(*) from whatsapp_messages where template_name like 'daily_owner_brief%' and related_payment_id is null;")"
 assert_db "body_preview holds the real brief text" \
-  "1" "$(sql "select count(*) from whatsapp_messages where template_name='daily_owner_brief' and body_preview like 'Good morning! Iron Temple Gym%';")"
+  "1" "$(sql "select count(*) from whatsapp_messages where template_name like 'daily_owner_brief%' and body_preview like 'Good morning! Iron Temple Gym%';")"
 assert_db "wa_message_id is NULL (send was mocked for this test run)" \
-  "1" "$(sql "select count(*) from whatsapp_messages where template_name='daily_owner_brief' and wa_message_id is null;")"
+  "1" "$(sql "select count(*) from whatsapp_messages where template_name like 'daily_owner_brief%' and wa_message_id is null;")"
 
 # A NULL member_id must not disturb send-renewal-reminder's member-scoped guard.
 assert_db "the NULL-member brief row is invisible to a member-scoped lookup" \
-  "0" "$(sql "select count(*) from whatsapp_messages where member_id='$MEMBER_ASHA' and template_name='daily_owner_brief';")"
+  "0" "$(sql "select count(*) from whatsapp_messages where member_id='$MEMBER_ASHA' and template_name like 'daily_owner_brief%';")"
 
 # ---------------------------------------------------------------------------
 # 5b. Meta rejects the send — must report as errored, not sent
@@ -501,14 +601,14 @@ else
   assert_equals   "one org errored"             "1" "$(field_num errored "$got")"
 
   assert_db "the failed send was still logged (once-per-day guard sees it)" \
-    "1" "$(sql "select count(*) from whatsapp_messages where template_name='daily_owner_brief' and organization_id='$ORG_FLEX' and status='failed';")"
+    "1" "$(sql "select count(*) from whatsapp_messages where template_name like 'daily_owner_brief%' and organization_id='$ORG_FLEX' and status='failed';")"
 
   # The once-per-day guard keys on the row existing at all, not on its status —
   # a re-run today must not retry, same as a genuinely sent brief.
   got=$(post "{\"organization_id\":\"$ORG_FLEX\"}")
   assert_contains "a re-run today is skipped, not retried" '"reason":"already_sent_today"' "$got"
   assert_db "still exactly one row for this org" \
-    "1" "$(sql "select count(*) from whatsapp_messages where template_name='daily_owner_brief' and organization_id='$ORG_FLEX';")"
+    "1" "$(sql "select count(*) from whatsapp_messages where template_name like 'daily_owner_brief%' and organization_id='$ORG_FLEX';")"
 
   sql "update organizations set owner_phone='919000000002' where id='$ORG_FLEX';
        update users set phone='919000000002' where organization_id='$ORG_FLEX' and role='owner';" >/dev/null
