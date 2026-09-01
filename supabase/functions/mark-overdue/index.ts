@@ -52,6 +52,7 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { createAdminClient, type SupabaseClient } from "../_shared/supabase.ts";
 import { authorizeServiceRole } from "../_shared/auth.ts";
+import { ACTIVE_ORG_STATUSES } from "../_shared/org-status.ts";
 
 const TAG = "mark-overdue";
 
@@ -151,16 +152,17 @@ function chunk<T>(items: T[], size: number): T[][] {
  * past_due up to five and a half hours early — on the very morning their
  * renewal reminder is due to go out, and while they can still walk in and pay.
  *
- * NOTE ON ORG STATUS: unlike renewal-scan and daily-owner-brief, this function
- * does NOT filter to active/trial organizations. Those two send messages, and a
- * suspended tenant should not be messaging anyone. This one only corrects a
- * status column to match dates that have already passed; letting a suspended
- * org's data silently rot would just move the problem to whenever they resume.
+ * NOTE ON ORG STATUS: like renewal-scan and daily-owner-brief, this now skips
+ * suspended organizations — a frozen tenant's data is frozen, full stop. It is
+ * safe to skip here because mark-overdue is idempotent: the first run after an
+ * org is reactivated transitions every membership whose current_period_end
+ * passed during the suspension, catching the whole backlog up in one pass.
  */
 async function loadZoneGroups(supabase: SupabaseClient): Promise<ZoneGroup[]> {
   const { data: orgs, error: orgError } = await supabase
     .from("organizations")
     .select("id")
+    .in("status", ACTIVE_ORG_STATUSES as unknown as string[])
     .order("id", { ascending: true });
 
   if (orgError) throw orgError;

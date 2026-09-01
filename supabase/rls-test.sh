@@ -170,6 +170,9 @@ DELETE FROM members WHERE id = '$MEMBER_LOC2';
 DELETE FROM locations WHERE id = '$LOC_IRON_2';
 DELETE FROM whatsapp_messages WHERE body_preview IN ('rls-test broadcast', 'rls-test member message');
 UPDATE organizations SET gst_number = NULL WHERE id = '$ORG_FLEX';
+-- section 13 suspends/reactivates FlexFit; make sure a mid-run abort can't
+-- leave it frozen for the next run.
+UPDATE organizations SET status = 'active' WHERE id IN ('$ORG_IRON', '$ORG_FLEX');
 -- coaching section's own inserts (seed rows carry none of these markers).
 -- body_measurements FIRST — it FK-references training_notes now.
 DELETE FROM body_measurements
@@ -797,6 +800,46 @@ assert_equals "FlexFit owner's coaches_workload has zero Iron coaches" "0" \
   "$(count_rows "$(rest "$SANJAY" "coaches_workload?id=in.($FARAH_UID,$GIRISH_UID)&select=id")")"
 assert_contains "FlexFit owner DOES see their own coach (Hema)" \
   "c0ac0000-0000-0000-0000-000000000003" "$(rest "$SANJAY" "coaches_workload?select=id")"
+
+# ---------------------------------------------------------------------------
+# 13. Suspended organization — every tenant table returns zero rows for an
+#     ALREADY-OPEN session the moment status flips, and reactivating restores
+#     it with no re-login. (migration 20260902090000, current_org_active() +
+#     the org_not_suspended RESTRICTIVE policies)
+# ---------------------------------------------------------------------------
+printf '\n%s-- suspended organization freeze --%s\n' "$B" "$N"
+
+# Baseline: SANJAY (FlexFit owner) and HEMA (FlexFit coach) see their data.
+assert_equals "baseline: FlexFit owner sees >=1 member" "1" \
+  "$([ "$(count_rows "$(rest "$SANJAY" "members?organization_id=eq.$ORG_FLEX&select=id&limit=1")")" -ge 1 ] && echo 1 || echo 0)"
+assert_equals "baseline: FlexFit owner reads own org row: 200" "200" \
+  "$(rest_status "$SANJAY" "organizations?id=eq.$ORG_FLEX&select=id")"
+
+sql "UPDATE organizations SET status = 'suspended' WHERE id = '$ORG_FLEX'" >/dev/null
+
+# SAME tokens, no refresh — the RESTRICTIVE gate re-reads status per query.
+for tbl in members memberships payments attendance whatsapp_messages membership_plans pt_packages; do
+  assert_equals "suspended: FlexFit owner sees 0 rows in $tbl" "0" \
+    "$(count_rows "$(rest "$SANJAY" "$tbl?organization_id=eq.$ORG_FLEX&select=id")")"
+done
+assert_equals "suspended: FlexFit owner can't even read the organizations row" "0" \
+  "$(count_rows "$(rest "$SANJAY" "organizations?id=eq.$ORG_FLEX&select=id")")"
+assert_equals "suspended: FlexFit coach sees 0 members" "0" \
+  "$(count_rows "$(rest "$HEMA" "members?select=id")")"
+assert_equals "suspended: FlexFit owner INSERT into members is blocked" "403" \
+  "$(rest_post_status "$SANJAY" "members" "{\"organization_id\":\"$ORG_FLEX\",\"location_id\":\"$LOC_FLEX\",\"name\":\"Nope\",\"phone\":\"919000099999\"}")"
+
+# Iron is untouched — suspension is per-tenant.
+assert_equals "suspended FlexFit does NOT affect Iron: owner still sees members" "1" \
+  "$([ "$(count_rows "$(rest "$RAVI" "members?organization_id=eq.$ORG_IRON&select=id&limit=1")")" -ge 1 ] && echo 1 || echo 0)"
+
+sql "UPDATE organizations SET status = 'active' WHERE id = '$ORG_FLEX'" >/dev/null
+
+# Same token again — full access back, no re-login.
+assert_equals "reactivated: FlexFit owner sees members again" "1" \
+  "$([ "$(count_rows "$(rest "$SANJAY" "members?organization_id=eq.$ORG_FLEX&select=id&limit=1")")" -ge 1 ] && echo 1 || echo 0)"
+assert_equals "reactivated: FlexFit owner reads own org row again: 200" "200" \
+  "$(rest_status "$SANJAY" "organizations?id=eq.$ORG_FLEX&select=id")"
 
 # ---------------------------------------------------------------------------
 # Summary

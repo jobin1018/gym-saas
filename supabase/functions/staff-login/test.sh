@@ -182,8 +182,14 @@ UPDATE public.users SET name = 'Priya Nair' WHERE id = '$USER_PRIYA';
 -- and only THEN do we delete the now-unreferenced auth.users rows, matched by
 -- email pattern rather than by joining back through auth_user_id (more
 -- robust: cleans up regardless of the exact id bookkeeping above).
+-- Null EVERY reference to a synthetic-domain auth.users row, not just this
+-- suite's two — other suites in a full run (validate-magic-link's e2e bridges
+-- a coach; this suite's section 8 bridges an Apex owner) leave their own
+-- bridged rows, and if ANY reference survives, the DELETE below hits a FK
+-- violation, silently no-ops under -q, and every suite that runs after this
+-- one can't mint a session ("createUser: email already registered").
 UPDATE public.users SET auth_user_id = NULL
- WHERE id IN ('$USER_PRIYA','$USER_RAVI');
+ WHERE auth_user_id IN (SELECT id FROM auth.users WHERE email LIKE '%@staff.internal.invalid');
 DELETE FROM public.users WHERE id = '$CROSS_ORG_USER';
 
 DELETE FROM auth.users WHERE email LIKE '%@staff.internal.invalid';
@@ -441,6 +447,32 @@ for i in 1 2 3 4; do post "$ORG_IRON" "$PHONE_RAVI" "9999" >/dev/null; done
 got=$(post "$ORG_IRON" "$PHONE_RAVI" "9999")
 assert_contains "still not locked — the success above reset the counter" '"error":"invalid_credentials"' "$got"
 assert_not_contains "confirms it did not lock out yet" 'too_many_attempts' "$got"
+
+reset_state
+
+# ---------------------------------------------------------------------------
+# 8. Suspended organization — the PIN is right, access is on hold
+#    (org-status enforcement 20260902090000). Apex Strength Co is seeded
+#    status='suspended'.
+# ---------------------------------------------------------------------------
+printf '\n%s-- suspended organization --%s\n' "$B" "$N"
+ORG_APEX=a9ec0000-0000-0000-0000-0000000000a1
+
+got=$(post "$ORG_APEX" 919100000001 2580)   # Nisha Raman, Apex owner, correct PIN
+assert_contains "correct PIN at a SUSPENDED org -> org_suspended"      '"error":"org_suspended"' "$got"
+assert_contains "  ...carries a human-readable message"               '"message":"' "$got"
+assert_equals   "  ...403, not 200"                                   "403" "$(post_status "$ORG_APEX" 919100000001 2580)"
+assert_contains "  ...a WRONG PIN at a suspended org is still generic" '"error":"invalid_credentials"' \
+  "$(post "$ORG_APEX" 919100000001 9999)"
+
+if $have_psql; then
+  sql "update organizations set status='active' where id='$ORG_APEX'" >/dev/null
+  assert_equals "reactivating restores login with no other action -> 200" "200" \
+    "$(post_status "$ORG_APEX" 919100000001 2580)"
+  sql "update organizations set status='suspended' where id='$ORG_APEX'" >/dev/null
+  assert_equals "re-suspending blocks it again -> 403" "403" \
+    "$(post_status "$ORG_APEX" 919100000001 2580)"
+fi
 
 reset_state
 

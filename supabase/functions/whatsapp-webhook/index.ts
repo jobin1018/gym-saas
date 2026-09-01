@@ -26,6 +26,7 @@ import "@supabase/functions-js/edge-runtime.d.ts";
 import { createAdminClient, type SupabaseClient } from "../_shared/supabase.ts";
 import { hmacSha256Hex, timingSafeEqualHex } from "../_shared/crypto.ts";
 import { expectedServiceRoleKey } from "../_shared/auth.ts";
+import { orgStatusIsActive } from "../_shared/org-status.ts";
 
 // NOTE: we intentionally do NOT use `withSupabase({ auth: [...] })` from
 // @supabase/server here. That wrapper requires a Supabase apiKey on every
@@ -53,6 +54,9 @@ const REPLY = {
   noMembership:
     "We couldn't find a membership on file for you — please check with your gym's front desk.",
   notFound: "We couldn't find you — check with your gym's front desk",
+  orgInactive:
+    "This gym's account is currently inactive. Please contact the gym directly — " +
+    "check-ins and messages are paused until it's restored.",
   unknown:
     "Sorry, I didn't understand. Reply IN to check in, or PAY to renew your membership.",
   // --- Real payment-link outcomes, from requestPaymentLink() below ---
@@ -594,6 +598,7 @@ type SenderRole =
   | { kind: "owner_ambiguous"; orgs: { id: string; name: string }[] }
   | { kind: "coach"; userId: string; organizationId: string; name: string }
   | { kind: "coach_ambiguous"; names: string[] }
+  | { kind: "org_suspended"; organizationId: string | null }
   | { kind: "member" };
 
 type OwnerCommand =
@@ -626,9 +631,16 @@ async function resolveSender(
   if (ownedOrgIds.size >= 1) {
     const ids = [...ownedOrgIds];
     const { data: ownedOrgs, error: ownedErr } = await supabase
-      .from("organizations").select("id, name").in("id", ids);
+      .from("organizations").select("id, name, status").in("id", ids);
     if (ownedErr) throw ownedErr;
-    const list = (ownedOrgs ?? []).map((o: any) => ({ id: o.id, name: o.name }));
+    // Suspended orgs drop out entirely — an owner of a suspended gym gets no
+    // owner commands. An owner of 2 gyms, one suspended, sees only the live one.
+    const list = (ownedOrgs ?? [])
+      .filter((o: any) => orgStatusIsActive(o.status))
+      .map((o: any) => ({ id: o.id, name: o.name }));
+    if (list.length === 0) {
+      return { kind: "org_suspended", organizationId: (ownedOrgs ?? [])[0]?.id ?? null };
+    }
     if (list.length === 1) {
       return { kind: "owner", organizationId: list[0].id, orgName: list[0].name };
     }
@@ -639,20 +651,27 @@ async function resolveSender(
 
   const { data: coaches, error: coachErr } = await supabase
     .from("users")
-    .select("id, name, organization_id")
+    .select("id, name, organization_id, organizations(status)")
     .eq("role", "coach")
     .eq("phone", phone);
   if (coachErr) throw coachErr;
-  if (coaches && coaches.length === 1) {
+  const liveCoaches = (coaches ?? []).filter((c: any) =>
+    orgStatusIsActive(c.organizations?.status)
+  );
+  if (liveCoaches.length === 1) {
     return {
       kind: "coach",
-      userId: coaches[0].id,
-      organizationId: coaches[0].organization_id,
-      name: coaches[0].name,
+      userId: liveCoaches[0].id,
+      organizationId: liveCoaches[0].organization_id,
+      name: liveCoaches[0].name,
     };
   }
-  if (coaches && coaches.length > 1) {
-    return { kind: "coach_ambiguous", names: coaches.map((c: any) => c.name) };
+  if (liveCoaches.length > 1) {
+    return { kind: "coach_ambiguous", names: liveCoaches.map((c: any) => c.name) };
+  }
+  // Every coach row for this phone was at a suspended org — not a member.
+  if ((coaches ?? []).length > 0) {
+    return { kind: "org_suspended", organizationId: (coaches ?? [])[0]?.organization_id ?? null };
   }
 
   return { kind: "member" };
@@ -1191,6 +1210,12 @@ async function handleStaffCommand(
       : cmd === "session"
       ? await coachStartSession(supabase, sender.userId, sender.organizationId, sender.name)
       : coachHelp(sender.name);
+  } else if (sender.kind === "org_suspended") {
+    // Every gym this phone is an owner/coach at is suspended. No commands, no
+    // magic links — just say why, same copy as the member path.
+    orgForLog = sender.organizationId;
+    console.log(`[whatsapp-webhook] staff phone=${phone} org=${sender.organizationId} — suspended, no commands.`);
+    reply = REPLY.orgInactive;
   } else if (sender.kind === "owner_ambiguous") {
     // No owner_active_context table and no conversation state (see the
     // TODO(convo) notes) — the same "can only show the list" limitation the
@@ -1379,6 +1404,18 @@ async function handleWebhook(req: Request): Promise<Response> {
       ? resolution.organizationId
       : null;
 
+    // --- (c2) Suspended tenant: a resolved member at a suspended org gets a
+    // --- clean "account inactive" reply and NO check-in — same freeze as the
+    // --- owner/coach path. Checked here so the log below still records the
+    // --- inbound message against the right org.
+    let orgSuspended = false;
+    if (resolution.kind === "resolved") {
+      const { data: orgRow, error: orgRowErr } = await supabase
+        .from("organizations").select("status").eq("id", organizationId!).maybeSingle();
+      if (orgRowErr) throw orgRowErr;
+      orgSuspended = !orgStatusIsActive((orgRow as any)?.status);
+    }
+
     // --- (f) Log the inbound message. ---
     // Done before the reply so the whatsapp_messages log reads chronologically.
     await logInboundMessage(supabase, message, { memberId, organizationId });
@@ -1387,7 +1424,10 @@ async function handleWebhook(req: Request): Promise<Response> {
     // --- requestPaymentLink()) — no further send happens at step (e).
     let reply: string | null;
 
-    if (resolution.kind === "not_found") {
+    if (orgSuspended) {
+      console.log(`[whatsapp-webhook] phone=${phone} org=${organizationId} — suspended, no check-in.`);
+      reply = REPLY.orgInactive;
+    } else if (resolution.kind === "not_found") {
       reply = REPLY.notFound;
     } else if (resolution.kind === "ambiguous") {
       // No attendance, no context write — we don't know which gym they mean.

@@ -469,6 +469,13 @@ send_cmd() { send_message "$1" "wamid.$RUN.$2" "$3" >/dev/null; }
 if ! $have_psql; then
   skipped "owner/coach command suite" "requires docker/psql for data assertions"
 else
+  # Apex is seeded status='suspended' (that is the deliberate suspended-org
+  # fixture). The owner/coach COMMAND tests below need a live org, so flip it
+  # active for their duration; 8i flips it back to 'suspended' and asserts the
+  # freeze. Restore-on-exit too, in case an assertion aborts the run.
+  sql "update organizations set status='active' where id='$ORG_APEX'" >/dev/null
+  trap "sql \"update organizations set status='suspended' where id='$ORG_APEX'\" >/dev/null 2>&1" EXIT
+
   # a little TODAY-dated activity (reset_state truncated attendance + messages)
   sql "insert into attendance (organization_id, member_id, source) values
         ('$ORG_APEX','a9ec0000-0000-0000-0000-0000000000f1','whatsapp_self'),
@@ -605,13 +612,13 @@ else
   assert_contains "unknown phone gets a clean not_found (not an error)" '"resolution":"not_found"' "$got"
   assert_contains "unknown phone response is still ok:true"             '"ok":true' "$got"
 
-  # Throwaway-org fixtures for 8f/8g. Both are status='suspended': every read
-  # in these handlers is scoped by organization_id, so status is irrelevant to
-  # the assertions — but 'suspended' means that even if teardown here somehow
-  # fails, a leaked row can't be picked up by the daily-owner-brief batch (its
-  # "4 briefable orgs" invariant) or any renewal/overdue cron. Teardown runs
-  # via a heredoc (statement-per-statement, continues past errors) rather than
-  # a single multi-statement -c string.
+  # Throwaway-org fixtures for 8f/8g. status='active': as of the org-status
+  # enforcement work (20260902090000) resolveSender() drops suspended orgs
+  # entirely, so an ambiguity / owner-command fixture MUST be active to be
+  # seen at all. Teardown DELETEs them (heredoc, statement-per-statement,
+  # continues past errors) and is also run defensively at the next run's
+  # start, so a leak into daily-owner-brief's "4 briefable orgs" invariant
+  # only survives an outright teardown failure.
   BULK_ORG=0daded00-0000-0000-0000-0000000b0001
   TWIN_ORG=0daded00-0000-0000-0000-00000000abba
   bulk_teardown() {
@@ -630,7 +637,7 @@ SQL
   # --- 8f. multi-org owner_phone collision -> graceful disambiguation ---
   docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
 INSERT INTO organizations (id, name, owner_phone, status)
-VALUES ('$TWIN_ORG', 'Twin Peaks Gym', '$PHONE_OWNER_IRON', 'suspended');
+VALUES ('$TWIN_ORG', 'Twin Peaks Gym', '$PHONE_OWNER_IRON', 'active');
 SQL
   send_cmd "$PHONE_OWNER_IRON" amb "REVENUE"
   r=$(sql "select body_preview from whatsapp_messages where direction='outbound' and organization_id is null order by created_at desc limit 1;")
@@ -640,7 +647,7 @@ SQL
   # --- 8g. a genuinely long list is capped + summarised, not malformed ---
   docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
 INSERT INTO organizations (id, name, owner_phone, status)
-VALUES ('$BULK_ORG', 'Bulk Test Gym', '919555000111', 'suspended');
+VALUES ('$BULK_ORG', 'Bulk Test Gym', '919555000111', 'active');
 INSERT INTO locations (id, organization_id, name)
 VALUES ('0daded00-0000-0000-0000-0000000b0000', '$BULK_ORG', 'Bulk HQ');
 INSERT INTO membership_plans (id, organization_id, name, amount)
@@ -676,11 +683,36 @@ SQL
 
   bulk_teardown
 
+  # --- 8i. suspended org — owner/coach commands AND member check-ins freeze ---
+  #     (org-status enforcement 20260902090000). Apex goes back to its seeded
+  #     'suspended' state here; the EXIT trap is only a fallback.
+  reset_state
+  sql "update organizations set status='suspended' where id='$ORG_APEX'" >/dev/null
+  APEX_MEMBER_PHONE=$(sql "select phone from members where organization_id='$ORG_APEX' limit 1;")
+
+  got=$(send_message "$PHONE_OWNER" "wamid.$RUN.susp-o" "REVENUE")
+  assert_contains "suspended org: owner REVENUE -> org_suspended resolution" '"resolution":"org_suspended"' "$got"
+  assert_contains "  ...owner gets the 'account inactive' reply"  "currently inactive" "$(last_out_org "$ORG_APEX")"
+  got=$(send_message "$PHONE_COACH" "wamid.$RUN.susp-c" "MYCLIENTS")
+  assert_contains "suspended org: coach MYCLIENTS -> org_suspended resolution" '"resolution":"org_suspended"' "$got"
+  got=$(send_message "$PHONE_COACH" "wamid.$RUN.susp-s" "SESSION")
+  assert_contains "suspended org: coach SESSION mints no magic link" '"resolution":"org_suspended"' "$got"
+  assert_equals   "  ...no coach_magic_links row was created" "0" \
+    "$(sql "select count(*) from coach_magic_links cml join users u on u.id=cml.coach_user_id where u.organization_id='$ORG_APEX';")"
+
+  if [ -n "$APEX_MEMBER_PHONE" ]; then
+    got=$(send_message "$APEX_MEMBER_PHONE" "wamid.$RUN.susp-m" "in")
+    assert_contains "suspended org: member check-in -> clean inactive reply" "currently inactive" "$(last_out_org "$ORG_APEX")"
+    assert_equals   "  ...no attendance row written" "0" "$(attendance_count "$APEX_MEMBER_PHONE")"
+  fi
+
   # --- 8h. existing member intents are completely unaffected ---
   reset_state
   got=$(send_message "$PHONE_ACTIVE" "wamid.$RUN.mem-in" "in")
   assert_contains "member IN still resolves + checks in" '"resolution":"resolved"' "$got"
   assert_db       "member IN still writes an attendance row" "1" "$(attendance_count "$PHONE_ACTIVE")"
+
+  trap - EXIT   # 8i already restored Apex to 'suspended'
 fi
 
 # ---------------------------------------------------------------------------

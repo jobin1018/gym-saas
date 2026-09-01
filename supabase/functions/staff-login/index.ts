@@ -60,6 +60,7 @@ import {
   syncUserMetadata,
   syntheticEmail,
 } from "../_shared/staff-session.ts";
+import { ACTIVE_ORG_STATUSES } from "../_shared/org-status.ts";
 
 const TAG = "staff-login";
 
@@ -245,6 +246,29 @@ async function handleLogin(req: Request): Promise<Response> {
     await recordAttempt(admin, organizationId, phone, true);
     console.log(`[${TAG}] correct PIN for DEACTIVATED user ${user.id} (org ${organizationId}) — refusing session.`);
     return json({ ok: false, error: "account_deactivated" }, 403);
+  }
+
+  // --- Suspended org: the PIN is right and the user is active, but the
+  // --- platform subscription is on hold. Checked AFTER the bcrypt compare
+  // --- and the active check, same as account_deactivated, so a wrong PIN
+  // --- still yields the generic invalid_credentials (no org-status oracle).
+  // --- Records a *successful* attempt (the credential was valid) then
+  // --- refuses. Reactivating the org needs no other action — the next
+  // --- attempt succeeds.
+  const { data: org, error: orgErr } = await admin
+    .from("organizations")
+    .select("status")
+    .eq("id", user.organization_id)
+    .maybeSingle();
+  if (orgErr) throw orgErr;
+  if (!org || !(ACTIVE_ORG_STATUSES as readonly string[]).includes((org as any).status)) {
+    await recordAttempt(admin, organizationId, phone, true);
+    console.log(`[${TAG}] correct PIN for user ${user.id} but org ${organizationId} status=${(org as any)?.status} — refusing session.`);
+    return json({
+      ok: false,
+      error: "org_suspended",
+      message: "This gym's subscription is on hold. Please contact support to restore access.",
+    }, 403);
   }
 
   // --- (c) Success. Reset the counter, bridge into a real Auth session. ---

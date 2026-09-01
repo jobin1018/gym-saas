@@ -43,6 +43,7 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { createAdminClient } from "../_shared/supabase.ts";
 import { corsJson as json, corsPreflightResponse } from "../_shared/cors.ts";
+import { orgStatusIsActive } from "../_shared/org-status.ts";
 
 const TAG = "staff-lookup-by-phone";
 
@@ -62,6 +63,7 @@ const PHONE_RE = /^\d{7,15}$/;
 interface Match {
   organization_id: string;
   organization_name: string;
+  organization_status: string;
   name: string;
   role: string;
 }
@@ -88,17 +90,28 @@ async function handleLookup(req: Request): Promise<Response> {
 
   const { data, error } = await admin
     .from("staff_lookup_directory")
-    .select("organization_id, organization_name, name, role")
+    .select("organization_id, organization_name, organization_status, name, role")
     .eq("phone", phone);
 
   if (error) throw error;
 
-  const matches = (data ?? []) as Match[];
+  const all = (data ?? []) as Match[];
+  // Suspended orgs are invisible here — the frontend must not offer them as a
+  // login target. A phone at two gyms, one suspended, sees only the live one.
+  const matches = all.filter((m) => orgStatusIsActive(m.organization_status));
 
   if (matches.length === 0) {
-    // Deliberately generic — this is a pre-login lookup, not a credential
-    // check, but there is still no reason to distinguish "never registered
-    // anywhere" from any other non-match in the response shape.
+    // If every match was a suspended org, say so specifically (this is
+    // pre-PIN — no credential has been checked, so there is no oracle to
+    // protect). Otherwise the generic not_found: no reason to distinguish
+    // "never registered anywhere" from any other non-match.
+    if (all.length > 0) {
+      return json({
+        ok: false,
+        error: "org_suspended",
+        message: "This gym's subscription is on hold. Please contact support to restore access.",
+      }, 403);
+    }
     return json({ ok: false, error: "not_found" }, 404);
   }
 

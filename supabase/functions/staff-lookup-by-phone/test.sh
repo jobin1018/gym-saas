@@ -238,6 +238,17 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 4b. Suspended org — a suspended gym's staff are invisible to the pre-PIN
+#     lookup (org-status enforcement 20260902090000). Apex Strength Co is
+#     seeded status='suspended'; Nisha Raman (919100000001) is ONLY at Apex.
+# ---------------------------------------------------------------------------
+printf '\n%s-- suspended org is hidden --%s\n' "$B" "$N"
+got=$(post 919100000001)
+assert_contains "phone only at a SUSPENDED org -> org_suspended" '"error":"org_suspended"' "$got"
+assert_equals   "  ...403, not 200"                              "403" "$(post_status 919100000001)"
+assert_not_contains "  ...no organization_id is leaked"          '"organization_id"' "$got"
+
+# ---------------------------------------------------------------------------
 # 5. pin_hash must NEVER appear in any response — grepped, not assumed
 # ---------------------------------------------------------------------------
 printf '\n%s-- pin_hash never leaks --%s\n' "$B" "$N"

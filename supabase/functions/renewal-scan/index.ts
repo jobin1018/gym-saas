@@ -29,6 +29,7 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { createAdminClient, type SupabaseClient } from "../_shared/supabase.ts";
 import { authorizeServiceRole, expectedServiceRoleKey } from "../_shared/auth.ts";
+import { ACTIVE_ORG_STATUSES } from "../_shared/org-status.ts";
 
 const TAG = "renewal-scan";
 
@@ -91,7 +92,11 @@ const REMINDER_FUNCTION = "send-renewal-reminder";
 const MEMBERSHIP_SELECT =
   "id,organization_id,member_id,plan_id,status,current_period_end," +
   "members(id,name,phone,whatsapp_opt_in)," +
-  "membership_plans(id,name,amount)";
+  "membership_plans(id,name,amount)," +
+  // !inner + the .in() filter below drops any membership whose org is
+  // suspended — a frozen tenant sends nobody a reminder. Same exclusion
+  // daily-owner-brief already applies to its org list.
+  "organizations!inner(status)";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -278,6 +283,7 @@ async function selectDueMemberships(
     .from("memberships")
     .select(MEMBERSHIP_SELECT)
     .in("status", SCAN_STATUSES as unknown as string[])
+    .in("organizations.status", ACTIVE_ORG_STATUSES as unknown as string[])
     .in("current_period_end", dates)
     .order("current_period_end", { ascending: true })
     .order("id", { ascending: true }) // stable tiebreak, so runs are reproducible
