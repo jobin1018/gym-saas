@@ -533,6 +533,7 @@ else
   assert_contains "unknown owner command falls back to owner HELP" "Commands — Apex Strength Co." "$r"
   assert_contains "owner HELP lists REVENUE"             "REVENUE" "$r"
   assert_contains "owner HELP lists LAPSED"              "LAPSED" "$r"
+  assert_contains "owner HELP lists SESSION (coach cmd)" "SESSION  — coach command" "$r"
   case "$r" in
     *"Reply IN to check in"*) bad "owner HELP must not show member help text" "no member copy" "$r" ;;
     *) ok "owner HELP does not leak member-facing copy" ;;
@@ -580,6 +581,7 @@ else
   send_cmd "$PHONE_COACH" c-rev "REVENUE"
   r=$(last_out_org "$ORG_APEX")
   assert_contains "a coach texting an owner command gets coach help" "reply MYCLIENTS" "$r"
+  assert_contains "coach help mentions SESSION / LOG"               "SESSION (alias: LOG)" "$r"
   assert_contains "coach help says owner reports are owner-only"     "owner-only" "$r"
   case "$r" in
     *"Revenue —"*) bad "coach must not receive the owner REVENUE report" "coach help" "$r" ;;

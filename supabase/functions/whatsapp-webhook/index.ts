@@ -1057,6 +1057,7 @@ function ownerHelp(orgName: string): string {
     `COACHES  — each coach's client count + logging activity`,
     `LAPSED   — members with no check-in for 14+ days`,
     `NEW      — members who joined this month`,
+    `SESSION  — coach command: a link to log a training session (alias: LOG)`,
     `HELP     — this list`,
   ].join("\n");
 }
@@ -1160,7 +1161,7 @@ async function coachStartSession(
 }
 
 function coachHelp(coachName: string): string {
-  return `🏋️ ${coachName} — reply MYCLIENTS for your active client list (name, goal, sessions used/purchased), or SESSION for a link to log a session. Owner reports (REVENUE, ALERTS, etc.) are owner-only.`;
+  return `🏋️ ${coachName} — reply MYCLIENTS for your active client list (name, goal, sessions used/purchased), or SESSION (alias: LOG) for a link to log a training session. Owner reports (REVENUE, ALERTS, etc.) are owner-only.`;
 }
 
 // --- dispatcher: owns the whole request for an owner/coach sender -------
