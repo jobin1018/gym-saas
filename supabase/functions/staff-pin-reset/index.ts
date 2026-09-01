@@ -61,6 +61,7 @@ interface CallerUser {
   id: string;
   organization_id: string;
   role: string;
+  active: boolean;
 }
 
 interface TargetUser {
@@ -85,7 +86,7 @@ async function resolveCaller(
 
   const { data: row, error: rowErr } = await admin
     .from("users")
-    .select("id, organization_id, role")
+    .select("id, organization_id, role, active")
     .eq("auth_user_id", data.user.id)
     .maybeSingle();
 
@@ -124,6 +125,11 @@ async function handleReset(req: Request): Promise<Response> {
   const caller = await resolveCaller(admin, req);
   if (!caller) {
     return json({ ok: false, error: "unauthenticated" }, 401);
+  }
+  // A just-deactivated owner whose access token has not expired must not keep
+  // acting (users.active added in 20260901090000).
+  if (!caller.active) {
+    return json({ ok: false, error: "caller_deactivated" }, 403);
   }
   if (caller.role !== "owner") {
     return json({ ok: false, error: "not_owner" }, 403);

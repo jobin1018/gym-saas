@@ -510,6 +510,16 @@ verify_jwt = true
 import_map = "./functions/staff-pin-reset/deno.json"
 entrypoint = "./functions/staff-pin-reset/index.ts"
 
+[functions.staff-manage]
+enabled = true
+# Same trust model as staff-pin-reset: an owner creates / deactivates /
+# reactivates staff in their OWN org using their own staff-login session
+# token. verify_jwt = true gates the door; the function re-validates the
+# token and reads role/org/active from public.users, never from the claims.
+verify_jwt = true
+import_map = "./functions/staff-manage/deno.json"
+entrypoint = "./functions/staff-manage/index.ts"
+
 [functions.razorpay-webhook]
 enabled = true
 # Razorpay authenticates with X-Razorpay-Signature (HMAC), not a Supabase JWT.

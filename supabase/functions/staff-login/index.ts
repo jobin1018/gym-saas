@@ -92,6 +92,7 @@ interface UserRow {
   role: string;
   location_id: string | null;
   pin_hash: string | null;
+  active: boolean;
 }
 
 async function findUser(
@@ -101,7 +102,7 @@ async function findUser(
 ): Promise<UserRow | null> {
   const { data, error } = await supabase
     .from("users")
-    .select("id, organization_id, auth_user_id, name, role, location_id, pin_hash")
+    .select("id, organization_id, auth_user_id, name, role, location_id, pin_hash, active")
     .eq("organization_id", organizationId)
     .eq("phone", phone)
     .maybeSingle();
@@ -393,6 +394,18 @@ async function handleLogin(req: Request): Promise<Response> {
   if (!user || !user.pin_hash || !pinMatches) {
     await recordAttempt(admin, organizationId, phone, false);
     return json({ ok: false, error: "invalid_credentials" }, 401);
+  }
+
+  // --- Deactivated staff: PIN is right, but access was revoked. Checked
+  // --- AFTER the bcrypt compare so a wrong PIN still returns the generic
+  // --- invalid_credentials (no "account exists but is disabled" oracle);
+  // --- only a correct PIN gets the explicit reason. Records a *successful*
+  // --- attempt (the credential was valid — clears any lockout counter) then
+  // --- refuses to mint a session.
+  if (!user.active) {
+    await recordAttempt(admin, organizationId, phone, true);
+    console.log(`[${TAG}] correct PIN for DEACTIVATED user ${user.id} (org ${organizationId}) — refusing session.`);
+    return json({ ok: false, error: "account_deactivated" }, 403);
   }
 
   // --- (c) Success. Reset the counter, bridge into a real Auth session. ---

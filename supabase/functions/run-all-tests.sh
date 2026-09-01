@@ -32,6 +32,7 @@ SUITES=(
   staff-login
   staff-lookup-by-phone
   staff-pin-reset
+  staff-manage
 )
 
 if [ -t 1 ]; then
