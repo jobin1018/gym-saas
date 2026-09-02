@@ -1088,19 +1088,27 @@ async function ownerNew(supabase: SupabaseClient, org: string, orgName: string):
   return lines.join("\n");
 }
 
-function ownerHelp(orgName: string): string {
+function ownerHelp(): string {
   return [
-    `🤖 Commands — ${orgName}`,
-    `REVENUE  — this month's total + membership/PT split, vs last month`,
-    `ALERTS   — overdue + PT-attention summary`,
-    `TODAY    — check-ins, renewals due, PT sessions, failed sends (24h)`,
-    `OVERDUE  — every past-due member: name, amount, days late`,
-    `PT       — active packages, PT revenue, low/expiring list`,
-    `COACHES  — each coach's client count + logging activity`,
-    `LAPSED   — members with no check-in for 14+ days`,
-    `NEW      — members who joined this month`,
-    `SESSION  — coach command: a link to log a training session (alias: LOG)`,
-    `HELP     — this list`,
+    `*Here's what you can ask me* 📋`,
+    ``,
+    `*Money*`,
+    `*REVENUE* — this month's income`,
+    `*OVERDUE* — who hasn't paid`,
+    ``,
+    `*Your Business*`,
+    `*ALERTS* — everything that needs attention right now`,
+    `*TODAY* — check-ins, payments, joins since midnight`,
+    `*NEW* — who joined this week`,
+    `*LAPSED* — members who've drifted away`,
+    ``,
+    `*Team*`,
+    `*COACHES* — who's active, who's gone quiet`,
+    `*PT* — packages running low or expiring`,
+    ``,
+    `Just text the word — no need for anything else.`,
+    ``,
+    `Powered by Gymdean`,
   ].join("\n");
 }
 
@@ -1119,7 +1127,7 @@ async function handleOwnerCommand(
     case "coaches": return await ownerCoaches(supabase, org, orgName);
     case "lapsed": return await ownerLapsed(supabase, org, orgName);
     case "new": return await ownerNew(supabase, org, orgName);
-    default: return ownerHelp(orgName);
+    default: return ownerHelp();
   }
 }
 

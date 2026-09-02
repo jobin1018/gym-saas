@@ -536,15 +536,47 @@ else
   assert_contains "NEW caps the list at 10 with +N more" "+2 more" "$r"
 
   # --- 8b. HELP + unknown-owner-command fallback (owner-tailored) ---
+  # Text content per the reformat spec — grouped, bold-anchored, blank line
+  # between groups, no org name (a shared reference card now, not a per-org
+  # header). Checked group-by-group and line-by-line rather than as one huge
+  # multi-line literal, so a single wrong line points straight at itself.
   send_cmd "$PHONE_OWNER" o-hlp "zzznotacommand"
   r=$(last_out_org "$ORG_APEX")
-  assert_contains "unknown owner command falls back to owner HELP" "Commands — Apex Strength Co." "$r"
-  assert_contains "owner HELP lists REVENUE"             "REVENUE" "$r"
-  assert_contains "owner HELP lists LAPSED"              "LAPSED" "$r"
-  assert_contains "owner HELP lists SESSION (coach cmd)" "SESSION  — coach command" "$r"
+  assert_contains "unknown owner command falls back to owner HELP" "*Here's what you can ask me* 📋" "$r"
+
+  assert_contains "owner HELP has the Money heading"     $'\n*Money*\n' "$r"
+  assert_contains "owner HELP lists REVENUE"             "*REVENUE* — this month's income" "$r"
+  assert_contains "owner HELP lists OVERDUE"             "*OVERDUE* — who hasn't paid" "$r"
+
+  assert_contains "owner HELP has the Your Business heading" $'\n*Your Business*\n' "$r"
+  assert_contains "owner HELP lists ALERTS"              "*ALERTS* — everything that needs attention right now" "$r"
+  assert_contains "owner HELP lists TODAY"               "*TODAY* — check-ins, payments, joins since midnight" "$r"
+  assert_contains "owner HELP lists NEW"                 "*NEW* — who joined this week" "$r"
+  assert_contains "owner HELP lists LAPSED"              "*LAPSED* — members who've drifted away" "$r"
+
+  assert_contains "owner HELP has the Team heading"      $'\n*Team*\n' "$r"
+  assert_contains "owner HELP lists COACHES"             "*COACHES* — who's active, who's gone quiet" "$r"
+  assert_contains "owner HELP lists PT"                  "*PT* — packages running low or expiring" "$r"
+
+  assert_contains "owner HELP closes with the footer"    "Just text the word — no need for anything else." "$r"
+  assert_contains "owner HELP is Gymdean-branded"        "Powered by Gymdean" "$r"
+
+  # Blank-line grouping and heading→first-command adjacency, spot-checked
+  # rather than re-deriving the whole literal.
+  assert_contains "Money's REVENUE line follows immediately" $'*Money*\n*REVENUE*' "$r"
+  assert_contains "Team's COACHES line follows immediately"  $'*Team*\n*COACHES*' "$r"
+
   case "$r" in
     *"Reply IN to check in"*) bad "owner HELP must not show member help text" "no member copy" "$r" ;;
     *) ok "owner HELP does not leak member-facing copy" ;;
+  esac
+  case "$r" in
+    *"Commands — Apex Strength Co."*) bad "owner HELP dropped the old per-org header" "no org-name header" "$r" ;;
+    *) ok "owner HELP no longer shows the old per-org header" ;;
+  esac
+  case "$r" in
+    *"SESSION"*) bad "owner HELP must not mention the coach-only SESSION command" "no SESSION" "$r" ;;
+    *) ok "owner HELP does not mention SESSION (coach-only, not owner-facing)" ;;
   esac
 
   # --- 8b'. co-owners: a second users role='owner' at the same gym (own
@@ -559,7 +591,7 @@ else
   assert_equals   "both co-owners see byte-identical data" "$r_primary" "$r_coowner"
   send_cmd "$PHONE_COOWNER" co-c "zzznope"
   assert_contains "co-owner unknown command -> owner HELP (routed as owner, not not_found)" \
-    "Commands — Apex Strength Co." "$(last_out_org "$ORG_APEX")"
+    "*Here's what you can ask me* 📋" "$(last_out_org "$ORG_APEX")"
 
   # --- 8c. coach path ---
   send_cmd "$PHONE_COACH" c-my "MYCLIENTS"
