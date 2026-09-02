@@ -38,6 +38,10 @@ LOC_FLEX=bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb
 # "the org's only location"). Cleaned up by reset_state().
 LOC_IRON_2=0daded00-1111-0000-0000-000000000002
 MEMBER_LOC2=0daded00-1111-0000-0000-0000000000a2
+# A membership + payment for MEMBER_LOC2 (HSR Layout) — section 14's proof that
+# v_payments_ledger excludes another location's transactions for front_desk.
+MEMBERSHIP_LOC2=0daded00-1111-0000-0000-0000000000b2
+PAYMENT_LOC2=0daded00-1111-0000-0000-0000000000c2
 
 PASS=0; FAIL=0; SKIP=0
 FAILED_CASES=()
@@ -147,6 +151,23 @@ rest_range() {
     | tr -d '\r' | sed -n 's/^[Cc]ontent-[Rr]ange: *//p'
 }
 
+# rest_page <token> <path-and-query> <start-end> -> response body for that page.
+# The HTTP Range header IS what supabase-js's .range(from, to) sends on the
+# wire — same mechanism coachWrites.getSessionHistory() already uses.
+rest_page() {
+  curl -s "$REST_URL/$2" \
+    -H "apikey: $ANON_KEY" -H "Authorization: Bearer $1" \
+    -H 'Prefer: count=exact' -H "Range-Unit: items" -H "Range: $3"
+}
+
+# rest_page_range <token> <path-and-query> <start-end> -> the Content-Range value for that page
+rest_page_range() {
+  curl -s -D - -o /dev/null "$REST_URL/$2" \
+    -H "apikey: $ANON_KEY" -H "Authorization: Bearer $1" \
+    -H 'Prefer: count=exact' -H "Range-Unit: items" -H "Range: $3" \
+    | tr -d '\r' | sed -n 's/^[Cc]ontent-[Rr]ange: *//p'
+}
+
 # count_rows <json-array-body> -> number of elements (crude but dependency-free)
 count_rows() {
   local body="$1"
@@ -164,6 +185,7 @@ count_rows() {
 reset_state() {
   $have_psql || return 0
   docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+DELETE FROM payments WHERE id = '$PAYMENT_LOC2';
 DELETE FROM attendance WHERE member_id = '$MEMBER_LOC2';
 DELETE FROM memberships WHERE member_id = '$MEMBER_LOC2';
 DELETE FROM members WHERE id = '$MEMBER_LOC2';
@@ -216,6 +238,16 @@ VALUES ('$LOC_IRON_2', '$ORG_IRON', 'Iron Temple — HSR Layout');
 
 INSERT INTO members (id, organization_id, location_id, name, phone, whatsapp_opt_in, source)
 VALUES ('$MEMBER_LOC2', '$ORG_IRON', '$LOC_IRON_2', 'Second-Location Test Member', '919000055501', true, 'manual');
+
+-- A reconciled membership payment at HSR Layout, for section 14
+-- (v_payments_ledger) — front_desk @ Indiranagar must never see it.
+INSERT INTO memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end)
+VALUES ('$MEMBERSHIP_LOC2', '$ORG_IRON', '$MEMBER_LOC2', 'cccccccc-cccc-cccc-cccc-cccccccccccc',
+        'active', CURRENT_DATE, CURRENT_DATE + 30);
+INSERT INTO payments (id, organization_id, membership_id, amount, provider, provider_payment_id,
+                      status, idempotency_key, reconciled_at)
+VALUES ('$PAYMENT_LOC2', '$ORG_IRON', '$MEMBERSHIP_LOC2', 1500.00, 'razorpay', 'pay_rlstest_loc2',
+        'success', 'rls-test-loc2-payment', now());
 
 UPDATE organizations SET gst_number = '29AAAAA0000A1Z5' WHERE id = '$ORG_IRON';
 
@@ -840,6 +872,108 @@ assert_equals "reactivated: FlexFit owner sees members again" "1" \
   "$([ "$(count_rows "$(rest "$SANJAY" "members?organization_id=eq.$ORG_FLEX&select=id&limit=1")")" -ge 1 ] && echo 1 || echo 0)"
 assert_equals "reactivated: FlexFit owner reads own org row again: 200" "200" \
   "$(rest_status "$SANJAY" "organizations?id=eq.$ORG_FLEX&select=id")"
+
+# ---------------------------------------------------------------------------
+# 14. v_payments_ledger — the deliberate front_desk-read reversal
+#     (migration 20260903090000). Expected counts are computed FRESH from the
+#     DB right here rather than hardcoded from the seed, because by this point
+#     in the suite earlier sections (8-11's coaching fixtures especially) have
+#     already created additional payments via the pt_packages_record_payment
+#     trigger — the view is cross-checked against ground truth, not a stale
+#     literal. arrange_fixtures() at the top added exactly ONE payment at HSR
+#     Layout (PAYMENT_LOC2, status success, type membership) — the
+#     front_desk-exclusion proof, since Priya is at Indiranagar.
+# ---------------------------------------------------------------------------
+printf '\n%s-- v_payments_ledger (owner org-wide, front_desk location-scoped) --%s\n' "$B" "$N"
+
+IRON_TOTAL=$(sql "select count(*) from payments where organization_id='$ORG_IRON';")
+IRON_INDIRANAGAR=$(sql "select count(*) from payments p
+  left join memberships ms on ms.id=p.membership_id
+  left join pt_packages pk on pk.id=p.pt_package_id
+  join members m on m.id = coalesce(ms.member_id, pk.member_id)
+  where p.organization_id='$ORG_IRON' and m.location_id='$LOC_IRON';")
+IRON_PT=$(sql "select count(*) from payments where organization_id='$ORG_IRON' and pt_package_id is not null;")
+IRON_MEMBERSHIP=$(sql "select count(*) from payments where organization_id='$ORG_IRON' and membership_id is not null;")
+IRON_INDIRANAGAR_PT=$(sql "select count(*) from payments p
+  join pt_packages pk on pk.id=p.pt_package_id join members m on m.id=pk.member_id
+  where p.organization_id='$ORG_IRON' and m.location_id='$LOC_IRON';")
+IRON_SUCCESS=$(sql "select count(*) from payments where organization_id='$ORG_IRON' and status='success';")
+IRON_FAILED=$(sql "select count(*) from payments where organization_id='$ORG_IRON' and status='failed';")
+
+assert_equals "owner sees ALL Iron payments (ground truth: $IRON_TOTAL)" "$IRON_TOTAL" \
+  "$(count_rows "$(rest "$RAVI" "v_payments_ledger?organization_id=eq.$ORG_IRON&select=id")")"
+assert_equals "front_desk @ Indiranagar sees only their location's payments" "$IRON_INDIRANAGAR" \
+  "$(count_rows "$(rest "$PRIYA" "v_payments_ledger?organization_id=eq.$ORG_IRON&select=id")")"
+assert_not_contains "front_desk does NOT see the HSR Layout payment" "$PAYMENT_LOC2" \
+  "$(rest "$PRIYA" "v_payments_ledger?select=id")"
+assert_contains "owner DOES see the HSR Layout payment" "$PAYMENT_LOC2" \
+  "$(rest "$RAVI" "v_payments_ledger?select=id")"
+assert_equals "a coach session has no path to the ledger at all" "0" \
+  "$(count_rows "$(rest "$FARAH" "v_payments_ledger?select=id")")"
+assert_equals "front_desk sees no OTHER location's payments in the ledger (base-table probe)" "0" \
+  "$(count_rows "$(rest "$PRIYA" "payments?organization_id=eq.$ORG_IRON&select=id")")"
+
+# --- payment_type: membership vs personal_training, derived from the XOR FK ---
+assert_equals "owner: personal_training count matches pt_package_id IS NOT NULL" "$IRON_PT" \
+  "$(count_rows "$(rest "$RAVI" "v_payments_ledger?organization_id=eq.$ORG_IRON&payment_type=eq.personal_training&select=id")")"
+assert_equals "owner: membership count matches membership_id IS NOT NULL" "$IRON_MEMBERSHIP" \
+  "$(count_rows "$(rest "$RAVI" "v_payments_ledger?organization_id=eq.$ORG_IRON&payment_type=eq.membership&select=id")")"
+assert_equals "front_desk: personal_training at their own location" "$IRON_INDIRANAGAR_PT" \
+  "$(count_rows "$(rest "$PRIYA" "v_payments_ledger?payment_type=eq.personal_training&select=id")")"
+
+# --- status filter ---
+assert_equals "owner: status=success matches ground truth" "$IRON_SUCCESS" \
+  "$(count_rows "$(rest "$RAVI" "v_payments_ledger?organization_id=eq.$ORG_IRON&status=eq.success&select=id")")"
+assert_equals "owner: status=failed matches ground truth" "$IRON_FAILED" \
+  "$(count_rows "$(rest "$RAVI" "v_payments_ledger?organization_id=eq.$ORG_IRON&status=eq.failed&select=id")")"
+
+# --- location filter (multi-branch owner narrowing to one branch) ---
+assert_equals "owner: location_id filter to HSR Layout == 1 (just the fixture)" "1" \
+  "$(count_rows "$(rest "$RAVI" "v_payments_ledger?location_id=eq.$LOC_IRON_2&select=id")")"
+
+# --- date range filter — the fixture payment reconciled at now() ---
+TODAY_UTC=$(sql "select to_char(now(),'YYYY-MM-DD');")
+TOMORROW_UTC=$(sql "select to_char(now() + interval '1 day','YYYY-MM-DD');")
+assert_contains "date range: gte today includes the just-reconciled fixture" "$PAYMENT_LOC2" \
+  "$(rest "$RAVI" "v_payments_ledger?transaction_date=gte.${TODAY_UTC}&select=id")"
+assert_not_contains "date range: gte tomorrow excludes it" "$PAYMENT_LOC2" \
+  "$(rest "$RAVI" "v_payments_ledger?transaction_date=gte.${TOMORROW_UTC}&select=id")"
+
+# --- pagination: HTTP Range + Prefer: count=exact, the wire shape of
+#     supabase-js .range(), same mechanism coachWrites.getSessionHistory()
+#     already uses. Deterministic order is required for stable pages. ---
+ORDERED="v_payments_ledger?organization_id=eq.$ORG_IRON&order=transaction_date.desc,id.desc&select=id"
+range1=$(rest_page_range "$RAVI" "$ORDERED" "0-4")
+assert_equals "page 1 (items 0-4) Content-Range reports the true total" "0-4/$IRON_TOTAL" "$range1"
+page1_ids=$(rest_page "$RAVI" "$ORDERED" "0-4")
+page2_ids=$(rest_page "$RAVI" "$ORDERED" "5-9")
+assert_equals "page 1 returns exactly 5 rows" "5" "$(count_rows "$page1_ids")"
+assert_equals "page 2 returns exactly 5 rows" "5" "$(count_rows "$page2_ids")"
+overlap=$(comm -12 \
+  <(printf '%s' "$page1_ids" | grep -o '"id":"[^"]*"' | sort) \
+  <(printf '%s' "$page2_ids" | grep -o '"id":"[^"]*"' | sort) | wc -l | tr -d ' ')
+assert_equals "page 1 and page 2 are disjoint (no dupes, no gaps in ordering)" "0" "$overlap"
+LAST_START=$((IRON_TOTAL - 2))
+last_range=$(rest_page_range "$RAVI" "$ORDERED" "${LAST_START}-9999")
+assert_equals "a final short page still reports the true total, not the page size" \
+  "${LAST_START}-$((IRON_TOTAL - 1))/$IRON_TOTAL" "$last_range"
+
+# --- cross-org isolation ---
+assert_equals "FlexFit owner sees ZERO Iron payments" "0" \
+  "$(count_rows "$(rest "$SANJAY" "v_payments_ledger?organization_id=eq.$ORG_IRON&select=id")")"
+assert_not_contains "FlexFit owner's own ledger never contains an Iron payment id" "$PAYMENT_LOC2" \
+  "$(rest "$SANJAY" "v_payments_ledger?select=id")"
+
+# --- the reversal is READ only: front_desk still cannot write a payment ---
+assert_equals "front_desk INSERT into payments is still blocked (no grant)" "403" \
+  "$(rest_post_status "$PRIYA" "payments" "{\"organization_id\":\"$ORG_IRON\",\"membership_id\":\"$MEMBERSHIP_LOC2\",\"amount\":1,\"provider\":\"manual\",\"status\":\"success\",\"idempotency_key\":\"rls-test-frontdesk-write-attempt\"}")"
+
+# --- and it did not leak into the revenue dashboards (the exact regression
+#     this design avoids — see the migration's DESIGN NOTE) ---
+assert_equals "front_desk STILL sees zero rows in v_daily_revenue_by_source" "0" \
+  "$(count_rows "$(rest "$PRIYA" "v_daily_revenue_by_source?organization_id=eq.$ORG_IRON&select=total")")"
+assert_equals "front_desk STILL sees zero rows in v_daily_revenue" "0" \
+  "$(count_rows "$(rest "$PRIYA" "v_daily_revenue?organization_id=eq.$ORG_IRON&select=total")")"
 
 # ---------------------------------------------------------------------------
 # Summary

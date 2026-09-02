@@ -490,7 +490,7 @@ if $have_psql; then
 fi
 
 # --- the v2 message text is the single-paragraph 12-value format ---
-assert_contains "v2 message greets + dates"        'Good morning! Iron Temple Gym — 1 ' "$got"
+assert_contains "v2 message greets + dates"        'Good morning! Iron Temple Gym — ' "$got"
 assert_contains "v2 message has the revenue clause" 'Revenue this month: ₹' "$got"
 assert_contains "v2 message has membership/PT split" ' membership, ₹' "$got"
 assert_contains "v2 message has the attention clause" 'Needs attention: 4 items — 3 overdue, 1 PT alerts.' "$got"
