@@ -442,6 +442,99 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 8. Auto-unfreeze (20260904090000_membership_freezing.sql) — four throwaway
+#    memberships, entirely separate from MEM_ASHA/BHARAT/CHITRA_* above, so
+#    this section cannot interfere with the boundary fixtures. Cleaned up in
+#    reset_state() below (added there) and again at the very end.
+# ---------------------------------------------------------------------------
+printf '\n%s-- auto-unfreeze --%s\n' "$B" "$N"
+
+FREEZE_MEMBER=e1111111-1111-1111-1111-111111111111   # Asha's member row — a
+                                                       # member CAN carry more
+                                                       # than one membership.
+F_DUE=0daded00-2222-0000-0000-0000000000f1     # frozen, due today
+F_NOT_DUE=0daded00-2222-0000-0000-0000000000f2 # frozen, NOT yet due
+F_STALE=0daded00-2222-0000-0000-0000000000f3   # frozen, stale period end, not due
+F_ORDER=0daded00-2222-0000-0000-0000000000f4   # unfreezes still-overdue (sequencing proof)
+
+if ! $have_psql; then
+  skipped "auto-unfreeze" "requires docker/psql"
+else
+  arrange_freezes() {
+    docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+INSERT INTO memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end) VALUES
+  ('$F_DUE',     '$ORG_IRON', '$FREEZE_MEMBER', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'frozen', CURRENT_DATE - 90, CURRENT_DATE + 5),
+  ('$F_NOT_DUE', '$ORG_IRON', '$FREEZE_MEMBER', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'frozen', CURRENT_DATE - 90, CURRENT_DATE + 5),
+  ('$F_STALE',   '$ORG_IRON', '$FREEZE_MEMBER', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'frozen', CURRENT_DATE - 90, CURRENT_DATE - 40),
+  ('$F_ORDER',   '$ORG_IRON', '$FREEZE_MEMBER', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'frozen', CURRENT_DATE - 90, CURRENT_DATE - 20);
+
+INSERT INTO membership_freezes (organization_id, membership_id, frozen_from, frozen_until, days, created_by) VALUES
+  -- Backdated 20 days but requested only 12 (frozen_until = frozen_from +
+  -- days = today-8, already due) — proves the shift uses the STORED days,
+  -- not (today - frozen_from), which would be 20, not 12.
+  ('$ORG_IRON', '$F_DUE',     CURRENT_DATE - 20, CURRENT_DATE - 8, 12, (SELECT id FROM users WHERE phone='919000000001' AND organization_id='$ORG_IRON')),
+  -- Frozen until well into the future — must be left alone entirely.
+  ('$ORG_IRON', '$F_NOT_DUE', CURRENT_DATE - 5,  CURRENT_DATE + 25, 30, (SELECT id FROM users WHERE phone='919000000001' AND organization_id='$ORG_IRON')),
+  -- Also not yet due — current_period_end is stale/"overdue-looking" but that
+  -- must never matter while status='frozen'.
+  ('$ORG_IRON', '$F_STALE',   CURRENT_DATE - 5,  CURRENT_DATE + 25, 30, (SELECT id FROM users WHERE phone='919000000001' AND organization_id='$ORG_IRON')),
+  -- Due today, but the +3 day credit does not reach current_period_end back
+  -- into the future (it was -20 before freezing) — must land 'past_due' by
+  -- the END of this SAME mark-overdue run, not stay 'active' until tomorrow.
+  ('$ORG_IRON', '$F_ORDER',   CURRENT_DATE - 3,  CURRENT_DATE, 3, (SELECT id FROM users WHERE phone='919000000001' AND organization_id='$ORG_IRON'));
+SQL
+  }
+  teardown_freezes() {
+    docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+DELETE FROM membership_freezes WHERE membership_id IN ('$F_DUE','$F_NOT_DUE','$F_STALE','$F_ORDER');
+DELETE FROM memberships WHERE id IN ('$F_DUE','$F_NOT_DUE','$F_STALE','$F_ORDER');
+SQL
+  }
+
+  teardown_freezes   # defensive: clear any leak from a previously aborted run
+  arrange_freezes
+
+  # --- dry_run: reports correctly, writes nothing ---
+  got=$(post '{"dry_run":true}')
+  assert_contains "dry run: F_DUE is in would_unfreeze"     "$F_DUE" "$got"
+  assert_not_contains "dry run: F_NOT_DUE is NOT due yet"   "$F_NOT_DUE" "$got"
+  assert_db "dry run touched nothing: F_DUE still frozen"   "frozen" "$(status_of "$F_DUE")"
+  assert_db "dry run touched nothing: F_DUE's date is unchanged" \
+    "$(sql "select (CURRENT_DATE + 5)::text;")" "$(sql "select current_period_end from memberships where id='$F_DUE';")"
+
+  # --- real run ---
+  got=$(post '{}')
+  assert_contains "real run: F_DUE was auto-unfrozen"       "$F_DUE" "$got"
+  assert_not_contains "real run: F_NOT_DUE was left alone"  "\"$F_NOT_DUE\"" "$got"
+
+  assert_db "F_DUE is active again"                  "active" "$(status_of "$F_DUE")"
+  assert_db "F_DUE shifted by the STORED days (12), not the 20 elapsed" \
+    "$(sql "select (CURRENT_DATE + 5 + 12)::text;")" "$(sql "select current_period_end from memberships where id='$F_DUE';")"
+  assert_db "F_DUE's freeze row reactivated_at is STILL NULL (auto-unfreeze, not manual)" \
+    "" "$(sql "select reactivated_at from membership_freezes where membership_id='$F_DUE';")"
+
+  assert_db "F_NOT_DUE is still frozen (not due yet)"       "frozen" "$(status_of "$F_NOT_DUE")"
+  assert_db "F_NOT_DUE's date is untouched"                 "$(sql "select (CURRENT_DATE + 5)::text;")" \
+    "$(sql "select current_period_end from memberships where id='$F_NOT_DUE';")"
+
+  assert_db "F_STALE stays frozen — a stale current_period_end is irrelevant while frozen" \
+    "frozen" "$(status_of "$F_STALE")"
+
+  # --- the sequencing proof: F_ORDER unfreezes AND is caught by the overdue
+  #     scan in this SAME invocation, ending 'past_due' not 'active' ---
+  assert_db "F_ORDER ends the run past_due (unfreeze-then-scan, same run)" \
+    "past_due" "$(status_of "$F_ORDER")"
+  assert_db "F_ORDER's date reflects the +3 day credit (still in the past)" \
+    "$(sql "select (CURRENT_DATE - 20 + 3)::text;")" "$(sql "select current_period_end from memberships where id='$F_ORDER';")"
+
+  # --- re-running is a no-op: nothing left to unfreeze ---
+  got=$(post '{}')
+  assert_equals "second run finds nothing left to unfreeze" "0" "$(field_num unfrozen "$got")"
+
+  teardown_freezes
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 reset_state

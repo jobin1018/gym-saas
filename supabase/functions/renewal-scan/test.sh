@@ -69,6 +69,14 @@ BAD_PLAN=0badbad0-0000-0000-0000-000000000001
 BAD_MEMBER=0badbad0-0000-0000-0000-000000000002
 BAD_MEMBERSHIP=0badbad0-0000-0000-0000-000000000003
 
+# Throwaway 'frozen' membership, right on the +7 offset — proves frozen
+# memberships are excluded from the scan (see the header note in
+# 20260904090000_membership_freezing.sql: SCAN_STATUSES=['active','past_due']
+# is a whitelist, so 'frozen' was never reachable, no code change needed —
+# this is the regression guard for that fact).
+FROZEN_MEMBER=0f00ba11-0000-0000-0000-000000000001
+FROZEN_MEMBERSHIP=0f00ba11-0000-0000-0000-000000000002
+
 PASS=0; FAIL=0; SKIP=0
 FAILED_CASES=()
 
@@ -195,6 +203,8 @@ DELETE FROM payments WHERE idempotency_key LIKE 'renewal-%';
 DELETE FROM memberships     WHERE id = '$BAD_MEMBERSHIP';
 DELETE FROM members         WHERE id = '$BAD_MEMBER';
 DELETE FROM membership_plans WHERE id = '$BAD_PLAN';
+DELETE FROM memberships     WHERE id = '$FROZEN_MEMBERSHIP';
+DELETE FROM members         WHERE id = '$FROZEN_MEMBER';
 UPDATE memberships SET status='active',   current_period_end=CURRENT_DATE + 20 WHERE id='$MEM_ASHA';
 UPDATE memberships SET status='past_due', current_period_end=CURRENT_DATE - 10 WHERE id='$MEM_BHARAT';
 UPDATE memberships SET status='active',   current_period_end=CURRENT_DATE + 25 WHERE id='$MEM_CHITRA_IT';
@@ -262,6 +272,23 @@ INSERT INTO memberships (id, organization_id, member_id, plan_id, status, start_
 VALUES ('$BAD_MEMBERSHIP', '$ORG_IRON', '$BAD_MEMBER', '$BAD_PLAN', 'active',
         CURRENT_DATE - 30, CURRENT_DATE + 7)
 ON CONFLICT (id) DO UPDATE SET current_period_end = CURRENT_DATE + 7, status = 'active';
+SQL
+}
+
+# A throwaway membership sitting right on the +7 offset, but 'frozen'.
+# Reuses $BAD_PLAN (Iron Temple, real amount not required since dry_run never
+# reaches send-renewal-reminder for this test) so no extra plan row is needed.
+add_frozen_membership() {
+  $have_psql || return 0
+  docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+INSERT INTO members (id, organization_id, location_id, name, phone, whatsapp_opt_in, source)
+VALUES ('$FROZEN_MEMBER', '$ORG_IRON', '$LOC_IRON', 'Frozen Window Tester', '915555500002', true, 'manual')
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end)
+SELECT '$FROZEN_MEMBERSHIP', '$ORG_IRON', '$FROZEN_MEMBER', mp.id, 'frozen',
+       CURRENT_DATE - 30, CURRENT_DATE + 7
+  FROM membership_plans mp WHERE mp.organization_id = '$ORG_IRON' LIMIT 1
+ON CONFLICT (id) DO UPDATE SET current_period_end = CURRENT_DATE + 7, status = 'frozen';
 SQL
 }
 
@@ -591,6 +618,37 @@ else
 
   got=$(post '{"dry_run":true}')
   assert_contains "an unlimited scan is not flagged truncated" '"truncated":false' "$got"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Frozen memberships are skipped
+# ---------------------------------------------------------------------------
+# SCAN_STATUSES=['active','past_due'] is a whitelist, so a membership in any
+# OTHER status — 'frozen' included — was never reachable here, and this
+# section required zero changes to renewal-scan itself. This is purely a
+# regression guard for that fact (see the header note in
+# 20260904090000_membership_freezing.sql for the full reasoning).
+printf '\n%s-- frozen memberships --%s\n' "$B" "$N"
+
+if ! $have_psql; then
+  skipped "a frozen membership on-offset is excluded from the scan" "requires docker/psql"
+else
+  reset_state
+  arrange_window
+  add_frozen_membership
+
+  got=$(post '{"dry_run":true,"offsets":[7]}')
+
+  # Not asserting an exact matched count here — seed.sql's own +7 fixtures
+  # (Sneha included) are untouched by this section, so the count is whatever
+  # the ambient in-window population is. What matters: Asha (positive
+  # control) is in, the frozen membership at the identical offset is not.
+  assert_contains "Asha (active, +7) is still included as a positive control" \
+    "\"membership_id\":\"$MEM_ASHA\"" "$got"
+  assert_not_contains "the frozen membership at the same offset is excluded" \
+    "$FROZEN_MEMBERSHIP" "$got"
+
+  reset_state
 fi
 
 # ---------------------------------------------------------------------------

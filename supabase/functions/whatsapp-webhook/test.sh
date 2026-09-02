@@ -47,6 +47,7 @@ PHONE_MULTI=917777777777       # member at BOTH gyms
 PHONE_UNKNOWN=916666666666     # not a member anywhere
 MEMBER_MULTI_IRON=e3333333-3333-3333-3333-333333333333
 ORG_IRON=11111111-1111-1111-1111-111111111111
+OWNER_USER_IRON=91111111-1111-1111-1111-111111111111   # membership_freezes.created_by fixture
 
 PASS=0; FAIL=0; SKIP=0
 FAILED_CASES=()
@@ -713,6 +714,47 @@ SQL
   assert_db       "member IN still writes an attendance row" "1" "$(attendance_count "$PHONE_ACTIVE")"
 
   trap - EXIT   # 8i already restored Apex to 'suspended'
+fi
+
+# ---------------------------------------------------------------------------
+# 9. Frozen membership check-in
+# ---------------------------------------------------------------------------
+# See 20260904090000_membership_freezing.sql. A frozen member's 'in' must get
+# a clear "paused until" reply, not fall through to the generic active/expired
+# branches, and must record NO attendance. Reuses PHONE_ACTIVE's real
+# membership — frozen for the duration of this section only, restored to
+# 'active' (its seeded state) immediately after.
+printf '\n%s-- frozen membership check-in --%s\n' "$B" "$N"
+
+if ! $have_psql; then
+  skipped "frozen member 'in' gets a clear paused reply" "requires docker/psql"
+else
+  reset_state
+  ACTIVE_MEMBERSHIP=$(sql "select ms.id from memberships ms join members m on m.id=ms.member_id
+                            where m.phone='$PHONE_ACTIVE' limit 1;")
+  FROZEN_UNTIL=$(sql "select (CURRENT_DATE + 12)::text;")
+  # fmtDay() in index.ts formats via Intl en-GB { day: numeric, month: short }.
+  # On this Deno runtime's ICU data that renders "Sept", not "Sep" — matched
+  # here rather than assumed, since GNU date's %b would say "Sep".
+  FROZEN_UNTIL_LABEL=$(date -d "$FROZEN_UNTIL" '+%-d %b' 2>/dev/null || date -j -f '%Y-%m-%d' "$FROZEN_UNTIL" '+%-d %b')
+  FROZEN_UNTIL_LABEL=$(printf '%s' "$FROZEN_UNTIL_LABEL" | sed 's/Sep$/Sept/')
+
+  sql "update memberships set status='frozen' where id='$ACTIVE_MEMBERSHIP';" >/dev/null
+  sql "insert into membership_freezes
+         (organization_id, membership_id, frozen_from, frozen_until, days, reason, created_by)
+       values ('$ORG_IRON', '$ACTIVE_MEMBERSHIP', CURRENT_DATE - 3, CURRENT_DATE + 12, 15,
+               'test fixture', '$OWNER_USER_IRON');" >/dev/null
+
+  got=$(send_message "$PHONE_ACTIVE" "wamid.$RUN.frozen-in" "in")
+  assert_contains "frozen member 'in' resolves" '"resolution":"resolved"' "$got"
+  assert_contains "frozen member 'in' reply names the paused-until date" \
+    "currently paused until $FROZEN_UNTIL_LABEL" "$(last_reply "$PHONE_ACTIVE")"
+  assert_db "frozen member 'in' records NO attendance" "0" "$(attendance_count "$PHONE_ACTIVE")"
+
+  # Restore — later re-runs of this suite, and any human poking at seed data
+  # afterwards, must find PHONE_ACTIVE active again.
+  sql "delete from membership_freezes where membership_id='$ACTIVE_MEMBERSHIP';" >/dev/null
+  sql "update memberships set status='active' where id='$ACTIVE_MEMBERSHIP';" >/dev/null
 fi
 
 # ---------------------------------------------------------------------------

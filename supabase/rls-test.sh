@@ -185,6 +185,22 @@ count_rows() {
 reset_state() {
   $have_psql || return 0
   docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+-- section 15's freeze fixtures. membership_freezes has no ON DELETE CASCADE
+-- to memberships (deliberate — see 20260904090000's header), so these MUST
+-- go before the membership/member deletes below, same FK-ordering discipline
+-- as body_measurements-before-training_notes further down. The two throwaway
+-- memberships (expired-status fixture, elapsed-days-shift fixture) are
+-- deleted outright so re-running this suite without a fresh \`db reset\`
+-- cannot compound a current_period_end shift; Asha's real seed membership is
+-- only ever round-tripped same-day (net shift zero) so a bare status restore
+-- is enough for it.
+DELETE FROM membership_freezes WHERE membership_id IN
+  ('f1111111-1111-1111-1111-111111111111', '$MEMBERSHIP_LOC2',
+   '0daded00-1111-0000-0000-0000000000e1', '0daded00-1111-0000-0000-0000000000e2');
+DELETE FROM memberships
+ WHERE id IN ('0daded00-1111-0000-0000-0000000000e1', '0daded00-1111-0000-0000-0000000000e2');
+UPDATE memberships SET status = 'active'
+ WHERE id = 'f1111111-1111-1111-1111-111111111111' AND status = 'frozen';
 DELETE FROM payments WHERE id = '$PAYMENT_LOC2';
 DELETE FROM attendance WHERE member_id = '$MEMBER_LOC2';
 DELETE FROM memberships WHERE member_id = '$MEMBER_LOC2';
@@ -974,6 +990,122 @@ assert_equals "front_desk STILL sees zero rows in v_daily_revenue_by_source" "0"
   "$(count_rows "$(rest "$PRIYA" "v_daily_revenue_by_source?organization_id=eq.$ORG_IRON&select=total")")"
 assert_equals "front_desk STILL sees zero rows in v_daily_revenue" "0" \
   "$(count_rows "$(rest "$PRIYA" "v_daily_revenue?organization_id=eq.$ORG_IRON&select=total")")"
+
+# ---------------------------------------------------------------------------
+# 15. Membership freezing — freeze_membership() / unfreeze_membership() RPCs,
+#     membership_freezes RLS. (migration 20260904090000). Auto-unfreeze via
+#     mark-overdue and the frozen check-in reply are covered in their own
+#     function test.sh suites, not here.
+# ---------------------------------------------------------------------------
+printf '\n%s-- membership freezing --%s\n' "$B" "$N"
+
+ASHA_MEMBERSHIP=f1111111-1111-1111-1111-111111111111        # Asha, Indiranagar, active
+BHARAT_MEMBERSHIP=f2222222-2222-2222-2222-222222222222       # Bharat, Indiranagar, past_due
+CANCELLED_MEMBERSHIP=70000000-0000-0000-0000-000000000006    # Pooja, Indiranagar, cancelled
+DEEPAK_MEMBERSHIP=70000000-0000-0000-0000-000000000001       # Deepak, Indiranagar, active
+EXPIRED_MEMBERSHIP=0daded00-1111-0000-0000-0000000000e1      # throwaway, this section only
+ELAPSED_MEMBERSHIP=0daded00-1111-0000-0000-0000000000e2      # throwaway, this section only
+
+ASHA_BEFORE=$(sql "select current_period_end from memberships where id='$ASHA_MEMBERSHIP';")
+
+# --- front_desk (Priya, Indiranagar) freezes Asha's own-location membership ---
+got=$(rest_rpc "$PRIYA" "freeze_membership" "{\"p_membership_id\":\"$ASHA_MEMBERSHIP\",\"p_days\":30,\"p_reason\":\"rls-test freeze\"}")
+assert_contains "front_desk freezes an own-location membership -> ok" '"status":"frozen"' "$got"
+assert_contains "  ...frozen_until is frozen_from + 30"            "\"days\":30" "$got"
+FREEZE_ID=$(printf '%s' "$got" | sed -n 's/.*"freeze_id":"\([^"]*\)".*/\1/p')
+assert_equals "memberships.status flipped to frozen" "frozen" "$(sql "select status from memberships where id='$ASHA_MEMBERSHIP';")"
+assert_equals "current_period_end UNCHANGED while frozen (requirement 2)" "$ASHA_BEFORE" \
+  "$(sql "select current_period_end from memberships where id='$ASHA_MEMBERSHIP';")"
+
+# --- membership_freezes RLS: owner org-wide, front_desk own-location, cross-org zero ---
+assert_contains "front_desk (own location) can read the freeze row" "$FREEZE_ID" \
+  "$(rest "$PRIYA" "membership_freezes?id=eq.$FREEZE_ID&select=id,reason")"
+assert_contains "  ...with the reason preserved" '"reason":"rls-test freeze"' \
+  "$(rest "$PRIYA" "membership_freezes?id=eq.$FREEZE_ID&select=reason")"
+assert_contains "owner can also read it (org-wide)" "$FREEZE_ID" \
+  "$(rest "$RAVI" "membership_freezes?id=eq.$FREEZE_ID&select=id")"
+assert_equals   "FlexFit owner reads ZERO rows for it (cross-org)" "0" \
+  "$(count_rows "$(rest "$SANJAY" "membership_freezes?id=eq.$FREEZE_ID&select=id")")"
+
+# --- can't freeze an already-frozen membership ---
+assert_contains "double-freeze -> membership_already_frozen" "membership_already_frozen" \
+  "$(rest_rpc "$RAVI" "freeze_membership" "{\"p_membership_id\":\"$ASHA_MEMBERSHIP\",\"p_days\":5}")"
+assert_equals   "  ...400, not 200" "400" \
+  "$(rest_rpc_status "$RAVI" "freeze_membership" "{\"p_membership_id\":\"$ASHA_MEMBERSHIP\",\"p_days\":5}")"
+
+# --- can't freeze past_due / cancelled / expired — distinct errors each ---
+assert_contains "past_due membership -> membership_past_due" "membership_past_due" \
+  "$(rest_rpc "$RAVI" "freeze_membership" "{\"p_membership_id\":\"$BHARAT_MEMBERSHIP\",\"p_days\":5}")"
+assert_contains "cancelled membership -> membership_cancelled" "membership_cancelled" \
+  "$(rest_rpc "$RAVI" "freeze_membership" "{\"p_membership_id\":\"$CANCELLED_MEMBERSHIP\",\"p_days\":5}")"
+
+sql "insert into memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end)
+     values ('$EXPIRED_MEMBERSHIP', '$ORG_IRON', '$ASHA', 'cccccccc-cccc-cccc-cccc-cccccccccccc',
+             'expired', CURRENT_DATE - 60, CURRENT_DATE - 30);" >/dev/null
+assert_contains "expired membership -> membership_expired" "membership_expired" \
+  "$(rest_rpc "$RAVI" "freeze_membership" "{\"p_membership_id\":\"$EXPIRED_MEMBERSHIP\",\"p_days\":5}")"
+
+# --- days out of bounds ---
+assert_contains "days=0 -> days_invalid"   "days_invalid" \
+  "$(rest_rpc "$RAVI" "freeze_membership" "{\"p_membership_id\":\"$DEEPAK_MEMBERSHIP\",\"p_days\":0}")"
+assert_contains "days=366 -> days_invalid" "days_invalid" \
+  "$(rest_rpc "$RAVI" "freeze_membership" "{\"p_membership_id\":\"$DEEPAK_MEMBERSHIP\",\"p_days\":366}")"
+
+# --- role: a coach cannot freeze anything, regardless of the target ---
+assert_contains "coach -> not_authorized" "not_authorized" \
+  "$(rest_rpc "$FARAH" "freeze_membership" "{\"p_membership_id\":\"$DEEPAK_MEMBERSHIP\",\"p_days\":5}")"
+assert_equals   "  ...403" "403" \
+  "$(rest_rpc_status "$FARAH" "freeze_membership" "{\"p_membership_id\":\"$DEEPAK_MEMBERSHIP\",\"p_days\":5}")"
+
+# --- cross-org: FlexFit owner cannot freeze an Iron membership ---
+assert_contains "cross-org freeze attempt -> membership_not_found" "membership_not_found" \
+  "$(rest_rpc "$SANJAY" "freeze_membership" "{\"p_membership_id\":\"$DEEPAK_MEMBERSHIP\",\"p_days\":5}")"
+
+# --- cross-location: front_desk (Indiranagar) cannot freeze HSR Layout's
+#     membership; owner CAN (org-wide) ---
+assert_contains "front_desk, wrong location -> membership_not_found" "membership_not_found" \
+  "$(rest_rpc "$PRIYA" "freeze_membership" "{\"p_membership_id\":\"$MEMBERSHIP_LOC2\",\"p_days\":5}")"
+got=$(rest_rpc "$RAVI" "freeze_membership" "{\"p_membership_id\":\"$MEMBERSHIP_LOC2\",\"p_days\":5}")
+assert_contains "owner CAN freeze a different branch's membership" '"status":"frozen"' "$got"
+# unfreeze it same-day (0 elapsed) so the throwaway fixture round-trips cleanly
+rest_rpc "$RAVI" "unfreeze_membership" "{\"p_membership_id\":\"$MEMBERSHIP_LOC2\"}" >/dev/null
+
+# --- manual EARLY unfreeze: shift by ACTUAL elapsed days, not the requested
+#     duration (requirement 5). Freeze row inserted directly with a backdated
+#     frozen_from — membership_freezes_dates_consistent forces frozen_until to
+#     match, so this is the only way to simulate elapsed time in a live test. ---
+sql "insert into memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end)
+     values ('$ELAPSED_MEMBERSHIP', '$ORG_IRON', '$ASHA', 'cccccccc-cccc-cccc-cccc-cccccccccccc',
+             'frozen', CURRENT_DATE - 90, CURRENT_DATE + 10);
+     insert into membership_freezes (organization_id, membership_id, frozen_from, frozen_until, days, created_by)
+     values ('$ORG_IRON', '$ELAPSED_MEMBERSHIP', CURRENT_DATE - 5, (CURRENT_DATE - 5) + 30, 30,
+             (select id from users where phone='919000000001' and organization_id='$ORG_IRON'));" >/dev/null
+got=$(rest_rpc "$PRIYA" "unfreeze_membership" "{\"p_membership_id\":\"$ELAPSED_MEMBERSHIP\"}")
+assert_contains "early unfreeze reports days_frozen=5 (actual), not 30 (requested)" '"days_frozen":5' "$got"
+assert_equals   "  ...current_period_end shifted by +5, not +30" "$(sql "select (CURRENT_DATE + 15)::text;")" \
+  "$(sql "select current_period_end from memberships where id='$ELAPSED_MEMBERSHIP';")"
+assert_equals   "  ...status back to active" "active" "$(sql "select status from memberships where id='$ELAPSED_MEMBERSHIP';")"
+assert_equals   "  ...reactivated_at is set (manual early end)" "t" \
+  "$(sql "select (reactivated_at is not null) from membership_freezes where membership_id='$ELAPSED_MEMBERSHIP';")"
+
+# --- can't unfreeze a membership that isn't frozen ---
+assert_contains "unfreezing an active membership -> membership_not_frozen" "membership_not_frozen" \
+  "$(rest_rpc "$RAVI" "unfreeze_membership" "{\"p_membership_id\":\"$DEEPAK_MEMBERSHIP\"}")"
+
+# --- suspended org: the freeze/unfreeze RPCs are gated exactly like every
+#     other write (org_not_suspended, 20260902090000) ---
+sql "UPDATE organizations SET status = 'suspended' WHERE id = '$ORG_IRON'" >/dev/null
+assert_contains "suspended org blocks freeze_membership" "organization_suspended" \
+  "$(rest_rpc "$RAVI" "freeze_membership" "{\"p_membership_id\":\"$DEEPAK_MEMBERSHIP\",\"p_days\":5}")"
+sql "UPDATE organizations SET status = 'active' WHERE id = '$ORG_IRON'" >/dev/null
+
+# --- clean round-trip: unfreeze Asha same-day (0 elapsed) so her real seed
+#     membership is back to active with an UNCHANGED current_period_end ---
+got=$(rest_rpc "$PRIYA" "unfreeze_membership" "{\"p_membership_id\":\"$ASHA_MEMBERSHIP\"}")
+assert_contains "front_desk unfreezes Asha (own location) -> ok" '"status":"active"' "$got"
+assert_contains "  ...days_frozen=0 (same-day round trip)" '"days_frozen":0' "$got"
+assert_equals   "  ...current_period_end unchanged (0-day shift)" "$ASHA_BEFORE" \
+  "$(sql "select current_period_end from memberships where id='$ASHA_MEMBERSHIP';")"
 
 # ---------------------------------------------------------------------------
 # Summary

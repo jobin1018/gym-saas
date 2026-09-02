@@ -1,0 +1,34 @@
+-- Grants for membership_freezes.
+--
+-- ============================================================================
+-- authenticated — SELECT, INSERT, UPDATE, scoped by RLS
+-- ============================================================================
+-- freeze_membership() and unfreeze_membership() are SECURITY INVOKER (see
+-- 20260904090000), so they run as the calling session and need the session's
+-- OWN grant on the table, not the function owner's — tenant_isolation_
+-- membership_freezes is what actually narrows the rows, exactly like
+-- memberships/attendance/training_notes.
+--   SELECT — freeze history display, and both RPCs' own internal lookups.
+--   INSERT — freeze_membership()'s new row.
+--   UPDATE — unfreeze_membership() setting reactivated_at. Deliberately no
+--            other column is ever updated by a client — frozen_from,
+--            frozen_until, days, reason, created_by are set once at INSERT
+--            and never touched again; there is no application code path that
+--            would update them, but nothing at the grant layer specifically
+--            forbids it either (matches the codebase's usual table-level, not
+--            column-scoped, UPDATE grants — e.g. memberships itself).
+--   No DELETE — freeze rows are the audit trail; never deleted, same
+--            discipline as coach_magic_links and login_attempts.
+GRANT SELECT, INSERT, UPDATE ON public.membership_freezes TO authenticated;
+
+-- ============================================================================
+-- service_role — SELECT only
+-- ============================================================================
+-- mark-overdue's auto-unfreeze pass (index.ts) reads membership_freezes to
+-- find each frozen membership's governing freeze (days, frozen_until) and
+-- then writes memberships directly — service_role already holds SELECT/UPDATE
+-- on memberships from the core schema grants, nothing new needed there. It
+-- never writes membership_freezes itself: auto-unfreeze leaves reactivated_at
+-- NULL by design (see the migration header), so there is nothing for it to
+-- write on this table at all.
+GRANT SELECT ON public.membership_freezes TO service_role;

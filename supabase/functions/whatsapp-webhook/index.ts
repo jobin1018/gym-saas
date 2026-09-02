@@ -539,6 +539,29 @@ async function handleCheckin(
 
   if (membership.status === "cancelled") return REPLY.membershipCancelled;
 
+  if (membership.status === "frozen") {
+    // No attendance row, no payment link — a frozen member owes nothing and
+    // simply isn't due back yet. Look up the governing freeze for
+    // frozen_until: the most recent membership_freezes row for this
+    // membership is unambiguous while status='frozen' — see
+    // 20260904090000_membership_freezing.sql's header for why.
+    const { data: freeze, error: freezeError } = await supabase
+      .from("membership_freezes")
+      .select("frozen_until")
+      .eq("membership_id", membership.id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (freezeError) throw freezeError;
+
+    return freeze
+      ? `Your membership is currently paused until ${fmtDay(freeze.frozen_until)}. ` +
+          `Reply again after that to check in, or contact the front desk to resume early.`
+      // Unreachable in practice (status='frozen' implies a freeze row exists),
+      // but a clean generic reply beats a crash if the two ever disagree.
+      : "Your membership is currently paused. Contact the front desk for details.";
+  }
+
   // status === 'active'
   // TODO: consider de-duplicating repeat check-ins within the same day
   // (a partial unique index on (member_id, date(checked_in_at)) or a lookback query).

@@ -1,11 +1,51 @@
-// mark-overdue — advance lapsed memberships from 'active' to 'past_due'.
+// mark-overdue — advance lapsed memberships from 'active' to 'past_due', AND
+// auto-unfreeze memberships whose freeze has run its course.
 //
-// POST {}                  -> transition every lapsed membership
-// POST { "dry_run": true } -> report what would transition, write nothing
+// POST {}                  -> transition every lapsed membership, auto-unfreeze
+// POST { "dry_run": true } -> report what would happen, write nothing
 //
 // Runs daily at 06:45 IST via pg_cron, fifteen minutes AHEAD of renewal-scan
 // and daily-owner-brief, so both of those read a status column that is already
 // current for the day.
+//
+// ============================================================================
+// AUTO-UNFREEZE (20260904090000_membership_freezing.sql) — WHY IT LIVES HERE
+// ============================================================================
+// Same shape of problem this whole function already exists to solve: a
+// membership can end up in a status that only a scheduled sweep can correct,
+// because nothing else runs every day. 'frozen' is reached through
+// freeze_membership() (an owner/front_desk RPC) and left through EITHER
+// unfreeze_membership() (a manual early end, any day) OR — the case nothing
+// else drives — simply letting the requested freeze run out. This function is
+// that second path's writer, added as a THIRD zone-scoped pass rather than a
+// new sibling function, because it needs the exact same per-org-timezone
+// "today" this file already computes, and because the ordering below is load
+// bearing, not incidental:
+//
+//   for each zone group:
+//     1. auto-unfreeze  (frozen_until <= today)   <- NEW, runs FIRST
+//     2. overdue scan   (status='active' AND current_period_end < today)
+//
+// Unfreezing first, in the SAME run, matters for a real case: a membership
+// can only be frozen while 'active' (freeze_membership() requires it), but
+// 'active' does not mean "not yet due" — a membership can legitimately be
+// frozen on the very day it would otherwise have been caught by THIS
+// function's overdue scan (frozen before that day's mark-overdue run got to
+// it). Auto-unfreeze shifts current_period_end forward by the freeze's
+// `days`, which moves it later but does not guarantee it lands in the
+// future — a membership frozen while already significantly lapsed, for a
+// freeze shorter than the lapse, unfreezes still overdue. Running the scan
+// AFTER unfreeze in the same invocation catches that immediately; reversing
+// the order would leave it silently 'active' with a stale date for a full
+// extra day, exactly the bug this function exists to prevent for the
+// non-freeze case.
+//
+// Neither pass needed to change to skip the other's status: renewal-scan's
+// SCAN_STATUSES and this function's overdue scan both already WHITELIST
+// ('active','past_due' / 'active' respectively) rather than blacklist, so
+// 'frozen' — a status neither list names — was excluded from both the moment
+// it became a legal value. Nothing to skip; there is nothing there to match.
+// ============================================================================
 //
 // ============================================================================
 // WHY THIS FUNCTION EXISTS AT ALL
@@ -59,6 +99,13 @@ const TAG = "mark-overdue";
 const FROM_STATUS = "active" as const;
 const TO_STATUS = "past_due" as const;
 
+// Auto-unfreeze: a membership whose freeze has run its course goes back to
+// 'active', with current_period_end shifted forward. See the header note
+// above the unfreeze functions below for the full mechanic and why this
+// runs BEFORE the overdue scan in every zone.
+const FROZEN_STATUS = "frozen" as const;
+const UNFROZEN_STATUS = "active" as const;
+
 // Fallback when an organization has no locations row to read a timezone from.
 const DEFAULT_TIMEZONE = Deno.env.get("BILLING_TIMEZONE") ?? "Asia/Kolkata";
 
@@ -97,6 +144,32 @@ interface TransitionedRow {
   timezone: string;
 }
 
+interface FrozenMembershipRow {
+  id: string;
+  organization_id: string;
+  member_id: string;
+  current_period_end: string;
+}
+
+/** The membership_freezes row governing one currently-frozen membership. */
+interface GoverningFreeze {
+  id: string;
+  membership_id: string;
+  days: number;
+  frozen_until: string;
+}
+
+interface UnfrozenRow {
+  membership_id: string;
+  organization_id: string;
+  member_id: string;
+  freeze_id: string;
+  days: number;
+  previous_current_period_end: string;
+  new_current_period_end: string;
+  timezone: string;
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
@@ -125,6 +198,12 @@ function daysBetween(from: string, to: string): number {
   return Math.round(
     (Date.UTC(ty, tm - 1, td) - Date.UTC(fy, fm - 1, fd)) / 86_400_000,
   );
+}
+
+/** Add whole days to a YYYY-MM-DD string. Pure calendar arithmetic, no zone. */
+function addDays(isoDate: string, days: number): string {
+  const [y, m, d] = isoDate.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
 }
 
 function chunk<T>(items: T[], size: number): T[][] {
@@ -201,6 +280,120 @@ async function loadZoneGroups(supabase: SupabaseClient): Promise<ZoneGroup[]> {
       organization_ids,
     }))
     .sort((a, b) => a.timezone.localeCompare(b.timezone));
+}
+
+// ---------------------------------------------------------------------------
+// Auto-unfreeze — see the header note above for why this runs first
+// ---------------------------------------------------------------------------
+
+/**
+ * Frozen memberships whose freeze has run its course (frozen_until <= today),
+ * for one zone group, each paired with its governing membership_freezes row.
+ *
+ * "Governing" = the most recent membership_freezes row for that membership_id.
+ * freeze_membership() requires status='active' as a precondition, so a
+ * membership can only be inside ONE frozen episode at a time — its newest
+ * freeze row IS that episode, regardless of how many older, already-resolved
+ * freeze/unfreeze cycles sit behind it. Fetched in two round trips rather
+ * than a single embedded query because PostgREST cannot express "only the
+ * latest row per membership_id" — filtering to the first occurrence per
+ * membership_id happens here, in JS, over a freeze-row list ordered newest
+ * first. A membership found 'frozen' with NO freeze row at all is a data
+ * inconsistency (unreachable via freeze_membership()/unfreeze_membership(),
+ * both of which keep the two tables in lockstep) — logged and skipped rather
+ * than thrown, so one bad row cannot cost the whole zone its run.
+ */
+async function selectFrozenDue(
+  supabase: SupabaseClient,
+  group: ZoneGroup,
+  limit: number,
+): Promise<{ membership: FrozenMembershipRow; freeze: GoverningFreeze }[]> {
+  const { data: frozenData, error: frozenError } = await supabase
+    .from("memberships")
+    .select("id,organization_id,member_id,current_period_end")
+    .in("organization_id", group.organization_ids)
+    .eq("status", FROZEN_STATUS)
+    .order("id", { ascending: true }) // stable tiebreak, matches selectLapsed
+    .limit(limit);
+
+  if (frozenError) throw frozenError;
+
+  const frozen = (frozenData ?? []) as FrozenMembershipRow[];
+  if (frozen.length === 0) return [];
+
+  const { data: freezeData, error: freezeError } = await supabase
+    .from("membership_freezes")
+    .select("id,membership_id,days,frozen_until")
+    .in("membership_id", frozen.map((m) => m.id))
+    .order("created_at", { ascending: false });
+
+  if (freezeError) throw freezeError;
+
+  const governing = new Map<string, GoverningFreeze>();
+  for (const f of (freezeData ?? []) as GoverningFreeze[]) {
+    if (!governing.has(f.membership_id)) governing.set(f.membership_id, f);
+  }
+
+  const due: { membership: FrozenMembershipRow; freeze: GoverningFreeze }[] = [];
+  for (const membership of frozen) {
+    const freeze = governing.get(membership.id);
+    if (!freeze) {
+      console.error(
+        `[${TAG}] membership ${membership.id} is '${FROZEN_STATUS}' with no ` +
+          "membership_freezes row — data inconsistency, skipped.",
+      );
+      continue;
+    }
+    if (freeze.frozen_until <= group.today) due.push({ membership, freeze });
+  }
+  return due;
+}
+
+/**
+ * Auto-unfreeze a batch: current_period_end += the freeze's ORIGINAL `days`
+ * (not elapsed calendar time — see the header note above), status -> 'active'.
+ *
+ * Compare-and-set on the write (`.eq("status", FROZEN_STATUS)`), same
+ * discipline as transition() below: a membership someone manually unfroze via
+ * unfreeze_membership() between selection and this write is left alone rather
+ * than double-credited days. reactivated_at on membership_freezes is
+ * deliberately NOT set here — see the migration header for why NULL there
+ * does not mean "still frozen".
+ */
+async function autoUnfreeze(
+  supabase: SupabaseClient,
+  items: { membership: FrozenMembershipRow; freeze: GoverningFreeze }[],
+  timezone: string,
+): Promise<UnfrozenRow[]> {
+  const out: UnfrozenRow[] = [];
+
+  for (const { membership, freeze } of items) {
+    const newEnd = addDays(membership.current_period_end, freeze.days);
+
+    const { data, error } = await supabase
+      .from("memberships")
+      .update({ status: UNFROZEN_STATUS, current_period_end: newEnd })
+      .eq("id", membership.id)
+      .eq("status", FROZEN_STATUS)
+      .select("id")
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) continue; // raced — no longer frozen at write time, left alone
+
+    out.push({
+      membership_id: membership.id,
+      organization_id: membership.organization_id,
+      member_id: membership.member_id,
+      freeze_id: freeze.id,
+      days: freeze.days,
+      previous_current_period_end: membership.current_period_end,
+      new_current_period_end: newEnd,
+      timezone,
+    });
+  }
+
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +524,8 @@ async function handleMarkOverdue(req: Request): Promise<Response> {
 
   const scanned: TransitionedRow[] = [];
   const transitioned: TransitionedRow[] = [];
+  const frozenDue: UnfrozenRow[] = [];
+  const unfrozen: UnfrozenRow[] = [];
   const errors: { timezone: string; error: string; detail?: string }[] = [];
 
   let remaining = limit;
@@ -339,6 +534,33 @@ async function handleMarkOverdue(req: Request): Promise<Response> {
     if (remaining <= 0) break;
 
     try {
+      // --- (1) Auto-unfreeze FIRST — see the header note on why the order
+      // --- within one zone (and one run) matters. ---
+      const due = await selectFrozenDue(supabase, group, remaining);
+      remaining -= due.length;
+
+      const describeUnfreeze = (
+        item: { membership: FrozenMembershipRow; freeze: GoverningFreeze },
+      ): UnfrozenRow => ({
+        membership_id: item.membership.id,
+        organization_id: item.membership.organization_id,
+        member_id: item.membership.member_id,
+        freeze_id: item.freeze.id,
+        days: item.freeze.days,
+        previous_current_period_end: item.membership.current_period_end,
+        new_current_period_end: addDays(item.membership.current_period_end, item.freeze.days),
+        timezone: group.timezone,
+      });
+
+      for (const item of due) frozenDue.push(describeUnfreeze(item));
+
+      if (!dryRun && due.length > 0) {
+        unfrozen.push(...await autoUnfreeze(supabase, due, group.timezone));
+      }
+
+      if (remaining <= 0) continue;
+
+      // --- (2) THEN the existing overdue scan, unchanged. ---
       const lapsed = await selectLapsed(supabase, group, remaining);
       remaining -= lapsed.length;
 
@@ -382,13 +604,17 @@ async function handleMarkOverdue(req: Request): Promise<Response> {
     }
   }
 
-  const truncated = remaining <= 0 && scanned.length >= limit;
+  // Shared `remaining` budget spans BOTH passes now, so truncation must look
+  // at both totals, not just the overdue scan's.
+  const truncated = remaining <= 0 && (scanned.length + frozenDue.length) >= limit;
 
   const summary = {
     ok: true,
     dry_run: dryRun,
     from_status: FROM_STATUS,
     to_status: TO_STATUS,
+    frozen_status: FROZEN_STATUS,
+    unfrozen_status: UNFROZEN_STATUS,
     zones: groups.map((g) => ({
       timezone: g.timezone,
       today: g.today,
@@ -397,24 +623,45 @@ async function handleMarkOverdue(req: Request): Promise<Response> {
     // In a dry run these are the rows that WOULD transition; in a real run,
     // the rows that were eligible when selected.
     eligible: scanned.length,
-    // Named distinctly from `eligible` so a dry-run summary can never be
-    // mistaken for evidence that rows were written.
+    frozen_due: frozenDue.length,
+    // Named distinctly from `eligible`/`frozen_due` so a dry-run summary can
+    // never be mistaken for evidence that rows were written.
     ...(dryRun
-      ? { would_transition: scanned.length, would_transition_membership_ids: scanned.map((r) => r.membership_id) }
-      : { transitioned: transitioned.length, transitioned_membership_ids: transitioned.map((r) => r.membership_id) }),
+      ? {
+        would_transition: scanned.length,
+        would_transition_membership_ids: scanned.map((r) => r.membership_id),
+        would_unfreeze: frozenDue.length,
+        would_unfreeze_membership_ids: frozenDue.map((r) => r.membership_id),
+      }
+      : {
+        transitioned: transitioned.length,
+        transitioned_membership_ids: transitioned.map((r) => r.membership_id),
+        unfrozen: unfrozen.length,
+        unfrozen_membership_ids: unfrozen.map((r) => r.membership_id),
+      }),
     truncated,
     limit,
     errored: errors.length,
     errors,
     results: dryRun ? scanned : transitioned,
+    unfreeze_results: dryRun ? frozenDue : unfrozen,
     duration_ms: Date.now() - startedAt,
   };
 
   console.log(
     `[${TAG}] ${dryRun ? "DRY RUN" : "done"}: ${scanned.length} eligible, ` +
-      `${dryRun ? 0 : transitioned.length} transitioned, ${errors.length} zone error(s) ` +
-      `in ${summary.duration_ms}ms`,
+      `${dryRun ? 0 : transitioned.length} transitioned, ` +
+      `${frozenDue.length} frozen due, ${dryRun ? 0 : unfrozen.length} auto-unfrozen, ` +
+      `${errors.length} zone error(s) in ${summary.duration_ms}ms`,
   );
+
+  for (const row of unfrozen) {
+    console.log(
+      `[${TAG}] auto-unfroze membership ${row.membership_id} (org ${row.organization_id}): ` +
+        `freeze ${row.freeze_id}, +${row.days}d, current_period_end ` +
+        `${row.previous_current_period_end} -> ${row.new_current_period_end}.`,
+    );
+  }
 
   if (truncated) {
     console.warn(
