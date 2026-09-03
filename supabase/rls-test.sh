@@ -197,10 +197,12 @@ reset_state() {
 DELETE FROM membership_freezes WHERE membership_id IN
   ('f1111111-1111-1111-1111-111111111111', '$MEMBERSHIP_LOC2',
    '0daded00-1111-0000-0000-0000000000e1', '0daded00-1111-0000-0000-0000000000e2');
+DELETE FROM membership_freezes WHERE membership_id = '0daded00-1111-0000-0000-0000000000e3';
 DELETE FROM memberships
- WHERE id IN ('0daded00-1111-0000-0000-0000000000e1', '0daded00-1111-0000-0000-0000000000e2');
+ WHERE id IN ('0daded00-1111-0000-0000-0000000000e1', '0daded00-1111-0000-0000-0000000000e2',
+              '0daded00-1111-0000-0000-0000000000e3');
 UPDATE memberships SET status = 'active'
- WHERE id = 'f1111111-1111-1111-1111-111111111111' AND status = 'frozen';
+ WHERE id IN ('f1111111-1111-1111-1111-111111111111', '$MEMBERSHIP_LOC2') AND status <> 'active';
 DELETE FROM payments WHERE id = '$PAYMENT_LOC2';
 DELETE FROM attendance WHERE member_id = '$MEMBER_LOC2';
 DELETE FROM memberships WHERE member_id = '$MEMBER_LOC2';
@@ -1106,6 +1108,77 @@ assert_contains "front_desk unfreezes Asha (own location) -> ok" '"status":"acti
 assert_contains "  ...days_frozen=0 (same-day round trip)" '"days_frozen":0' "$got"
 assert_equals   "  ...current_period_end unchanged (0-day shift)" "$ASHA_BEFORE" \
   "$(sql "select current_period_end from memberships where id='$ASHA_MEMBERSHIP';")"
+
+# ---------------------------------------------------------------------------
+# 16. memberships.status direct-write guard (migration 20260905090000) — an
+#     authenticated session may set status to 'cancelled' by a direct PATCH;
+#     every other transition stays system-managed. Location scoping for this
+#     is the SAME pre-existing tenant_isolation_memberships policy freeze/
+#     unfreeze already rely on (RLS answers "can you touch this row", the new
+#     trigger answers "what can you set status to") — not re-tested here,
+#     just confirmed unaffected by the new trigger.
+# ---------------------------------------------------------------------------
+printf '\n%s-- memberships.status direct-write guard --%s\n' "$B" "$N"
+
+GUARD_MEMBERSHIP=0daded00-1111-0000-0000-0000000000e3   # throwaway, this section only
+sql "insert into memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end)
+     values ('$GUARD_MEMBERSHIP', '$ORG_IRON', '$ASHA', 'cccccccc-cccc-cccc-cccc-cccccccccccc',
+             'active', CURRENT_DATE - 10, CURRENT_DATE + 20);" >/dev/null
+
+# --- direct write to any OTHER status value is rejected ---
+status_code=$(rest_patch_status "$RAVI" "memberships?id=eq.$GUARD_MEMBERSHIP" '{"status":"past_due"}')
+assert_equals   "owner direct PATCH to past_due -> 403" "403" "$status_code"
+assert_equals   "  ...status is unchanged" "active" "$(sql "select status from memberships where id='$GUARD_MEMBERSHIP';")"
+
+body=$(curl -s -X PATCH "$REST_URL/memberships?id=eq.$GUARD_MEMBERSHIP" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $RAVI" \
+  -H 'Content-Type: application/json' -d '{"status":"frozen"}')
+assert_contains "  ...error names the guard" "membership_status_system_managed" "$body"
+
+# --- direct write to 'cancelled' succeeds (owner) ---
+status_code=$(rest_patch_status "$RAVI" "memberships?id=eq.$GUARD_MEMBERSHIP" '{"status":"cancelled"}')
+assert_equals   "owner direct PATCH to cancelled -> 200" "200" "$status_code"
+assert_equals   "  ...status actually flipped" "cancelled" "$(sql "select status from memberships where id='$GUARD_MEMBERSHIP';")"
+
+# --- front_desk, own location: same as owner ---
+sql "update memberships set status='active' where id='$GUARD_MEMBERSHIP';" >/dev/null
+status_code=$(rest_patch_status "$PRIYA" "memberships?id=eq.$GUARD_MEMBERSHIP" '{"status":"cancelled"}')
+assert_equals   "front_desk (own location) direct PATCH to cancelled -> 200" "200" "$status_code"
+assert_equals   "  ...status actually flipped" "cancelled" "$(sql "select status from memberships where id='$GUARD_MEMBERSHIP';")"
+
+# --- front_desk, wrong location: pre-existing RLS still denies (0 rows, not
+#     the new trigger — MEMBERSHIP_LOC2 is HSR Layout, Priya is Indiranagar) ---
+sql "update memberships set status='active' where id='$MEMBERSHIP_LOC2';" >/dev/null
+patch_body=$(curl -s -X PATCH "$REST_URL/memberships?id=eq.$MEMBERSHIP_LOC2" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $PRIYA" \
+  -H 'Content-Type: application/json' -H 'Prefer: return=representation' -d '{"status":"cancelled"}')
+assert_equals   "front_desk, wrong location -> zero rows affected" "[]" "$patch_body"
+assert_equals   "  ...status is unchanged (still active)" "active" "$(sql "select status from memberships where id='$MEMBERSHIP_LOC2';")"
+
+# --- cancelling a FROZEN membership is allowed by design (courtesy pause,
+#     not a commitment — see 20260905090000's header for the full reasoning),
+#     and leaves the freeze row's reactivated_at untouched (NULL): a
+#     cancellation is not a reactivation. ---
+sql "update memberships set status='active' where id='$GUARD_MEMBERSHIP';" >/dev/null
+freeze_got=$(rest_rpc "$RAVI" "freeze_membership" "{\"p_membership_id\":\"$GUARD_MEMBERSHIP\",\"p_days\":10}")
+assert_contains "setup: freeze the guard membership" '"status":"frozen"' "$freeze_got"
+
+status_code=$(rest_patch_status "$RAVI" "memberships?id=eq.$GUARD_MEMBERSHIP" '{"status":"cancelled"}')
+assert_equals   "cancelling a FROZEN membership directly -> 200 (allowed)" "200" "$status_code"
+assert_equals   "  ...status is cancelled, not frozen" "cancelled" "$(sql "select status from memberships where id='$GUARD_MEMBERSHIP';")"
+assert_equals   "  ...the freeze row's reactivated_at is still NULL" "f" \
+  "$(sql "select (reactivated_at is not null) from membership_freezes
+           where membership_id='$GUARD_MEMBERSHIP' order by created_at desc limit 1;")"
+
+# --- superuser / service_role writes are unaffected by the guard (fixture
+#     setup throughout this whole suite, plus mark-overdue / renewal-scan /
+#     razorpay-webhook in their own test.sh suites, all rely on this) ---
+sql "update memberships set status='active' where id='$GUARD_MEMBERSHIP';" >/dev/null
+sql "update memberships set status='past_due' where id='$GUARD_MEMBERSHIP';" >/dev/null
+assert_equals   "postgres (rolbypassrls) direct write to past_due -> allowed" "past_due" \
+  "$(sql "select status from memberships where id='$GUARD_MEMBERSHIP';")"
+
+sql "delete from memberships where id='$GUARD_MEMBERSHIP';" >/dev/null
 
 # ---------------------------------------------------------------------------
 # Summary
