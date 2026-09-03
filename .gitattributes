@@ -1,0 +1,9 @@
+# Normalize line endings to LF for every text file, regardless of which
+# git client (Windows, WSL/Linux, CI) checks it out or commits it — this
+# repo is worked on from both a Windows Git Bash session and native WSL
+# Ubuntu git on the same checkout, and without this file the two disagree
+# on CRLF vs LF, causing permanent "modified" noise and, once, actual
+# local object-store corruption from a bad commit. LF is also simply
+# correct here: this is a backend-only project (Deno/TS, SQL, shell,
+# JSON), nothing in it has any reason to want CRLF.
+* text=auto eol=lf
