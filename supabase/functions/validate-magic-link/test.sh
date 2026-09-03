@@ -225,6 +225,101 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 7. Expiry, at the boundary, through the REAL generator — not a synthetic
+#    insert_link() row. Mints a link the same way an actual coach would (SESSION
+#    -> whatsapp-webhook), then backdates ONLY that row's expires_at to
+#    simulate "waited past 15 minutes", and proves redemption is genuinely
+#    denied. This is the direct regression test for the reported bug: a
+#    client-computed "now" reaching the comparison (fixed by
+#    claim_coach_magic_link, 20260906090000) would have let a link like this
+#    one through if the edge runtime's clock ran meaningfully behind
+#    Postgres's — this test only trusts Postgres's own clock throughout, same
+#    as the fixed code now does.
+# ---------------------------------------------------------------------------
+printf '\n%s-- expiry boundary, via the real generator --%s\n' "$B" "$N"
+
+if [ -n "$e2e_skip" ]; then
+  skipped "a REAL generated link, backdated past its own expiry, is denied" "$e2e_skip"
+else
+  ENVELOPE2='{"object":"whatsapp_business_account","entry":[{"id":"WABA","changes":[{"field":"messages","value":{"messaging_product":"whatsapp","metadata":{"display_phone_number":"911111111111","phone_number_id":"PID"},"messages":[{"from":"'"$FARAH_PHONE"'","id":"wamid.vml-boundary-'"$(date +%s)"'","timestamp":"1700000000","type":"text","text":{"body":"SESSION"}}]}}]}]}'
+  wargs2=(-s -X POST "$WH_URL" -H 'Content-Type: application/json')
+  if [ -n "$APP_SECRET" ] && $have_openssl; then
+    SIG2=$(printf '%s' "$ENVELOPE2" | openssl dgst -sha256 -hmac "$APP_SECRET" | sed 's/^.*= */sha256=/')
+    wargs2+=(-H "X-Hub-Signature-256: $SIG2")
+  fi
+  curl "${wargs2[@]}" -d "$ENVELOPE2" >/dev/null
+
+  LINK2=$(sql "select body_preview from whatsapp_messages
+               where organization_id='$ORG_IRON' and body_preview like '%coach/quick-log?token=%'
+               order by created_at desc limit 1")
+  BOUND_TOKEN=$(printf '%s' "$LINK2" | sed -n 's/.*token=\([A-Za-z0-9_-]\{32,128\}\).*/\1/p')
+
+  if [ -z "$BOUND_TOKEN" ]; then
+    bad "setup: a real link was generated to backdate" "a /coach/quick-log?token=… line" "$LINK2"
+  else
+    # The generator wrote a real 15-minutes-out expires_at. Simulate "waited
+    # past it" by moving expires_at to 1 second ago — right at the boundary,
+    # not minutes past it, so this cannot pass by coincidence or a wide
+    # margin for error.
+    sql "update coach_magic_links set expires_at = now() - interval '1 second' where token='$BOUND_TOKEN'" >/dev/null
+
+    boundary_resp=$(vml "{\"token\":\"$BOUND_TOKEN\"}")
+    assert_contains "a REAL generated link, backdated 1s past expiry, is denied" \
+      '"error":"link_expired"' "$boundary_resp"
+    assert_not_contains "  ...no session was minted for it" '"access_token"' "$boundary_resp"
+    assert_equals "  ...the claim did NOT stamp used_at" "f" \
+      "$(sql "select (used_at is not null) from coach_magic_links where token='$BOUND_TOKEN'")"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Single-use under a genuine race — not just sequential reuse. Fires two
+#    redemption attempts at the same valid token at once; exactly one must
+#    claim it, the other must see link_already_used, and the row must show
+#    exactly one used_at stamp. Audits the concern the report raised
+#    explicitly ("don't assume single-use is fine just because expiry
+#    was[n't]") independently of the expiry fix above — single-use never
+#    depended on any client-supplied timestamp (its gate is `used_at IS
+#    NULL`, a pure NULL check), so it was never exposed to the same clock-skew
+#    risk, and this proves it holds under real concurrency, not just in a
+#    sequential "redeem, then redeem again" test.
+# ---------------------------------------------------------------------------
+printf '\n%s-- single-use under a real race --%s\n' "$B" "$N"
+
+if ! $have_psql; then
+  skipped "exactly one of two concurrent redemptions succeeds" "requires docker/psql"
+else
+  T_RACE=$(new_token)
+  insert_link "$T_RACE" "$FARAH_ID" "$ORG_IRON" "now() + interval '15 minutes'"
+
+  vml "{\"token\":\"$T_RACE\"}" > /tmp/vml_race_a.$$ &
+  pid_a=$!
+  vml "{\"token\":\"$T_RACE\"}" > /tmp/vml_race_b.$$ &
+  pid_b=$!
+  wait "$pid_a" "$pid_b"
+  race_a=$(cat /tmp/vml_race_a.$$ 2>/dev/null); rm -f /tmp/vml_race_a.$$
+  race_b=$(cat /tmp/vml_race_b.$$ 2>/dev/null); rm -f /tmp/vml_race_b.$$
+
+  successes=0
+  case "$race_a" in *'"ok":true'*) successes=$((successes+1)) ;; esac
+  case "$race_b" in *'"ok":true'*) successes=$((successes+1)) ;; esac
+  assert_equals "exactly one of two simultaneous redemptions succeeded" "1" "$successes"
+
+  losers_say_already_used=true
+  [ "$successes" = 1 ] || losers_say_already_used=false
+  case "$race_a$race_b" in
+    *'"ok":true'*'"error":"link_already_used"'*|*'"error":"link_already_used"'*'"ok":true'*) : ;;
+    *) losers_say_already_used=false ;;
+  esac
+  if $losers_say_already_used; then ok "  ...the loser saw link_already_used, not a silent duplicate success"
+  else bad "  ...the loser saw link_already_used, not a silent duplicate success" \
+    "one ok:true + one link_already_used" "$race_a | $race_b"; fi
+
+  assert_equals "  ...exactly one used_at stamp on the row, not zero or two" "1" \
+    "$(sql "select count(*) from coach_magic_links where token='$T_RACE' and used_at is not null")"
+fi
+
+# ---------------------------------------------------------------------------
 reset_state
 
 printf '\n%s== summary ==%s\n' "$B" "$N"

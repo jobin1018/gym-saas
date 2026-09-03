@@ -236,7 +236,8 @@ DELETE FROM pt_packages
  WHERE (price >= 4321.00 AND price < 4400.00)   -- 4321.xx: this suite's created packages
     OR id IN ('9c000000-0000-0000-0000-0000000000f1',
               '9c000000-0000-0000-0000-0000000000f3',
-              '9c000000-0000-0000-0000-0000000000f5');
+              '9c000000-0000-0000-0000-0000000000f5',
+              '9c000000-0000-0000-0000-0000000000f9');
 -- the session-count trigger bumps sessions_used on every note; deleting the
 -- note does not undo the bump, so restore the one seed package the coaching
 -- section writes a real note against (keeps repeated runs without `db reset`
@@ -292,7 +293,19 @@ VALUES
   -- price 0 so the pt_packages_record_payment trigger creates no payment row.
   -- Manoj (8000..03) is otherwise unreferenced by this suite.
   ('9c000000-0000-0000-0000-0000000000f5', '$ORG_IRON', '80000000-0000-0000-0000-000000000003',
-   'c0ac0000-0000-0000-0000-000000000001', 'muscle_gain', 1, 5, 5, 4, 0, 'active', CURRENT_DATE);
+   'c0ac0000-0000-0000-0000-000000000001', 'muscle_gain', 1, 5, 5, 4, 0, 'active', CURRENT_DATE),
+  -- f9: HSR Layout (LOC_IRON_2/MEMBER_LOC2) — real coaching data at a DIFFERENT
+  -- Iron Temple location than Priya's (Indiranagar). Coaches aren't
+  -- location-scoped (Farah can still be assigned here), but front_desk's new
+  -- read grant (20260905093000_front_desk_read_training_history) IS — this is
+  -- the negative control proving that, against a real row, not just an
+  -- absence of data. price 0, same reasoning as f5.
+  ('9c000000-0000-0000-0000-0000000000f9', '$ORG_IRON', '$MEMBER_LOC2',
+   'c0ac0000-0000-0000-0000-000000000001', 'general_fitness', 1, 5, 5, 0, 0, 'active', CURRENT_DATE);
+
+INSERT INTO training_notes (organization_id, member_id, coach_id, pt_package_id, note_text, session_date)
+VALUES ('$ORG_IRON', '$MEMBER_LOC2', 'c0ac0000-0000-0000-0000-000000000001',
+        '9c000000-0000-0000-0000-0000000000f9', 'rls-test HSR Layout note', CURRENT_DATE);
 SQL
 }
 
@@ -537,9 +550,29 @@ got=$(rest "$GIRISH" "training_notes?select=note_text")
 assert_contains     "Girish sees his note for Sneha"              "Mobility work" "$got"
 assert_not_contains "Girish does NOT see Farah's note for Asha"   "Increased squat" "$got"
 
-assert_equals "Priya (front_desk) sees zero training_notes"       "0" "$(count_rows "$(rest "$PRIYA" "training_notes?select=id")")"
 assert_equals "Priya's training_notes read is 200, not 403"       "200" "$(rest_status "$PRIYA" "training_notes?select=id")"
-assert_equals "Priya (front_desk) sees zero body_measurements"    "0" "$(count_rows "$(rest "$PRIYA" "body_measurements?select=id")")"
+# front_desk gained READ on training_notes/body_measurements for their OWN
+# location (20260905093000_front_desk_read_training_history) — Asha and Ritu
+# are both Indiranagar, same as Priya, so she now sees their real notes;
+# HSR Layout's f9 fixture (arrange_fixtures, a DIFFERENT Iron Temple
+# location) proves the grant is genuinely location-scoped, not org-wide,
+# against a real row rather than an absence of data.
+assert_contains "Priya (front_desk, Indiranagar) sees Asha's session note (own location)" \
+  "Increased squat" "$(rest "$PRIYA" "training_notes?select=note_text")"
+assert_not_contains "Priya does NOT see the HSR Layout note (different location)" \
+  "rls-test HSR Layout note" "$(rest "$PRIYA" "training_notes?select=note_text")"
+assert_equals "  ...HSR Layout note count for Priya is exactly zero" "0" \
+  "$(count_rows "$(rest "$PRIYA" "training_notes?member_id=eq.$MEMBER_LOC2&select=id")")"
+assert_contains "Farah (the assigned coach, not location-scoped) DOES see the HSR Layout note" \
+  "rls-test HSR Layout note" "$(rest "$FARAH" "training_notes?select=note_text")"
+
+got=$(rest "$PRIYA" "body_measurements?select=id")
+assert_equals "Priya's body_measurements read is 200, not 403" "200" "$(rest_status "$PRIYA" "body_measurements?select=id")"
+priya_bm=$(count_rows "$got")
+if [ "$priya_bm" -gt 0 ] 2>/dev/null; then ok "Priya (front_desk, own location) sees at least one body measurement ($priya_bm)"
+else bad "Priya (front_desk, own location) sees at least one body measurement" ">0" "$priya_bm"; fi
+assert_equals "Priya sees zero body_measurements for the HSR Layout member" "0" \
+  "$(count_rows "$(rest "$PRIYA" "body_measurements?member_id=eq.$MEMBER_LOC2&select=id")")"
 
 got=$(rest "$FARAH" "body_measurements?member_id=eq.$ASHA&select=id")
 farah_bm=$(count_rows "$got")
@@ -704,10 +737,15 @@ assert_equals "another coach sees 0 of Ritu's session history"        "0" \
   "$(count_rows "$(rest "$GIRISH" "training_notes?member_id=eq.$RITU&select=id")")"
 assert_equals "a coach in another org sees 0 of Ritu's session history" "0" \
   "$(count_rows "$(rest "$HEMA" "training_notes?member_id=eq.$RITU&select=id")")"
-assert_equals "front_desk sees 0 of Ritu's session history"           "0" \
-  "$(count_rows "$(rest "$PRIYA" "training_notes?member_id=eq.$RITU&select=id")")"
+# front_desk now genuinely sees Ritu's history too (20260905093000) — Ritu is
+# an Indiranagar member, Priya's own location, not the "assignment-scoped
+# like a coach" rule the two checks above test. Asserted against the SAME
+# real count the assigned coach sees, not a hardcoded number.
+priya_ritu_n=$(count_rows "$(rest "$PRIYA" "training_notes?member_id=eq.$RITU&select=id")")
 # ...but the assigned coach keeps it after the package completed (093000/097000 history rule)
 hist_n=$(count_rows "$(rest "$FARAH" "training_notes?member_id=eq.$RITU&select=id")")
+assert_equals "front_desk (own location) sees all of Ritu's session history, same count as the coach" \
+  "$hist_n" "$priya_ritu_n"
 if [ "$hist_n" -eq 5 ] 2>/dev/null; then
   ok "the assigned coach still reads all 5 sessions after the package completed"
 else

@@ -11,13 +11,20 @@
 //
 //   * 256 bits of entropy (crypto.getRandomValues, base64url) — brute force
 //     is not on the table; a lookup miss is just `invalid_token`.
-//   * SINGLE USE, enforced at the row: this function's first act is an atomic
+//   * SINGLE USE, enforced at the row: this function's first act is calling
+//     claim_coach_magic_link(token) (20260906090000), an atomic
 //     `UPDATE coach_magic_links SET used_at = now() WHERE token = $1 AND
-//     used_at IS NULL AND expires_at > now() RETURNING ...`. A second attempt
-//     updates zero rows. The claim happens BEFORE the session is minted, so a
-//     mint failure burns the link (the coach texts SESSION again) — an
-//     acceptable, rare cost to keep single-use absolute.
-//   * 15-minute expiry (set by the generator in whatsapp-webhook).
+//     used_at IS NULL AND expires_at > now() RETURNING ...` entirely inside
+//     Postgres. A second attempt updates zero rows. The claim happens BEFORE
+//     the session is minted, so a mint failure burns the link (the coach
+//     texts SESSION again) — an acceptable, rare cost to keep single-use
+//     absolute.
+//   * 15-minute expiry (set by the generator in whatsapp-webhook), decided by
+//     Postgres's own now() inside claim_coach_magic_link — deliberately NOT
+//     a timestamp computed here and passed in. See that migration's header
+//     for why: a client-computed "now" makes the check depend on the edge
+//     runtime's clock agreeing with Postgres's, which is one clock too many
+//     for a security-critical comparison.
 //   * SCOPED to one coach_user_id. The session this mints is that coach's
 //     ordinary session — same app_role='coach', same org, same RLS. It is
 //     minted the EXACT same way staff-login mints one (shared
@@ -69,39 +76,25 @@ async function handle(req: Request): Promise<Response> {
   }
 
   const admin = createAdminClient();
-  const nowIso = new Date().toISOString();
 
-  // --- (a) Atomic single-use claim. ---
-  const { data: claimed, error: claimErr } = await admin
-    .from("coach_magic_links")
-    .update({ used_at: nowIso })
-    .eq("token", token)
-    .is("used_at", null)
-    .gt("expires_at", nowIso)
-    .select("id, coach_user_id, organization_id")
-    .maybeSingle();
+  // --- (a) Atomic single-use + expiry claim, entirely Postgres-clock-driven
+  //         (claim_coach_magic_link, 20260906090000). ---
+  const { data: claimRows, error: claimErr } = await admin
+    .rpc("claim_coach_magic_link", { p_token: token });
 
   if (claimErr) throw claimErr;
 
-  if (!claimed) {
-    // Classify the miss for a useful error, without a TOCTOU window (the
-    // claim above already failed; this SELECT only decides which message).
-    const { data: existing, error: exErr } = await admin
-      .from("coach_magic_links")
-      .select("used_at, expires_at")
-      .eq("token", token)
-      .maybeSingle();
-    if (exErr) throw exErr;
+  const claim = Array.isArray(claimRows) ? claimRows[0] : claimRows;
 
-    if (!existing) return json({ ok: false, error: "invalid_token" }, 404);
-    if ((existing as any).used_at) return json({ ok: false, error: "link_already_used" }, 410);
-    if (new Date((existing as any).expires_at).getTime() <= Date.now()) {
-      return json({ ok: false, error: "link_expired" }, 410);
+  if (!claim || claim.outcome !== "claimed") {
+    switch (claim?.outcome) {
+      case "not_found":     return json({ ok: false, error: "invalid_token" }, 404);
+      case "expired":       return json({ ok: false, error: "link_expired" }, 410);
+      case "already_used":
+      default:              return json({ ok: false, error: "link_already_used" }, 410);
     }
-    // Row exists, unused, unexpired, yet the claim failed — a concurrent
-    // request won the race. Same outcome for this caller.
-    return json({ ok: false, error: "link_already_used" }, 410);
   }
+  const claimed = claim;
 
   // --- (b) The coach must still be a real, active coach. ---
   const { data: coach, error: coachErr } = await admin
@@ -128,7 +121,7 @@ async function handle(req: Request): Promise<Response> {
     const session = await mintSession(admin, anon, syntheticEmail(coachRow.id));
 
     console.log(
-      `[${TAG}] link ${(claimed as any).id} redeemed -> session for coach ${coachRow.id} (org ${coachRow.organization_id})`,
+      `[${TAG}] link ${(claimed as any).link_id} redeemed -> session for coach ${coachRow.id} (org ${coachRow.organization_id})`,
     );
 
     return json({
