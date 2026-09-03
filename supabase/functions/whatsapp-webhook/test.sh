@@ -178,7 +178,7 @@ attendance_count() { # <phone>
 
 reset_state() {
   $have_psql || return 0
-  sql "truncate webhook_events, whatsapp_messages, attendance, member_active_context, coach_magic_links;" >/dev/null
+  sql "truncate webhook_events, whatsapp_messages, attendance, member_active_context, staff_magic_links;" >/dev/null
 }
 
 # assert_db <label> <expected> <actual>  — SKIPs when psql is unavailable
@@ -609,12 +609,13 @@ else
   assert_contains "SESSION replies with a /coach/quick-log link" "/coach/quick-log?token=" "$r"
   assert_contains "SESSION link says one use / 15 min"           "one use" "$r"
   RHEA_ID=$(sql "select id from users where phone='$PHONE_COACH' and organization_id='$ORG_APEX'")
-  link_row=$(sql "select (used_at is null)||'|'||(expires_at > now())::text||'|'||coach_user_id
-                  from coach_magic_links where coach_user_id='$RHEA_ID' order by created_at desc limit 1")
-  assert_equals "  ...persisted a fresh coach_magic_links row for this coach" "true|true|$RHEA_ID" "$link_row"
+  link_row=$(sql "select (used_at is null)||'|'||(expires_at > now())::text||'|'||user_id||'|'||purpose
+                  from staff_magic_links where user_id='$RHEA_ID' order by created_at desc limit 1")
+  assert_equals "  ...persisted a fresh staff_magic_links row for this coach, purpose=session_log" \
+    "true|true|$RHEA_ID|session_log" "$link_row"
   assert_equals "  ...expiry is ~15 min out (13-15 min)" "t" \
     "$(sql "select (expires_at between now() + interval '13 minutes' and now() + interval '15 minutes')
-            from coach_magic_links where coach_user_id='$RHEA_ID' order by created_at desc limit 1")"
+            from staff_magic_links where user_id='$RHEA_ID' order by created_at desc limit 1")"
   send_cmd "$PHONE_COACH" c-log "LOG"
   assert_contains "LOG is an alias for SESSION" "/coach/quick-log?token=" "$(last_out_org "$ORG_APEX")"
 
@@ -730,8 +731,8 @@ SQL
   assert_contains "suspended org: coach MYCLIENTS -> org_suspended resolution" '"resolution":"org_suspended"' "$got"
   got=$(send_message "$PHONE_COACH" "wamid.$RUN.susp-s" "SESSION")
   assert_contains "suspended org: coach SESSION mints no magic link" '"resolution":"org_suspended"' "$got"
-  assert_equals   "  ...no coach_magic_links row was created" "0" \
-    "$(sql "select count(*) from coach_magic_links cml join users u on u.id=cml.coach_user_id where u.organization_id='$ORG_APEX';")"
+  assert_equals   "  ...no staff_magic_links row was created" "0" \
+    "$(sql "select count(*) from staff_magic_links sml join users u on u.id=sml.user_id where u.organization_id='$ORG_APEX';")"
 
   if [ -n "$APEX_MEMBER_PHONE" ]; then
     got=$(send_message "$APEX_MEMBER_PHONE" "wamid.$RUN.susp-m" "in")
@@ -787,6 +788,134 @@ else
   # afterwards, must find PHONE_ACTIVE active again.
   sql "delete from membership_freezes where membership_id='$ACTIVE_MEMBERSHIP';" >/dev/null
   sql "update memberships set status='active' where id='$ACTIVE_MEMBERSHIP';" >/dev/null
+fi
+
+# ---------------------------------------------------------------------------
+# 10. PAUSE/RESUME MEMBER, ADD MEMBER, ADD PT, RESET PIN — owner + front_desk
+#     action commands, and the generalized staff_magic_links table
+#     (20260907090000). Iron Temple fixtures: PHONE_OWNER_IRON (Ravi,
+#     owner), PHONE_FRONTDESK_IRON (Priya, front_desk — Indiranagar).
+# ---------------------------------------------------------------------------
+printf '\n%s-- owner/front_desk action commands --%s\n' "$B" "$N"
+
+if ! $have_psql; then
+  skipped "PAUSE/RESUME MEMBER, ADD MEMBER, ADD PT, RESET PIN" "requires docker/psql"
+else
+  reset_state
+  PHONE_FRONTDESK_IRON=919000000011   # Priya Nair, front_desk, Iron Temple — Indiranagar
+  ASHA_PHONE_FOR_PAUSE=919999999999   # = PHONE_ACTIVE, reused as the pause/resume target
+
+  # --- front_desk gets its own HELP on unrecognized text (no report commands) ---
+  got=$(send_message "$PHONE_FRONTDESK_IRON" "wamid.$RUN.fd-help" "zzznope")
+  assert_contains "front_desk resolves"                 '"resolution":"front_desk"' "$got"
+  assert_contains "front_desk gets its own command list" "*Here's what you can ask me*" "$(last_out_org "$ORG_IRON")"
+  assert_contains "  ...lists PAUSE MEMBER"              "PAUSE MEMBER" "$(last_out_org "$ORG_IRON")"
+  assert_not_contains "  ...does NOT list REVENUE (report commands are owner-only)" \
+    "REVENUE" "$(last_out_org "$ORG_IRON")"
+  assert_not_contains "  ...does NOT list RESET PIN (owner-only)" \
+    "RESET PIN" "$(last_out_org "$ORG_IRON")"
+
+  # --- PAUSE MEMBER (owner) ---
+  send_cmd "$PHONE_OWNER_IRON" pm-a "PAUSE MEMBER Asha Menon 5 vacation"
+  r=$(last_out_org "$ORG_IRON")
+  assert_contains "owner PAUSE MEMBER pauses Asha for 5 days" "Paused Asha Menon" "$r"
+  assert_contains "  ...names the day count"                  "5 days" "$r"
+  ASHA_MEMBERSHIP_ID=$(sql "select ms.id from memberships ms join members m on m.id=ms.member_id where m.phone='$ASHA_PHONE_FOR_PAUSE' limit 1;")
+  assert_equals "  ...memberships.status is actually frozen" "frozen" \
+    "$(sql "select status from memberships where id='$ASHA_MEMBERSHIP_ID';")"
+
+  # --- pausing an already-frozen membership -> the mapped freeze_membership error ---
+  send_cmd "$PHONE_OWNER_IRON" pm-b "PAUSE MEMBER Asha Menon 3"
+  assert_contains "pausing an already-paused membership gives a clear reply" \
+    "already paused" "$(last_out_org "$ORG_IRON")"
+
+  # --- RESUME MEMBER (owner) ---
+  send_cmd "$PHONE_OWNER_IRON" pm-c "RESUME MEMBER Asha Menon"
+  r=$(last_out_org "$ORG_IRON")
+  assert_contains "owner RESUME MEMBER resumes Asha" "Resumed Asha Menon" "$r"
+  assert_equals "  ...memberships.status is active again" "active" \
+    "$(sql "select status from memberships where id='$ASHA_MEMBERSHIP_ID';")"
+
+  # --- resuming a membership that isn't frozen -> the mapped unfreeze error ---
+  send_cmd "$PHONE_OWNER_IRON" pm-d "RESUME MEMBER Asha Menon"
+  assert_contains "resuming a non-frozen membership gives a clear reply" \
+    "isn't currently paused" "$(last_out_org "$ORG_IRON")"
+
+  # --- invalid days ---
+  send_cmd "$PHONE_OWNER_IRON" pm-e "PAUSE MEMBER Asha Menon 999"
+  assert_contains "days out of range (1-365) is rejected before the RPC" \
+    "between 1 and 365" "$(last_out_org "$ORG_IRON")"
+
+  # --- unknown member ---
+  send_cmd "$PHONE_OWNER_IRON" pm-f "PAUSE MEMBER zzznobody 3"
+  assert_contains "unknown member name -> clean 'not found', not a crash" \
+    "No member found" "$(last_out_org "$ORG_IRON")"
+
+  # --- ambiguous name -> disambiguation, resend-by-phone instruction ---
+  send_cmd "$PHONE_OWNER_IRON" pm-g "PAUSE MEMBER a 3"
+  r=$(last_out_org "$ORG_IRON")
+  assert_contains "ambiguous name lists the matches" "More than one member matches" "$r"
+  assert_contains "  ...tells the sender to resend by phone"   "Resend the command using the phone number" "$r"
+  assert_equals "  ...nobody was actually paused by the ambiguous attempt" "active" \
+    "$(sql "select status from memberships where id='$ASHA_MEMBERSHIP_ID';")"
+
+  # --- front_desk PAUSE MEMBER: own-location member, real RLS-scoped session ---
+  send_cmd "$PHONE_FRONTDESK_IRON" pm-h "PAUSE MEMBER Asha Menon 2 front desk test"
+  r=$(last_out_org "$ORG_IRON")
+  assert_contains "front_desk PAUSE MEMBER works for their own location" "Paused Asha Menon" "$r"
+  sql "delete from membership_freezes where membership_id='$ASHA_MEMBERSHIP_ID';" >/dev/null
+  sql "update memberships set status='active' where id='$ASHA_MEMBERSHIP_ID';" >/dev/null
+
+  # --- cross-org: an Apex owner's PAUSE MEMBER can't touch an Iron member —
+  #     the session minted for them only ever sees their OWN org's members,
+  #     so the name search itself returns zero matches (Apex is reactivated
+  #     for this fixture the same way section 8 does). ---
+  sql "update organizations set status='active' where id='$ORG_APEX';" >/dev/null
+  send_cmd "$PHONE_OWNER" pm-i "PAUSE MEMBER Asha Menon 3"
+  assert_contains "cross-org PAUSE MEMBER finds no such member" "No member found" "$(last_out_org "$ORG_APEX")"
+  assert_equals "  ...Asha's own membership is untouched" "active" \
+    "$(sql "select status from memberships where id='$ASHA_MEMBERSHIP_ID';")"
+  sql "update organizations set status='suspended' where id='$ORG_APEX';" >/dev/null
+
+  # --- ADD MEMBER / ADD PT — owner and front_desk, link + purpose stored ---
+  send_cmd "$PHONE_OWNER_IRON" am-a "ADD MEMBER"
+  r=$(last_out_org "$ORG_IRON")
+  assert_contains "owner ADD MEMBER replies with a members/add link" "/members/add?token=" "$r"
+  RAVI_ID=$(sql "select id from users where phone='$PHONE_OWNER_IRON' and organization_id='$ORG_IRON';")
+  assert_equals "  ...a staff_magic_links row was written with purpose=add_member" "add_member" \
+    "$(sql "select purpose from staff_magic_links where user_id='$RAVI_ID' order by created_at desc limit 1;")"
+
+  send_cmd "$PHONE_FRONTDESK_IRON" ap-a "ADD PT"
+  r=$(last_out_org "$ORG_IRON")
+  assert_contains "front_desk ADD PT replies with a pt/add link" "/pt/add?token=" "$r"
+  PRIYA_ID=$(sql "select id from users where phone='$PHONE_FRONTDESK_IRON' and organization_id='$ORG_IRON';")
+  assert_equals "  ...a staff_magic_links row was written with purpose=add_pt_package" "add_pt_package" \
+    "$(sql "select purpose from staff_magic_links where user_id='$PRIYA_ID' order by created_at desc limit 1;")"
+
+  # --- RESET PIN — owner only ---
+  send_cmd "$PHONE_FRONTDESK_IRON" rp-a "RESET PIN Priya 5555"
+  assert_not_contains "front_desk RESET PIN is not even parsed as a command (falls to HELP)" \
+    "Reset " "$(last_out_org "$ORG_IRON")"
+
+  BEFORE_HASH=$(sql "select pin_hash from users where id='$PRIYA_ID';")
+  send_cmd "$PHONE_OWNER_IRON" rp-b "RESET PIN Priya 5678"
+  r=$(last_out_org "$ORG_IRON")
+  assert_contains "owner RESET PIN succeeds" "Reset Priya Nair's PIN" "$r"
+  AFTER_HASH=$(sql "select pin_hash from users where id='$PRIYA_ID';")
+  if [ -n "$AFTER_HASH" ] && [ "$AFTER_HASH" != "$BEFORE_HASH" ]; then ok "  ...pin_hash actually changed"
+  else bad "  ...pin_hash actually changed" "a new hash" "unchanged"; fi
+  sql "create extension if not exists pgcrypto with schema extensions;" >/dev/null
+  assert_equals "  ...the new hash verifies the new PIN via bcrypt" "t" \
+    "$(sql "select (extensions.crypt('5678', pin_hash) = pin_hash) from users where id='$PRIYA_ID';")"
+
+  # --- unknown staff name ---
+  send_cmd "$PHONE_OWNER_IRON" rp-c "RESET PIN zzznostaff 1234"
+  assert_contains "unknown staff name -> clean 'not found'" "No staff member found" "$(last_out_org "$ORG_IRON")"
+
+  # cleanup: restore Priya's original PIN (1111, seed.sql) so other suites'
+  # login assumptions about her aren't disturbed by this section running.
+  sql "update users set pin_hash = extensions.crypt('1111', extensions.gen_salt('bf', 12)) where id='$PRIYA_ID';" >/dev/null
+  reset_state
 fi
 
 # ---------------------------------------------------------------------------

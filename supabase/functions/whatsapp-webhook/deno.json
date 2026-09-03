@@ -2,6 +2,7 @@
   "imports": {
     "@supabase/functions-js": "jsr:@supabase/functions-js@^2",
     "@supabase/server": "npm:@supabase/server@^1",
-    "@supabase/supabase-js": "npm:@supabase/supabase-js@^2"
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@^2",
+    "bcryptjs": "npm:bcryptjs@^2"
   }
 }

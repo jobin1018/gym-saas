@@ -48,14 +48,12 @@
 // ============================================================================
 
 import "@supabase/functions-js/edge-runtime.d.ts";
-import bcrypt from "bcryptjs";
 import { createAdminClient, type SupabaseClient } from "../_shared/supabase.ts";
 import { corsJson as json, corsPreflightResponse } from "../_shared/cors.ts";
+import { PIN_RE, resetStaffPin } from "../_shared/staff-pin.ts";
 
 const TAG = "staff-pin-reset";
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const PIN_RE = /^\d{4,8}$/; // same keyspace as staff-login
-const BCRYPT_COST = 12;
 
 interface CallerUser {
   id: string;
@@ -152,29 +150,9 @@ async function handleReset(req: Request): Promise<Response> {
 
   const targetUser = target as TargetUser;
 
-  // --- (c) Hash server-side and write, re-scoped by org in the WHERE. ---
-  const pinHash = await bcrypt.hash(newPin, BCRYPT_COST);
-
-  const { error: updateErr } = await admin
-    .from("users")
-    .update({ pin_hash: pinHash })
-    .eq("id", targetUser.id)
-    .eq("organization_id", caller.organization_id);
-
-  if (updateErr) throw updateErr;
-
-  // --- (d) Clear the lockout window so the new PIN works immediately. ---
-  const { error: lockoutErr } = await admin
-    .from("login_attempts")
-    .delete()
-    .eq("organization_id", caller.organization_id)
-    .eq("phone", targetUser.phone);
-
-  if (lockoutErr) {
-    // The PIN is already reset; a stale lockout row just means the staffer
-    // waits out the window. Loud log, not a failure response.
-    console.error(`[${TAG}] pin reset for ${targetUser.id} ok, but clearing login_attempts failed:`, lockoutErr);
-  }
+  // --- (c) Hash server-side, write, clear the lockout window — shared with
+  //         whatsapp-webhook's RESET PIN command (../_shared/staff-pin.ts). ---
+  await resetStaffPin(admin, caller.organization_id, targetUser, newPin, TAG);
 
   console.log(`[${TAG}] owner ${caller.id} reset PIN for ${targetUser.id} (org ${caller.organization_id})`);
 

@@ -23,10 +23,18 @@
 
 // Setup type definitions for built-in Supabase Runtime APIs (Deno.env, etc).
 import "@supabase/functions-js/edge-runtime.d.ts";
-import { createAdminClient, type SupabaseClient } from "../_shared/supabase.ts";
+import { createAdminClient, createAnonClient, createSessionClient, type SupabaseClient } from "../_shared/supabase.ts";
 import { hmacSha256Hex, timingSafeEqualHex } from "../_shared/crypto.ts";
 import { expectedServiceRoleKey } from "../_shared/auth.ts";
 import { orgStatusIsActive } from "../_shared/org-status.ts";
+import {
+  ensureAuthUser,
+  mintSession,
+  syncUserMetadata,
+  syntheticEmail,
+  type StaffSessionUser,
+} from "../_shared/staff-session.ts";
+import { PIN_RE as STAFF_PIN_RE, resetStaffPin } from "../_shared/staff-pin.ts";
 
 // NOTE: we intentionally do NOT use `withSupabase({ auth: [...] })` from
 // @supabase/server here. That wrapper requires a Supabase apiKey on every
@@ -621,6 +629,8 @@ type SenderRole =
   | { kind: "owner_ambiguous"; orgs: { id: string; name: string }[] }
   | { kind: "coach"; userId: string; organizationId: string; name: string }
   | { kind: "coach_ambiguous"; names: string[] }
+  | { kind: "front_desk"; userId: string; organizationId: string; locationId: string; name: string }
+  | { kind: "front_desk_ambiguous"; names: string[] }
   | { kind: "org_suspended"; organizationId: string | null }
   | { kind: "member" };
 
@@ -697,6 +707,35 @@ async function resolveSender(
     return { kind: "org_suspended", organizationId: (coaches ?? [])[0]?.organization_id ?? null };
   }
 
+  // FRONT_DESK — new command surface (PAUSE/RESUME MEMBER, ADD MEMBER, ADD
+  // PT). Same shape as the coach branch above; front_desk additionally
+  // carries location_id since every one of their actions is location-scoped
+  // (enforced by RLS on the session minted for them, not re-derived here).
+  const { data: frontDesk, error: fdErr } = await supabase
+    .from("users")
+    .select("id, name, organization_id, location_id, organizations(status)")
+    .eq("role", "front_desk")
+    .eq("phone", phone);
+  if (fdErr) throw fdErr;
+  const liveFrontDesk = (frontDesk ?? []).filter((f: any) =>
+    orgStatusIsActive(f.organizations?.status)
+  );
+  if (liveFrontDesk.length === 1) {
+    return {
+      kind: "front_desk",
+      userId: liveFrontDesk[0].id,
+      organizationId: liveFrontDesk[0].organization_id,
+      locationId: liveFrontDesk[0].location_id,
+      name: liveFrontDesk[0].name,
+    };
+  }
+  if (liveFrontDesk.length > 1) {
+    return { kind: "front_desk_ambiguous", names: liveFrontDesk.map((f: any) => f.name) };
+  }
+  if ((frontDesk ?? []).length > 0) {
+    return { kind: "org_suspended", organizationId: (frontDesk ?? [])[0]?.organization_id ?? null };
+  }
+
   return { kind: "member" };
 }
 
@@ -733,9 +772,132 @@ function parseCoachCommand(body: string): "myclients" | "session" | "help" {
   return "help";
 }
 
+// ---------------------------------------------------------------------------
+// Owner / front_desk action commands — PAUSE MEMBER, RESUME MEMBER, ADD
+// MEMBER, ADD PT (owner + front_desk), RESET PIN (owner only).
+//
+// These take arguments, so they are parsed against the RAW body (whitespace
+// preserved) BEFORE normalizeCommand's whitespace-stripping — a completely
+// separate path from parseOwnerCommand/parseCoachCommand above, which are
+// unchanged and still handle every single-word command exactly as before.
+// ---------------------------------------------------------------------------
+
+type StaffAction =
+  | { kind: "pause_member"; identifier: string; days: number; reason: string | null }
+  | { kind: "resume_member"; identifier: string }
+  | { kind: "reset_pin"; identifier: string; pin: string }
+  | { kind: "add_member" }
+  | { kind: "add_pt" }
+  | { kind: "none" };
+
+/**
+ * `<identifier> <days> [reason]` — identifier is non-greedy so it stops at
+ * the FIRST run of digits that looks like the days argument, which is
+ * exactly where a real name (however many words) ends and the number
+ * begins. "PAUSE MEMBER Asha Menon 5 going on vacation" -> identifier="Asha
+ * Menon", days=5, reason="going on vacation".
+ */
+function parsePauseMember(body: string): StaffAction {
+  const m = body.trim().match(/^pause\s+member\s+(.+?)\s+(\d{1,3})(?:\s+(.+))?$/i);
+  if (!m) return { kind: "none" };
+  const days = parseInt(m[2], 10);
+  return { kind: "pause_member", identifier: m[1].trim(), days, reason: m[3]?.trim() || null };
+}
+
+function parseResumeMember(body: string): StaffAction {
+  const m = body.trim().match(/^resume\s+member\s+(.+)$/i);
+  if (!m) return { kind: "none" };
+  return { kind: "resume_member", identifier: m[1].trim() };
+}
+
+function parseResetPin(body: string): StaffAction {
+  const m = body.trim().match(/^reset\s+pin\s+(.+?)\s+(\d{4,8})\s*$/i);
+  if (!m) return { kind: "none" };
+  return { kind: "reset_pin", identifier: m[1].trim(), pin: m[2] };
+}
+
+/** Shared by owner and front_desk — the 4 commands both roles get. */
+function parseMemberOrPtAction(body: string): StaffAction {
+  const t = body.trim();
+  const pause = parsePauseMember(t);
+  if (pause.kind !== "none") return pause;
+  const resume = parseResumeMember(t);
+  if (resume.kind !== "none") return resume;
+  if (/^add\s+member$/i.test(t)) return { kind: "add_member" };
+  if (/^add\s+pt$/i.test(t)) return { kind: "add_pt" };
+  return { kind: "none" };
+}
+
+// --- name-or-phone member/staff resolution ---------------------------------
+
+interface NameOrPhoneMatch { id: string; name: string; phone: string; }
+type ResolveResult =
+  | { kind: "one"; match: NameOrPhoneMatch }
+  | { kind: "none" }
+  | { kind: "many"; matches: NameOrPhoneMatch[] };
+
+const PHONE_LOOKUP_RE = /^\+?[\d\s-]{7,17}$/;
+
+/**
+ * Resolves a free-text `<name-or-phone>` argument against `table` (members
+ * or users), through `client` — pass a session client minted for the actual
+ * caller so RLS does the org/location scoping (owner: org-wide; front_desk:
+ * their own location for members; org-wide for users, since staff PIN reset
+ * is owner-only and owner sees the whole org's staff). A digit-shaped
+ * identifier is matched EXACTLY by phone (unambiguous by construction); a
+ * name-shaped one is matched by ILIKE substring, capped at 6 to keep a
+ * disambiguation reply readable.
+ *
+ * On multiple matches, callers ask the sender to resend using the phone
+ * number instead — deliberately NOT a stateful "reply 1/2/3" flow (no
+ * pending-command table exists, and every other owner/staff command in this
+ * system is already a single self-contained message; inventing conversation
+ * state for just this would be a new mechanism, not a reuse of one).
+ */
+async function resolveByNameOrPhone(
+  client: SupabaseClient,
+  table: "members" | "users",
+  org: string,
+  identifier: string,
+): Promise<ResolveResult> {
+  const digits = identifier.replace(/\D/g, "");
+  if (PHONE_LOOKUP_RE.test(identifier) && digits.length >= 7) {
+    const { data, error } = await client
+      .from(table)
+      .select("id, name, phone")
+      .eq("organization_id", org)
+      .eq("phone", digits)
+      .limit(1);
+    if (error) throw error;
+    if (!data || data.length === 0) return { kind: "none" };
+    return { kind: "one", match: data[0] as NameOrPhoneMatch };
+  }
+
+  const { data, error } = await client
+    .from(table)
+    .select("id, name, phone")
+    .eq("organization_id", org)
+    .ilike("name", `%${identifier}%`)
+    .limit(6);
+  if (error) throw error;
+  if (!data || data.length === 0) return { kind: "none" };
+  if (data.length === 1) return { kind: "one", match: data[0] as NameOrPhoneMatch };
+  return { kind: "many", matches: data as NameOrPhoneMatch[] };
+}
+
+function formatDisambiguation(subject: string, matches: NameOrPhoneMatch[], verb: string): string {
+  const lines = matches.map((m) => `${m.name} — ${m.phone}`);
+  return [
+    `More than one ${subject} matches that name:`,
+    ...lines,
+    ``,
+    `Resend the command using the phone number instead, e.g. "${verb} ${matches[0].phone} ..."`,
+  ].join("\n");
+}
+
 /**
  * base64url (RFC 4648 §5, no padding) of raw bytes. 32 bytes -> 43 chars,
- * matching validate-magic-link's TOKEN_RE and the coach_magic_links.token
+ * matching validate-magic-link's TOKEN_RE and the staff_magic_links.token
  * column. Local so whatsapp-webhook has no new shared-module dependency.
  */
 function base64Url(bytes: Uint8Array): string {
@@ -753,6 +915,21 @@ function coachQuickLogUrl(token: string): string {
   const base = (Deno.env.get("COACH_QUICK_LOG_BASE_URL") ?? "http://localhost:5173")
     .replace(/\/+$/, "");
   return `${base}/coach/quick-log?token=${token}`;
+}
+
+/** Where the ADD MEMBER magic-link page lives. Own env var, same default as
+ *  every other *_BASE_URL here, so it can be routed independently later. */
+function addMemberUrl(token: string): string {
+  const base = (Deno.env.get("ADD_MEMBER_BASE_URL") ?? "http://localhost:5173")
+    .replace(/\/+$/, "");
+  return `${base}/members/add?token=${token}`;
+}
+
+/** Where the ADD PT magic-link page lives. */
+function addPtUrl(token: string): string {
+  const base = (Deno.env.get("ADD_PT_BASE_URL") ?? "http://localhost:5173")
+    .replace(/\/+$/, "");
+  return `${base}/pt/add?token=${token}`;
 }
 
 // --- formatting helpers -------------------------------------------------
@@ -1106,6 +1283,13 @@ function ownerHelp(): string {
     `*COACHES* — who's active, who's gone quiet`,
     `*PT* — packages running low or expiring`,
     ``,
+    `*Manage*`,
+    `*PAUSE MEMBER <name-or-phone> <days> [reason]* — pause a membership`,
+    `*RESUME MEMBER <name-or-phone>* — end a pause early`,
+    `*ADD MEMBER* — a link to add a new member`,
+    `*ADD PT* — a link to add a PT package`,
+    `*RESET PIN <staff-name-or-phone> <new-4-digit-pin>* — reset a staff PIN`,
+    ``,
     `Just text the word — no need for anything else.`,
     ``,
     `Powered by Gymdean`,
@@ -1159,24 +1343,29 @@ async function coachMyClients(
   ].join("\n");
 }
 
+type MagicLinkPurpose = "session_log" | "add_member" | "add_pt_package";
+
 /**
- * SESSION / LOG — mint a single-use, 15-minute magic link into the coach
- * quick-log page and reply with it.
+ * Mint a single-use, 15-minute magic link (staff_magic_links) for ANY
+ * purpose and return its token. Shared by SESSION/LOG (coach), ADD MEMBER
+ * and ADD PT (owner/front_desk) — one generator, `purpose` says what it's
+ * for, exactly the reuse-not-duplicate shape 20260907090000 generalized the
+ * table for.
  *
- * The link is an auth-bypass mechanism (validate-magic-link redeems the token
- * for a real coach session with no PIN), so:
+ * The link is an auth-bypass mechanism (validate-magic-link redeems the
+ * token for a real session with no PIN), so:
  *   * the token is 256 bits of CSPRNG output — unguessable;
- *   * the coach_magic_links row is written BEFORE the reply goes out, so
+ *   * the staff_magic_links row is written BEFORE the reply goes out, so
  *     generation is always audited even if the Meta send then fails;
- *   * expiry is short and single-use is enforced at redemption (see
- *     validate-magic-link + the migration header).
+ *   * expiry is short and single-use is enforced at redemption, decided
+ *     entirely by Postgres's own clock (see claim_staff_magic_link).
  * This function only GENERATES; it never establishes a session itself.
  */
-async function coachStartSession(
+async function generateMagicLink(
   supabase: SupabaseClient,
-  coachUserId: string,
-  coachOrg: string,
-  coachName: string,
+  userId: string,
+  org: string,
+  purpose: MagicLinkPurpose,
 ): Promise<string> {
   const raw = new Uint8Array(32);
   crypto.getRandomValues(raw);
@@ -1184,12 +1373,13 @@ async function coachStartSession(
   const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
 
   const { data: row, error } = await supabase
-    .from("coach_magic_links")
+    .from("staff_magic_links")
     .insert({
-      coach_user_id: coachUserId,
-      organization_id: coachOrg,
+      user_id: userId,
+      organization_id: org,
       token,
       expires_at: expiresAt,
+      purpose,
     })
     .select("id")
     .single();
@@ -1198,16 +1388,194 @@ async function coachStartSession(
   // Generation audit line — pairs with validate-magic-link's redemption line
   // (same link id) for the full trail on this auth-bypass path.
   console.log(
-    `[whatsapp-webhook] magic-link generated id=${row.id} coach=${coachUserId} ` +
-      `org=${coachOrg} expires=${expiresAt}`,
+    `[whatsapp-webhook] magic-link generated id=${row.id} purpose=${purpose} user=${userId} ` +
+      `org=${org} expires=${expiresAt}`,
   );
 
+  return token;
+}
+
+/** SESSION / LOG — coach only. */
+async function coachStartSession(
+  supabase: SupabaseClient,
+  coachUserId: string,
+  coachOrg: string,
+  coachName: string,
+): Promise<string> {
+  const token = await generateMagicLink(supabase, coachUserId, coachOrg, "session_log");
   return [
     `🏋️ ${coachName} — tap to log a session:`,
     coachQuickLogUrl(token),
     ``,
     `Valid for 15 minutes, one use. It signs you in on this device — don't forward it.`,
   ].join("\n");
+}
+
+/** ADD MEMBER — owner + front_desk. */
+async function ownerAddMember(
+  supabase: SupabaseClient,
+  userId: string,
+  org: string,
+): Promise<string> {
+  const token = await generateMagicLink(supabase, userId, org, "add_member");
+  return [
+    `📝 Tap to add a new member:`,
+    addMemberUrl(token),
+    ``,
+    `Valid for 15 minutes, one use. It signs you in on this device — don't forward it.`,
+  ].join("\n");
+}
+
+/** ADD PT — owner + front_desk. */
+async function ownerAddPt(
+  supabase: SupabaseClient,
+  userId: string,
+  org: string,
+): Promise<string> {
+  const token = await generateMagicLink(supabase, userId, org, "add_pt_package");
+  return [
+    `🏋️ Tap to add a PT package:`,
+    addPtUrl(token),
+    ``,
+    `Valid for 15 minutes, one use. It signs you in on this device — don't forward it.`,
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// PAUSE MEMBER / RESUME MEMBER — owner + front_desk, direct reply (no magic
+// link). Both mint a real session for the SENDER (same bridge validate-
+// magic-link uses) and call freeze_membership/unfreeze_membership through
+// it, so those RPCs' own auth.jwt()-driven org/location checks apply exactly
+// as they would for a normal PIN-logged-in session — no duplicated
+// authorization logic here. See _shared/supabase.ts's createSessionClient
+// for why.
+// ---------------------------------------------------------------------------
+
+interface StaffSender { userId: string; organizationId: string; name: string; role: "owner" | "front_desk"; }
+
+/**
+ * Mints a session for `sender` and returns a client authenticated as them,
+ * for the remainder of THIS request only — never returned to WhatsApp.
+ */
+async function mintSenderSessionClient(
+  admin: SupabaseClient,
+  sender: StaffSender,
+): Promise<SupabaseClient> {
+  const staffUser: StaffSessionUser = { id: sender.userId, auth_user_id: null, name: sender.name, role: sender.role };
+  // Re-read auth_user_id fresh (StaffSessionUser above deliberately omits it
+  // so a stale one is never trusted) — ensureAuthUser needs the real value
+  // to avoid minting a duplicate auth.users row on every command.
+  const { data: row, error } = await admin
+    .from("users").select("auth_user_id").eq("id", sender.userId).maybeSingle();
+  if (error) throw error;
+  staffUser.auth_user_id = (row as any)?.auth_user_id ?? null;
+
+  const authUserId = await ensureAuthUser(admin, staffUser, "whatsapp-webhook");
+  await syncUserMetadata(admin, authUserId, staffUser, "whatsapp-webhook");
+  const anon = createAnonClient();
+  const session = await mintSession(admin, anon, syntheticEmail(sender.userId));
+  return createSessionClient(session.accessToken);
+}
+
+const FREEZE_ERROR_REPLIES: Record<string, string> = {
+  membership_not_found: "Couldn't find an active membership for that member.",
+  membership_already_frozen: "That membership is already paused.",
+  membership_past_due: "That membership is past due — it can't be paused until it's current.",
+  membership_expired: "That membership has expired — it can't be paused.",
+  membership_cancelled: "That membership is cancelled — it can't be paused.",
+  membership_not_active: "That membership isn't active, so it can't be paused.",
+  days_invalid: "Days must be a number between 1 and 365.",
+  not_authorized: "You're not authorized to pause memberships.",
+  organization_suspended: "This gym's account is currently inactive.",
+};
+
+const UNFREEZE_ERROR_REPLIES: Record<string, string> = {
+  membership_not_found: "Couldn't find that member's membership.",
+  membership_not_frozen: "That membership isn't currently paused.",
+  not_authorized: "You're not authorized to resume memberships.",
+  organization_suspended: "This gym's account is currently inactive.",
+};
+
+async function pauseMember(admin: SupabaseClient, sender: StaffSender, action: Extract<StaffAction, { kind: "pause_member" }>): Promise<string> {
+  if (action.days < 1 || action.days > 365) {
+    return FREEZE_ERROR_REPLIES.days_invalid;
+  }
+  // One session for this whole command: the member search AND the RPC call
+  // both go through it, so RLS (org-wide for owner, own-location for
+  // front_desk) scopes the search exactly as it will scope the write.
+  const session = await mintSenderSessionClient(admin, sender);
+
+  const resolved = await resolveByNameOrPhone(session, "members", sender.organizationId, action.identifier);
+  if (resolved.kind === "none") return `No member found matching "${action.identifier}".`;
+  if (resolved.kind === "many") return formatDisambiguation("member", resolved.matches, "PAUSE MEMBER");
+
+  const membership = await loadLatestMembership(session, sender.organizationId, resolved.match.id);
+  if (!membership) return FREEZE_ERROR_REPLIES.membership_not_found;
+
+  const { data, error } = await session.rpc("freeze_membership", {
+    p_membership_id: membership.id, p_days: action.days, p_reason: action.reason,
+  });
+  if (error) {
+    const code = (error as any).message ?? "";
+    console.log(`[whatsapp-webhook] PAUSE MEMBER failed for ${resolved.match.id}: ${code}`);
+    return FREEZE_ERROR_REPLIES[code] ?? `Couldn't pause that membership (${code}).`;
+  }
+  const row = Array.isArray(data) ? data[0] : data;
+  return `⏸️ Paused ${resolved.match.name}'s membership for ${action.days} days, until ${fmtDay(row.frozen_until)}.`;
+}
+
+async function resumeMember(admin: SupabaseClient, sender: StaffSender, action: Extract<StaffAction, { kind: "resume_member" }>): Promise<string> {
+  const session = await mintSenderSessionClient(admin, sender);
+
+  const resolved = await resolveByNameOrPhone(session, "members", sender.organizationId, action.identifier);
+  if (resolved.kind === "none") return `No member found matching "${action.identifier}".`;
+  if (resolved.kind === "many") return formatDisambiguation("member", resolved.matches, "RESUME MEMBER");
+
+  const membership = await loadLatestMembership(session, sender.organizationId, resolved.match.id);
+  if (!membership) return UNFREEZE_ERROR_REPLIES.membership_not_found;
+
+  const { data, error } = await session.rpc("unfreeze_membership", { p_membership_id: membership.id });
+  if (error) {
+    const code = (error as any).message ?? "";
+    console.log(`[whatsapp-webhook] RESUME MEMBER failed for ${resolved.match.id}: ${code}`);
+    return UNFREEZE_ERROR_REPLIES[code] ?? `Couldn't resume that membership (${code}).`;
+  }
+  const row = Array.isArray(data) ? data[0] : data;
+  return `▶️ Resumed ${resolved.match.name}'s membership — ${row.days_frozen} day${row.days_frozen === 1 ? "" : "s"} credited back.`;
+}
+
+// ---------------------------------------------------------------------------
+// RESET PIN — owner only, direct reply. Resolves the target staff member by
+// name/phone against `users` (org-scoped explicitly; `users` has no RLS
+// grant for `authenticated` at all — see the shared helper's own note), then
+// delegates the actual hash+write+lockout-clear to ../_shared/staff-pin.ts,
+// the EXACT same code path staff-pin-reset uses.
+// ---------------------------------------------------------------------------
+
+function frontDeskHelp(): string {
+  return [
+    `*Here's what you can ask me* 📋`,
+    ``,
+    `*PAUSE MEMBER <name-or-phone> <days> [reason]* — pause a membership`,
+    `*RESUME MEMBER <name-or-phone>* — end a pause early`,
+    `*ADD MEMBER* — a link to add a new member`,
+    `*ADD PT* — a link to add a PT package`,
+  ].join("\n");
+}
+
+async function resetPin(admin: SupabaseClient, sender: StaffSender, action: Extract<StaffAction, { kind: "reset_pin" }>): Promise<string> {
+  const resolved = await resolveByNameOrPhone(admin, "users", sender.organizationId, action.identifier);
+  if (resolved.kind === "none") return `No staff member found matching "${action.identifier}".`;
+  if (resolved.kind === "many") return formatDisambiguation("staff member", resolved.matches, "RESET PIN");
+  if (!STAFF_PIN_RE.test(action.pin)) return "PIN must be 4 digits.";
+
+  await resetStaffPin(
+    admin, sender.organizationId,
+    { id: resolved.match.id, organization_id: sender.organizationId, phone: resolved.match.phone },
+    action.pin, "whatsapp-webhook",
+  );
+  console.log(`[whatsapp-webhook] owner ${sender.userId} reset PIN for ${resolved.match.id} via WhatsApp (org ${sender.organizationId})`);
+  return `🔑 Reset ${resolved.match.name}'s PIN. Tell them their new PIN privately — this reply is the only record.`;
 }
 
 function coachHelp(coachName: string): string {
@@ -1229,9 +1597,54 @@ async function handleStaffCommand(
 
   if (sender.kind === "owner") {
     orgForLog = sender.organizationId;
-    const cmd = parseOwnerCommand(message.body);
-    console.log(`[whatsapp-webhook] owner phone=${phone} org=${sender.organizationId} cmd=${cmd}`);
-    reply = await handleOwnerCommand(supabase, cmd, sender.organizationId, sender.orgName);
+    // Owner commands with args are tried FIRST, against the raw (whitespace-
+    // preserved) body — parseOwnerCommand below strips all whitespace, so it
+    // could never parse these anyway. Falls through unchanged to the
+    // existing simple-command path when nothing matches.
+    const action = parseMemberOrPtAction(message.body);
+    const resetAction = action.kind === "none" ? parseResetPin(message.body) : { kind: "none" as const };
+    // Owner needs a real userId/name for PAUSE/RESUME/ADD/RESET PIN (session
+    // minting, audit logging) — sender.kind === "owner" only carries org id/
+    // name (it can resolve purely from organizations.owner_phone, with no
+    // users row at all — a valid, already-supported state: the org's
+    // original signup contact, never given a staff login). Resolved on
+    // demand, only when one of these commands is actually used. Returns null
+    // rather than throwing so a missing users row reads as a clean WhatsApp
+    // reply, not a 500.
+    async function ownerAsStaffSender(): Promise<StaffSender | null> {
+      const { data, error } = await supabase
+        .from("users").select("id, name")
+        .eq("organization_id", sender.organizationId).eq("phone", phone).eq("role", "owner")
+        .maybeSingle();
+      if (error) throw error;
+      if (!data) return null;
+      return { userId: (data as any).id, organizationId: sender.organizationId, name: (data as any).name, role: "owner" };
+    }
+    const NO_STAFF_LOGIN_REPLY =
+      "Your number is this gym's registered contact, but you don't have a staff login yet — " +
+      "ask an existing owner to add you via the admin dashboard.";
+
+    console.log(`[whatsapp-webhook] owner phone=${phone} org=${sender.organizationId} action=${action.kind !== "none" ? action.kind : resetAction.kind !== "none" ? resetAction.kind : "simple"}`);
+
+    if (action.kind === "pause_member" || action.kind === "resume_member" || action.kind === "add_member" || action.kind === "add_pt" || resetAction.kind === "reset_pin") {
+      const staffSender = await ownerAsStaffSender();
+      if (!staffSender) {
+        reply = NO_STAFF_LOGIN_REPLY;
+      } else if (action.kind === "pause_member") {
+        reply = await pauseMember(supabase, staffSender, action);
+      } else if (action.kind === "resume_member") {
+        reply = await resumeMember(supabase, staffSender, action);
+      } else if (action.kind === "add_member") {
+        reply = await ownerAddMember(supabase, staffSender.userId, sender.organizationId);
+      } else if (action.kind === "add_pt") {
+        reply = await ownerAddPt(supabase, staffSender.userId, sender.organizationId);
+      } else {
+        reply = await resetPin(supabase, staffSender, resetAction as Extract<StaffAction, { kind: "reset_pin" }>);
+      }
+    } else {
+      const cmd = parseOwnerCommand(message.body);
+      reply = await handleOwnerCommand(supabase, cmd, sender.organizationId, sender.orgName);
+    }
   } else if (sender.kind === "coach") {
     orgForLog = sender.organizationId;
     const cmd = parseCoachCommand(message.body);
@@ -1241,9 +1654,23 @@ async function handleStaffCommand(
       : cmd === "session"
       ? await coachStartSession(supabase, sender.userId, sender.organizationId, sender.name)
       : coachHelp(sender.name);
+  } else if (sender.kind === "front_desk") {
+    orgForLog = sender.organizationId;
+    const staffSender: StaffSender = { userId: sender.userId, organizationId: sender.organizationId, name: sender.name, role: "front_desk" };
+    const action = parseMemberOrPtAction(message.body);
+    console.log(`[whatsapp-webhook] front_desk phone=${phone} org=${sender.organizationId} action=${action.kind}`);
+    reply = action.kind === "pause_member"
+      ? await pauseMember(supabase, staffSender, action)
+      : action.kind === "resume_member"
+      ? await resumeMember(supabase, staffSender, action)
+      : action.kind === "add_member"
+      ? await ownerAddMember(supabase, sender.userId, sender.organizationId)
+      : action.kind === "add_pt"
+      ? await ownerAddPt(supabase, sender.userId, sender.organizationId)
+      : frontDeskHelp();
   } else if (sender.kind === "org_suspended") {
-    // Every gym this phone is an owner/coach at is suspended. No commands, no
-    // magic links — just say why, same copy as the member path.
+    // Every gym this phone is an owner/coach/front_desk at is suspended. No
+    // commands, no magic links — just say why, same copy as the member path.
     orgForLog = sender.organizationId;
     console.log(`[whatsapp-webhook] staff phone=${phone} org=${sender.organizationId} — suspended, no commands.`);
     reply = REPLY.orgInactive;
@@ -1256,11 +1683,17 @@ async function handleStaffCommand(
       `This number is the registered owner contact for more than one gym (${names}). ` +
       `WhatsApp commands can't tell them apart yet — please use the owner dashboard, ` +
       `or contact support to split the numbers.`;
-  } else {
+  } else if (sender.kind === "coach_ambiguous") {
     const names = sender.names.join(", ");
     reply =
       `This number is registered as a coach at more than one gym (${names}). ` +
       `WhatsApp commands can't tell them apart yet — please use the coach app.`;
+  } else {
+    // front_desk_ambiguous
+    const names = sender.names.join(", ");
+    reply =
+      `This number is registered as front-desk staff at more than one gym (${names}). ` +
+      `WhatsApp commands can't tell them apart yet — please use the admin dashboard.`;
   }
 
   await logInboundMessage(supabase, message, { memberId: null, organizationId: orgForLog });

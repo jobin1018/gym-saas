@@ -77,18 +77,19 @@ vml_status() { curl -s -o /dev/null -w '%{http_code}' -X POST "$VML_URL" -H "Aut
 # A fresh base64url token (32 bytes -> 43 chars), matching the generator's shape.
 new_token() { openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=\n'; }
 
-# Insert a coach_magic_links row directly. <token> <coach_id> <org> <expires-sql> [used-sql]
+# Insert a staff_magic_links row directly.
+# <token> <user_id> <org> <expires-sql> [used-sql] [purpose, default session_log]
 insert_link() {
   docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
-INSERT INTO coach_magic_links (coach_user_id, organization_id, token, expires_at, used_at)
-VALUES ('$2', '$3', '$1', $4, ${5:-NULL});
+INSERT INTO staff_magic_links (user_id, organization_id, token, expires_at, used_at, purpose)
+VALUES ('$2', '$3', '$1', $4, ${5:-NULL}, '${6:-session_log}');
 SQL
 }
 
 reset_state() {
   $have_psql || return 0
   docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
-DELETE FROM coach_magic_links WHERE coach_user_id IN ('$FARAH_ID', '$DEACT_COACH_ID');
+DELETE FROM staff_magic_links WHERE user_id IN ('$FARAH_ID', '$DEACT_COACH_ID');
 DELETE FROM training_notes  WHERE coach_id = '$DEACT_COACH_ID';
 DELETE FROM users           WHERE id = '$DEACT_COACH_ID';
 DELETE FROM whatsapp_messages
@@ -147,7 +148,7 @@ assert_contains "  ...returns an access_token"          '"access_token":"' "$got
 assert_contains "  ...returns a refresh_token"          '"refresh_token":"' "$got"
 assert_contains "  ...session is scoped role=coach"     '"role":"coach"' "$got"
 assert_contains "  ...and to the coach's own org"       "\"organization_id\":\"$ORG_IRON\"" "$got"
-assert_equals   "  ...the row is now marked used"       "t" "$(sql "select (used_at is not null) from coach_magic_links where token='$T_OK'")"
+assert_equals   "  ...the row is now marked used"       "t" "$(sql "select (used_at is not null) from staff_magic_links where token='$T_OK'")"
 
 # The minted token is a genuine session: it can read the coach's own clients.
 AT=$(printf '%s' "$got" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
@@ -160,7 +161,7 @@ assert_contains "minted session can read pt_packages under normal RLS" '"id":' "
 printf '\n%s-- reuse is refused --%s\n' "$B" "$N"
 assert_contains "redeeming the same link again -> link_already_used" '"error":"link_already_used"' "$(vml "{\"token\":\"$T_OK\"}")"
 assert_equals   "  ...410, not 200"                                  "410" "$(vml_status "{\"token\":\"$T_OK\"}")"
-assert_equals   "  ...still exactly one used row for this token"      "1" "$(sql "select count(*) from coach_magic_links where token='$T_OK' and used_at is not null")"
+assert_equals   "  ...still exactly one used row for this token"      "1" "$(sql "select count(*) from staff_magic_links where token='$T_OK' and used_at is not null")"
 
 # ---------------------------------------------------------------------------
 # 4. Expiry — a link past its window fails, and is NOT consumed
@@ -171,7 +172,7 @@ insert_link "$T_EXP" "$FARAH_ID" "$ORG_IRON" "now() - interval '1 minute'"
 assert_contains "an expired link -> link_expired"        '"error":"link_expired"' "$(vml "{\"token\":\"$T_EXP\"}")"
 assert_equals   "  ...410, not 200"                      "410" "$(vml_status "{\"token\":\"$T_EXP\"}")"
 assert_equals   "  ...the claim did NOT stamp used_at on an expired row" "f" \
-  "$(sql "select (used_at is not null) from coach_magic_links where token='$T_EXP'")"
+  "$(sql "select (used_at is not null) from staff_magic_links where token='$T_EXP'")"
 
 # ---------------------------------------------------------------------------
 # 5. Deactivated coach — link is claimed but no session is minted
@@ -181,7 +182,7 @@ T_DEACT=$(new_token); T_DEACT2=$(new_token)
 insert_link "$T_DEACT"  "$DEACT_COACH_ID" "$ORG_IRON" "now() + interval '15 minutes'"
 insert_link "$T_DEACT2" "$DEACT_COACH_ID" "$ORG_IRON" "now() + interval '15 minutes'"
 got=$(vml "{\"token\":\"$T_DEACT\"}")
-assert_contains "deactivated coach -> coach_unavailable" '"error":"coach_unavailable"' "$got"
+assert_contains "deactivated coach -> staff_unavailable" '"error":"staff_unavailable"' "$got"
 assert_equals   "  ...403, not 200"                      "403" "$(vml_status "{\"token\":\"$T_DEACT2\"}")"
 assert_not_contains "  ...no session was minted"         '"access_token"' "$got"
 
@@ -215,7 +216,7 @@ else
     bad "coach texts SESSION -> receives a magic link" "a /coach/quick-log?token=… line" "$LINK"
   else
     ok "coach texts SESSION -> receives a magic link"
-    row=$(sql "select (used_at is null)||'|'||(expires_at > now())::text||'|'||coach_user_id from coach_magic_links where token='$E2E_TOKEN'")
+    row=$(sql "select (used_at is null)||'|'||(expires_at > now())::text||'|'||user_id from staff_magic_links where token='$E2E_TOKEN'")
     assert_equals "  ...persisted unused, unexpired, scoped to this coach" "true|true|$FARAH_ID" "$row"
     e2e=$(vml "{\"token\":\"$E2E_TOKEN\"}")
     assert_contains "  ...that link redeems for a coach session" '"ok":true' "$e2e"
@@ -231,7 +232,7 @@ fi
 #    simulate "waited past 15 minutes", and proves redemption is genuinely
 #    denied. This is the direct regression test for the reported bug: a
 #    client-computed "now" reaching the comparison (fixed by
-#    claim_coach_magic_link, 20260906090000) would have let a link like this
+#    claim_staff_magic_link, 20260906090000) would have let a link like this
 #    one through if the edge runtime's clock ran meaningfully behind
 #    Postgres's — this test only trusts Postgres's own clock throughout, same
 #    as the fixed code now does.
@@ -261,14 +262,14 @@ else
     # past it" by moving expires_at to 1 second ago — right at the boundary,
     # not minutes past it, so this cannot pass by coincidence or a wide
     # margin for error.
-    sql "update coach_magic_links set expires_at = now() - interval '1 second' where token='$BOUND_TOKEN'" >/dev/null
+    sql "update staff_magic_links set expires_at = now() - interval '1 second' where token='$BOUND_TOKEN'" >/dev/null
 
     boundary_resp=$(vml "{\"token\":\"$BOUND_TOKEN\"}")
     assert_contains "a REAL generated link, backdated 1s past expiry, is denied" \
       '"error":"link_expired"' "$boundary_resp"
     assert_not_contains "  ...no session was minted for it" '"access_token"' "$boundary_resp"
     assert_equals "  ...the claim did NOT stamp used_at" "f" \
-      "$(sql "select (used_at is not null) from coach_magic_links where token='$BOUND_TOKEN'")"
+      "$(sql "select (used_at is not null) from staff_magic_links where token='$BOUND_TOKEN'")"
   fi
 fi
 
@@ -316,8 +317,55 @@ else
     "one ok:true + one link_already_used" "$race_a | $race_b"; fi
 
   assert_equals "  ...exactly one used_at stamp on the row, not zero or two" "1" \
-    "$(sql "select count(*) from coach_magic_links where token='$T_RACE' and used_at is not null")"
+    "$(sql "select count(*) from staff_magic_links where token='$T_RACE' and used_at is not null")"
 fi
+
+# ---------------------------------------------------------------------------
+# 9. Purpose scoping (20260907090000) — the generalized table serves ANY
+#    staff role, discriminated by `purpose`; PURPOSE_ROLES in index.ts is
+#    the one place that gates which role may redeem which purpose.
+# ---------------------------------------------------------------------------
+printf '\n%s-- purpose scoping --%s\n' "$B" "$N"
+
+RAVI_ID=91111111-1111-1111-1111-111111111111       # owner, Iron Temple
+PRIYA_ID=92222222-2222-2222-2222-222222222222       # front_desk, Iron Temple
+
+T_ADD_MEMBER=$(new_token)
+insert_link "$T_ADD_MEMBER" "$RAVI_ID" "$ORG_IRON" "now() + interval '15 minutes'" NULL add_member
+got=$(vml "{\"token\":\"$T_ADD_MEMBER\"}")
+assert_contains "owner redeems an add_member link -> ok"        '"ok":true' "$got"
+assert_contains "  ...role in the response is owner"            '"role":"owner"' "$got"
+assert_contains "  ...purpose in the response is add_member"    '"purpose":"add_member"' "$got"
+
+T_ADD_PT=$(new_token)
+insert_link "$T_ADD_PT" "$PRIYA_ID" "$ORG_IRON" "now() + interval '15 minutes'" NULL add_pt_package
+got=$(vml "{\"token\":\"$T_ADD_PT\"}")
+assert_contains "front_desk redeems an add_pt_package link -> ok" '"ok":true' "$got"
+assert_contains "  ...role in the response is front_desk"         '"role":"front_desk"' "$got"
+assert_contains "  ...purpose in the response is add_pt_package"  '"purpose":"add_pt_package"' "$got"
+
+# A coach's own token, purpose add_member (can't happen through whatsapp-webhook's
+# own generator — coachStartSession only ever writes purpose='session_log' —
+# but the redemption endpoint must not trust that; it re-derives the role
+# check from the CURRENT purpose+role pairing every time). Two separate
+# tokens for the body-check and the status-check — a single token is
+# single-use, so a second call against the SAME one would correctly see
+# link_already_used instead, not re-prove the role check.
+T_WRONG_ROLE=$(new_token); T_WRONG_ROLE2=$(new_token)
+insert_link "$T_WRONG_ROLE"  "$FARAH_ID" "$ORG_IRON" "now() + interval '15 minutes'" NULL add_member
+insert_link "$T_WRONG_ROLE2" "$FARAH_ID" "$ORG_IRON" "now() + interval '15 minutes'" NULL add_member
+got=$(vml "{\"token\":\"$T_WRONG_ROLE\"}")
+assert_contains "a coach's token for an add_member-purpose link is refused" '"error":"staff_unavailable"' "$got"
+assert_not_contains "  ...no session was minted (still ok:false)" '"access_token"' "$got"
+assert_equals   "  ...403, not 200"                                        "403" "$(vml_status "{\"token\":\"$T_WRONG_ROLE2\"}")"
+
+# The reverse: an owner's token for session_log (coach-only purpose).
+T_OWNER_SESSION_LOG=$(new_token)
+insert_link "$T_OWNER_SESSION_LOG" "$RAVI_ID" "$ORG_IRON" "now() + interval '15 minutes'" NULL session_log
+assert_contains "an owner's token for a session_log-purpose link is refused" '"error":"staff_unavailable"' \
+  "$(vml "{\"token\":\"$T_OWNER_SESSION_LOG\"}")"
+
+sql "delete from staff_magic_links where user_id in ('$RAVI_ID', '$PRIYA_ID');" >/dev/null
 
 # ---------------------------------------------------------------------------
 reset_state
