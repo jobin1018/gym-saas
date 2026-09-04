@@ -368,6 +368,114 @@ assert_contains "an owner's token for a session_log-purpose link is refused" '"e
 sql "delete from staff_magic_links where user_id in ('$RAVI_ID', '$PRIYA_ID');" >/dev/null
 
 # ---------------------------------------------------------------------------
+# 10. Expiry-at-the-boundary + single-use-under-a-race, for add_member and
+#     add_pt_package specifically — sections 7/8 above already prove this for
+#     session_log (coach); this closes the same gap for the other two
+#     purposes rather than assuming the shared claim_staff_magic_link() code
+#     path makes a per-purpose re-proof redundant. It doesn't make the
+#     underlying mechanism ANY different (there is exactly one claim
+#     function, called identically regardless of purpose — see index.ts and
+#     20260907090000) but a purpose-specific regression guard is cheap
+#     insurance against ever again saying "it must be fine, it's the same
+#     code" without having actually re-run it for every purpose.
+# ---------------------------------------------------------------------------
+printf '\n%s-- expiry boundary + single-use race, per purpose (add_member / add_pt_package) --%s\n' "$B" "$N"
+
+RAVI_PHONE=919000000001    # owner, Iron Temple
+PRIYA_PHONE=919000000011   # front_desk, Iron Temple
+
+# <purpose> <phone> <wa-command> <expected-role> <expected-name>
+test_purpose_boundary_and_race() {
+  local purpose="$1" phone="$2" cmd="$3" role="$4" name="$5"
+
+  if [ -n "$e2e_skip" ]; then
+    skipped "$purpose: real link backdated past expiry is denied" "$e2e_skip"
+    skipped "$purpose: exactly one of two simultaneous redemptions succeeds" "$e2e_skip"
+    return
+  fi
+
+  # --- boundary: generate via the REAL command, backdate 1s past expiry ---
+  local envelope wargs sig link token
+  envelope='{"object":"whatsapp_business_account","entry":[{"id":"WABA","changes":[{"field":"messages","value":{"messaging_product":"whatsapp","metadata":{"display_phone_number":"911111111111","phone_number_id":"PID"},"messages":[{"from":"'"$phone"'","id":"wamid.vml-'"$purpose"'-b-'"$(date +%s%N)"'","timestamp":"1700000000","type":"text","text":{"body":"'"$cmd"'"}}]}}]}]}'
+  wargs=(-s -X POST "$WH_URL" -H 'Content-Type: application/json')
+  if [ -n "$APP_SECRET" ] && $have_openssl; then
+    sig=$(printf '%s' "$envelope" | openssl dgst -sha256 -hmac "$APP_SECRET" | sed 's/^.*= */sha256=/')
+    wargs+=(-H "X-Hub-Signature-256: $sig")
+  fi
+  curl "${wargs[@]}" -d "$envelope" >/dev/null
+
+  link=$(sql "select body_preview from whatsapp_messages
+              where organization_id='$ORG_IRON' and body_preview like '%token=%'
+              order by created_at desc limit 1")
+  token=$(printf '%s' "$link" | sed -n 's/.*token=\([A-Za-z0-9_-]\{32,128\}\).*/\1/p')
+
+  if [ -z "$token" ]; then
+    bad "$purpose: setup — a real link was generated to test" "a …?token=… line" "$link"
+  else
+    sql "update staff_magic_links set expires_at = now() - interval '1 second' where token='$token'" >/dev/null
+    local resp
+    resp=$(vml "{\"token\":\"$token\"}")
+    assert_contains "$purpose: a REAL generated link, backdated 1s past expiry, is denied" \
+      '"error":"link_expired"' "$resp"
+    assert_not_contains "$purpose:   ...no session was minted for it" '"access_token"' "$resp"
+    assert_equals "$purpose:   ...the claim did NOT stamp used_at" "f" \
+      "$(sql "select (used_at is not null) from staff_magic_links where token='$token'")"
+  fi
+
+  # --- single-use under a genuine race, on a FRESH valid link of this purpose ---
+  envelope='{"object":"whatsapp_business_account","entry":[{"id":"WABA","changes":[{"field":"messages","value":{"messaging_product":"whatsapp","metadata":{"display_phone_number":"911111111111","phone_number_id":"PID"},"messages":[{"from":"'"$phone"'","id":"wamid.vml-'"$purpose"'-r-'"$(date +%s%N)"'","timestamp":"1700000000","type":"text","text":{"body":"'"$cmd"'"}}]}}]}]}'
+  wargs=(-s -X POST "$WH_URL" -H 'Content-Type: application/json')
+  if [ -n "$APP_SECRET" ] && $have_openssl; then
+    sig=$(printf '%s' "$envelope" | openssl dgst -sha256 -hmac "$APP_SECRET" | sed 's/^.*= */sha256=/')
+    wargs+=(-H "X-Hub-Signature-256: $sig")
+  fi
+  curl "${wargs[@]}" -d "$envelope" >/dev/null
+
+  link=$(sql "select body_preview from whatsapp_messages
+              where organization_id='$ORG_IRON' and body_preview like '%token=%'
+              order by created_at desc limit 1")
+  token=$(printf '%s' "$link" | sed -n 's/.*token=\([A-Za-z0-9_-]\{32,128\}\).*/\1/p')
+
+  if [ -z "$token" ]; then
+    bad "$purpose: setup — a real link was generated for the race test" "a …?token=… line" "$link"
+    return
+  fi
+
+  vml "{\"token\":\"$token\"}" > "/tmp/vml_race_a_$purpose" &
+  local pid_a=$!
+  vml "{\"token\":\"$token\"}" > "/tmp/vml_race_b_$purpose" &
+  local pid_b=$!
+  wait "$pid_a" "$pid_b"
+  local a b successes
+  a=$(cat "/tmp/vml_race_a_$purpose" 2>/dev/null); rm -f "/tmp/vml_race_a_$purpose"
+  b=$(cat "/tmp/vml_race_b_$purpose" 2>/dev/null); rm -f "/tmp/vml_race_b_$purpose"
+
+  successes=0
+  case "$a" in *'"ok":true'*"\"role\":\"$role\""*) successes=$((successes+1)) ;; esac
+  case "$b" in *'"ok":true'*"\"role\":\"$role\""*) successes=$((successes+1)) ;; esac
+  assert_equals "$purpose: exactly one of two simultaneous redemptions succeeds" "1" "$successes"
+
+  local loser_ok=true
+  [ "$successes" = 1 ] || loser_ok=false
+  case "$a$b" in
+    *'"ok":true'*'"error":"link_already_used"'*|*'"error":"link_already_used"'*'"ok":true'*) : ;;
+    *) loser_ok=false ;;
+  esac
+  if $loser_ok; then ok "$purpose:   ...the loser saw link_already_used, not a silent duplicate success"
+  else bad "$purpose:   ...the loser saw link_already_used, not a silent duplicate success" \
+    "one ok:true ($role) + one link_already_used" "$a | $b"; fi
+
+  assert_equals "$purpose:   ...exactly one used_at stamp on the row, not zero or two" "1" \
+    "$(sql "select count(*) from staff_magic_links where token='$token' and used_at is not null")"
+}
+
+test_purpose_boundary_and_race "add_member"     "$RAVI_PHONE"  "ADD MEMBER" "owner"      "Ravi Krishnan"
+test_purpose_boundary_and_race "add_pt_package" "$PRIYA_PHONE" "ADD PT"     "front_desk" "Priya Nair"
+
+sql "delete from staff_magic_links where user_id in
+     (select id from users where phone in ('$RAVI_PHONE','$PRIYA_PHONE') and organization_id='$ORG_IRON');" >/dev/null
+
+# ---------------------------------------------------------------------------
 reset_state
 
 printf '\n%s== summary ==%s\n' "$B" "$N"
