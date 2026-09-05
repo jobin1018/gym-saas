@@ -54,7 +54,7 @@ const TAG = "send-welcome-message";
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const TEMPLATE_NAME = "member_welcome";
-const TEMPLATE_LANGUAGE = "en_GB"; // Meta's code for "English (UK)", not "en"
+const TEMPLATE_LANGUAGE = "en"; // Meta's code for "English (UK)", not "en"
 // NOTE: language code and single-{{1}}-param body carried over unverified
 // from the old "welcome_message" attempt — confirm both still match
 // member_welcome's actual approved template before relying on a real send.

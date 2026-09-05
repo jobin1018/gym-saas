@@ -57,7 +57,7 @@ const PROVIDER = "razorpay" as const;
 const TEMPLATE_NAME = "renewal_reminder" as const;
 // Meta's locale code for the template's registered language, "English (UK)" —
 // not plain "en", which is a different template language variant to Meta.
-const TEMPLATE_LANGUAGE = "en_GB" as const;
+const TEMPLATE_LANGUAGE = "en" as const;
 const RAZORPAY_API = "https://api.razorpay.com/v1/payment_links";
 
 // The once-per-day guard needs a timezone to mean anything. Same default and
