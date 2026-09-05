@@ -54,17 +54,23 @@ const TAG = "send-welcome-message";
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const TEMPLATE_NAME = "member_welcome";
-const TEMPLATE_LANGUAGE = "en"; // Meta's code for "English (UK)", not "en"
-// NOTE: language code and single-{{1}}-param body carried over unverified
-// from the old "welcome_message" attempt — confirm both still match
-// member_welcome's actual approved template before relying on a real send.
-
+const TEMPLATE_LANGUAGE = "en";
+// CONFIRMED LIVE (staging error, 2026-09-05): a 1-param send was rejected —
+// "(#132000) ... number of localizable_params (1) does not match the
+// expected number of params (2)". member_welcome takes TWO variables, not
+// one. Order assumed {{1}}=member name, {{2}}=org name, matching every other
+// member-facing template in this codebase (payment_confirmation,
+// pt_payment_confirmation, renewal_reminder all lead with the member's own
+// name as {{1}}) — NOT independently confirmed against the actual approved
+// body text (still no WABA access from this session). If the rendered
+// message reads wrong on staging, the fix is to swap the two bodyParams
+// below, not to touch param count again.
 function welcomeTemplateApproved(): boolean {
   return (Deno.env.get("WELCOME_TEMPLATE_APPROVED") ?? "").trim().toLowerCase() === "true";
 }
 
-function welcomeText(orgName: string): string {
-  return `Welcome to ${orgName}! Your membership is now active. ` +
+function welcomeText(memberName: string, orgName: string): string {
+  return `Welcome to ${orgName}, ${memberName}! Your membership is now active. ` +
     `Reply IN when you arrive to check in, or PAY anytime to renew.`;
 }
 
@@ -157,7 +163,7 @@ async function handle(req: Request): Promise<Response> {
     return json({ ok: true, skipped: "already_sent" });
   }
 
-  const text = welcomeText((org as any).name);
+  const text = welcomeText((member as any).name, (org as any).name);
 
   // ===== BEGIN TEMPORARY SEND MODE — gated on WELCOME_TEMPLATE_APPROVED =====
   if (!welcomeTemplateApproved()) {
@@ -194,7 +200,7 @@ async function handle(req: Request): Promise<Response> {
   const template: TemplateSpec = {
     name: TEMPLATE_NAME,
     language: TEMPLATE_LANGUAGE,
-    bodyParams: [(org as any).name],
+    bodyParams: [(member as any).name, (org as any).name],
   };
   const result = await sendWhatsAppMessage(admin, (member as any).phone, text, {
     tag: TAG,
