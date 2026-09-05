@@ -21,20 +21,28 @@
 //       enforces that for automated runs.
 //
 // ============================================================================
-// TEMPLATE VERSION — v2 is the default, v1 is kept for rollback
+// TEMPLATE VERSION — v3 is the default, v1/v2 kept for rollback
 // ============================================================================
 // v1 (daily_owner_brief, 7 params): the original renewals/overdue/check-ins
 //     summary. buildBrief() + the 7-element bodyParams below. UNTOUCHED.
-// v2 (daily_owner_brief_v2, 12 params, approved): adds this-month revenue with
-//     the membership/PT split, an attention-items roll-up, and coach activity.
-//     buildBriefV2() + the 12-element bodyParams.
+// v2 (daily_owner_brief_v2, 12 params): adds this-month revenue with the
+//     membership/PT split, an attention-items roll-up, and coach activity.
+//     buildBriefV2() + the 12-element bodyParams. SUPERSEDED — its approved
+//     body had a broken reference to a "DETAILS" link that was never part of
+//     the template; kept only for rollback, not sent by default.
+// v3 (daily_owner_brief_v3, approved): byte-for-byte the same 12 params, same
+//     order, same buildBriefV2() content — the fix is Meta-side only (the
+//     approved body text swaps the broken DETAILS reference for a plain
+//     ALERTS/OVERDUE closing line). No new computation needed; v3 reuses
+//     every v2 code path and differs from it only in which template name a
+//     send actually targets.
 //
 // Which one a send uses:
-//   * default: DAILY_BRIEF_TEMPLATE_VERSION env (unset => "v2").
-//   * per request: { "template_version": "v1" | "v2" } overrides it — so an
-//     operator can roll back one run, or a dry run can preview either format,
-//     without touching secrets.
-// Rollback to v1 everywhere: `supabase secrets set DAILY_BRIEF_TEMPLATE_VERSION=v1`.
+//   * default: DAILY_BRIEF_TEMPLATE_VERSION env (unset => "v3").
+//   * per request: { "template_version": "v1" | "v2" | "v3" } overrides it —
+//     so an operator can roll back one run, or a dry run can preview any
+//     format, without touching secrets.
+// Rollback: `supabase secrets set DAILY_BRIEF_TEMPLATE_VERSION=v1` (or v2).
 //
 // The v2 numbers are computed to MATCH the owner-facing WhatsApp commands
 // exactly — same sources, same rules — so the brief and REVENUE / PT / COACHES
@@ -81,24 +89,27 @@ import { sendWhatsAppMessage } from "../_shared/whatsapp.ts";
 
 const TAG = "daily-owner-brief";
 
-// v1 = the original 7-param template; v2 = the approved 12-param richer one.
+// v1 = the original 7-param template; v2 = superseded 12-param (broken
+// DETAILS reference in its approved body, kept for rollback only); v3 = the
+// current approved 12-param template (default).
 const TEMPLATE_NAME_V1 = "daily_owner_brief" as const;
 const TEMPLATE_NAME_V2 = "daily_owner_brief_v2" as const;
-// Both names, for the once-per-day-per-org guard: one brief per org per day
-// regardless of which template version produced it (so flipping the version
-// mid-day can never double-send).
-const BRIEF_TEMPLATE_NAMES = [TEMPLATE_NAME_V1, TEMPLATE_NAME_V2] as const;
+const TEMPLATE_NAME_V3 = "daily_owner_brief_v3" as const;
+// All three names, for the once-per-day-per-org guard: one brief per org per
+// day regardless of which template version produced it (so flipping the
+// version mid-day, or a v2 rollback, can never double-send).
+const BRIEF_TEMPLATE_NAMES = [TEMPLATE_NAME_V1, TEMPLATE_NAME_V2, TEMPLATE_NAME_V3] as const;
 // Locale code the templates are registered under. Kept as one constant for
-// both versions — v2 was registered the same way v1 was.
+// all three versions — v2/v3 were registered the same way v1 was.
 const TEMPLATE_LANGUAGE = "en" as const;
 
-type BriefVersion = "v1" | "v2";
+type BriefVersion = "v1" | "v2" | "v3";
 
 /** Default template version for a send. Per-request `template_version` overrides. */
-const DEFAULT_BRIEF_VERSION: BriefVersion =
-  (Deno.env.get("DAILY_BRIEF_TEMPLATE_VERSION") ?? "v2").trim().toLowerCase() === "v1"
-    ? "v1"
-    : "v2";
+const DEFAULT_BRIEF_VERSION: BriefVersion = (() => {
+  const v = (Deno.env.get("DAILY_BRIEF_TEMPLATE_VERSION") ?? "v3").trim().toLowerCase();
+  return v === "v1" ? "v1" : v === "v2" ? "v2" : "v3";
+})();
 
 // Orgs that get a brief. 'suspended' is excluded: a suspended account should not
 // be receiving daily operational messages.
@@ -387,8 +398,9 @@ function buildBrief(orgName: string, todayLocal: string, s: BriefStats): string 
 }
 
 /**
- * v2 brief text — the body_preview / dry-run rendering of the approved
- * daily_owner_brief_v2 template:
+ * v2/v3 brief text — the body_preview / dry-run rendering of the approved
+ * daily_owner_brief_v3 template (byte-identical params/order to the
+ * superseded v2; only the registered template body's own wording changed):
  *
  *   "Good morning! {{1}} — {{2}}. Revenue this month: ₹{{3}} (₹{{4}} membership,
  *    ₹{{5}} PT). Needs attention: {{6}} items — {{7}} overdue, {{8}} PT alerts.
@@ -800,9 +812,10 @@ async function briefOneOrg(
     failed_sends: await countFailedSends(supabase, org.id),
   };
 
-  // --- v2 adds revenue, PT alerts, coach activity, yesterday's sessions. v1
-  // --- is left byte-for-byte as it was: none of this runs, none of it ships. ---
-  if (version === "v2") {
+  // --- v2/v3 add revenue, PT alerts, coach activity, yesterday's sessions —
+  // --- identical computation for both (v3 differs only in template name).
+  // --- v1 is left byte-for-byte as it was: none of this runs, none of it ships. ---
+  if (version === "v2" || version === "v3") {
     const [revenue, ptAlerts, coaches, sessionsYesterday] = await Promise.all([
       loadMonthRevenue(supabase, org.id, todayLocal),
       countPtAlerts(supabase, org.id, todayLocal),
@@ -819,7 +832,7 @@ async function briefOneOrg(
     stats.sessions_logged_yesterday = sessionsYesterday;
   }
 
-  const message = version === "v2"
+  const message = (version === "v2" || version === "v3")
     ? buildBriefV2(org.name, todayLocal, stats)
     : buildBrief(org.name, todayLocal, stats);
 
@@ -844,17 +857,18 @@ async function briefOneOrg(
     };
   }
 
-  const templateName = version === "v2" ? TEMPLATE_NAME_V2 : TEMPLATE_NAME_V1;
+  const templateName = version === "v3" ? TEMPLATE_NAME_V3 : version === "v2" ? TEMPLATE_NAME_V2 : TEMPLATE_NAME_V1;
 
-  // Body params in template order. v1 = 7 (unchanged). v2 = 12, matching the
-  // approved daily_owner_brief_v2 body:
+  // Body params in template order. v1 = 7 (unchanged). v2/v3 = 12, matching
+  // the approved daily_owner_brief_v3 body (byte-identical param list to the
+  // superseded v2 — only the template's own wording changed on Meta's side):
   //   {{1}} org  {{2}} date  {{3}} revenue total  {{4}} membership  {{5}} PT
   //   {{6}} attention items  {{7}} overdue  {{8}} PT alerts
   //   {{9}} coaches active  {{10}} coaches needing a check-in
   //   {{11}} yesterday check-ins  {{12}} yesterday sessions logged
   // The ₹ signs are literals IN the template, so {{3}}/{{4}}/{{5}} are the bare
-  // grouped numbers. failed_sends is never a param in either version.
-  const bodyParams = version === "v2"
+  // grouped numbers. failed_sends is never a param in any version.
+  const bodyParams = (version === "v2" || version === "v3")
     ? [
       org.name,
       formatDateForOwner(todayLocal),
@@ -990,15 +1004,15 @@ async function handleBrief(req: Request): Promise<Response> {
   const dryRun = dryRunRaw === true;
 
   // Optional per-request override of DEFAULT_BRIEF_VERSION — lets an operator
-  // roll one run back to v1, or a dry run preview either format, without
+  // roll one run back to v1/v2, or a dry run preview any format, without
   // touching the DAILY_BRIEF_TEMPLATE_VERSION secret.
   let version: BriefVersion = DEFAULT_BRIEF_VERSION;
   if (body.template_version !== undefined) {
-    if (body.template_version !== "v1" && body.template_version !== "v2") {
+    if (body.template_version !== "v1" && body.template_version !== "v2" && body.template_version !== "v3") {
       return json({
         ok: false,
         error: "template_version_invalid",
-        detail: `expected "v1" or "v2", got ${JSON.stringify(body.template_version)}`,
+        detail: `expected "v1", "v2" or "v3", got ${JSON.stringify(body.template_version)}`,
       }, 400);
     }
     version = body.template_version;

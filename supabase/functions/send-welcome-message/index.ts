@@ -21,20 +21,22 @@
 // owner or front_desk, and the member must be in the caller's own org.
 //
 // ============================================================================
-// BUSINESS-INITIATED => TEMPLATE REQUIRED => TEMPORARY SEND MODE
+// BUSINESS-INITIATED => TEMPLATE REQUIRED
 // ============================================================================
 // A brand-new member has never messaged the bot, so there is no open 24h
-// service window and Meta REJECTS a free-form send. This message must go as an
-// APPROVED template. The "welcome_message" template is NOT approved yet, so:
+// service window and Meta REJECTS a free-form send. This message must go as
+// an APPROVED template — currently registered as "member_welcome" (the
+// earlier "welcome_message" name attempted here was never the approved one;
+// corrected to match the WABA).
 //
-//   * BEGIN/END TEMPORARY SEND MODE below writes the whatsapp_messages audit
-//     row (status 'queued', template_name 'welcome_message') and makes NO Meta
-//     call.
-//   * TODO(meta): submit "welcome_message" for approval with body:
-//       "Welcome to {{1}}! Your membership is now active. Reply IN when you
-//        arrive to check in, or PAY anytime to renew."
-//     then set project secret WELCOME_TEMPLATE_APPROVED=true. That flips this
-//     to a real templated send via ../_shared/whatsapp.ts — no other change.
+// The BEGIN/END TEMPORARY SEND MODE block below is a deliberate safety gate,
+// not dead code: it stays in place so a staging/prod environment that hasn't
+// yet set WELCOME_TEMPLATE_APPROVED=true degrades to a queued-only audit row
+// (no Meta call) instead of a bounced send. Once member_welcome's approval is
+// confirmed live on a given environment's WABA, set the project secret
+// there: `supabase secrets set WELCOME_TEMPLATE_APPROVED=true` — no code
+// change needed, the real templated send via ../_shared/whatsapp.ts is
+// already wired up below.
 //
 // This mirrors razorpay-webhook's TODO(meta) discipline for payment_failed /
 // pt_payment_confirmation, but fences the send explicitly because — unlike
@@ -51,8 +53,11 @@ import { orgStatusIsActive } from "../_shared/org-status.ts";
 const TAG = "send-welcome-message";
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const TEMPLATE_NAME = "welcome_message";
+const TEMPLATE_NAME = "member_welcome";
 const TEMPLATE_LANGUAGE = "en_GB"; // Meta's code for "English (UK)", not "en"
+// NOTE: language code and single-{{1}}-param body carried over unverified
+// from the old "welcome_message" attempt — confirm both still match
+// member_welcome's actual approved template before relying on a real send.
 
 function welcomeTemplateApproved(): boolean {
   return (Deno.env.get("WELCOME_TEMPLATE_APPROVED") ?? "").trim().toLowerCase() === "true";
@@ -154,11 +159,11 @@ async function handle(req: Request): Promise<Response> {
 
   const text = welcomeText((org as any).name);
 
-  // ===== BEGIN TEMPORARY SEND MODE — welcome_message template NOT approved ===
+  // ===== BEGIN TEMPORARY SEND MODE — gated on WELCOME_TEMPLATE_APPROVED =====
   if (!welcomeTemplateApproved()) {
     console.log(
-      `[${TAG}] TODO(meta): "${TEMPLATE_NAME}" template not approved — ` +
-        `writing audit row only, no Meta call. to=${(member as any).phone}`,
+      `[${TAG}] WELCOME_TEMPLATE_APPROVED not set on this environment — ` +
+        `writing audit row only for "${TEMPLATE_NAME}", no Meta call. to=${(member as any).phone}`,
     );
     const { data: row, error: logErr } = await admin
       .from("whatsapp_messages")
