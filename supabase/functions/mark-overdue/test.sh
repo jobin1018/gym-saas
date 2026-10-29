@@ -535,6 +535,68 @@ SQL
 fi
 
 # ---------------------------------------------------------------------------
+# update_membership_duration (migration 20261029090000): a membership whose
+# duration was corrected by front desk is swept by mark-overdue exactly like
+# any other row - the RPC leaves no special state behind.
+# ---------------------------------------------------------------------------
+printf '\n%s-- corrected memberships (update_membership_duration) --%s\n' "$B" "$N"
+
+if ! $have_psql; then
+  skipped "corrected-membership sweep" "requires docker/psql"
+else
+  CD_PLAN=cccccccc-cccc-cccc-cccc-cccccccccccc
+  CD_MEMBER=e1111111-1111-1111-1111-111111111111      # Asha, Iron Temple
+  CD_FIX=0daded00-2222-0000-0000-0000000000a1         # past_due, lapsed -> corrected into the future
+  CD_SHORT=0daded00-2222-0000-0000-0000000000a2       # active, 6 months -> corrected to 1 (end now in the past)
+  CD_CLAIMS='{"org_id":"11111111-1111-1111-1111-111111111111","user_id":"91111111-1111-1111-1111-111111111111","app_role":"owner"}'
+
+  # Calls the RPC as the Iron Temple owner, the way PostgREST would: role
+  # authenticated + request.jwt.claims. Prints the returned status only.
+  correct_duration() { # <membership_id> <months>
+    docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -tA -q <<SQL 2>&1 | tail -1 | tr -d '\r'
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims', '$CD_CLAIMS', true) \gset
+SELECT status FROM update_membership_duration('$1', $2);
+COMMIT;
+SQL
+  }
+  cd_cleanup() {
+    sql "delete from membership_duration_changes where membership_id in ('$CD_FIX','$CD_SHORT');" >/dev/null
+    sql "delete from memberships where id in ('$CD_FIX','$CD_SHORT');" >/dev/null
+  }
+
+  reset_state
+  cd_cleanup
+  sql "insert into memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end, duration_months)
+       values
+        ('$CD_FIX',   '$ORG_IRON', '$CD_MEMBER', '$CD_PLAN', 'past_due', CURRENT_DATE - 100, (CURRENT_DATE - 100 + interval '1 month')::date, 1),
+        ('$CD_SHORT', '$ORG_IRON', '$CD_MEMBER', '$CD_PLAN', 'active',   CURRENT_DATE - 100, (CURRENT_DATE - 100 + interval '6 months')::date, 6);" >/dev/null
+
+  assert_db "setup: lapsed past_due membership" "past_due" "$(status_of "$CD_FIX")"
+  assert_equals "RPC: past_due membership corrected into the future -> active" "active" "$(correct_duration "$CD_FIX" 6)"
+  assert_equals "RPC: active membership shortened into the past stays active (the sweep owns that flip)" \
+    "active" "$(correct_duration "$CD_SHORT" 1)"
+  assert_db "  ...shortened membership's end date is now in the past" "t" \
+    "$(sql "select current_period_end < CURRENT_DATE from memberships where id='$CD_SHORT';")"
+
+  got=$(post '{"dry_run":true}')
+  assert_contains     "dry run flags the shortened membership (end in the past)" "$CD_SHORT" "$got"
+  assert_not_contains "dry run leaves the corrected-into-the-future membership alone" "$CD_FIX" "$got"
+
+  got=$(post '{}')
+  assert_contains "real run reports the shortened membership as transitioned" "$CD_SHORT" "$got"
+  assert_db "shortened membership became past_due, like any lapsed row" "past_due" "$(status_of "$CD_SHORT")"
+  assert_db "corrected-into-the-future membership is still active"      "active"   "$(status_of "$CD_FIX")"
+  assert_db "the sweep did not touch the corrected end date" \
+    "$(sql "select (start_date + interval '6 months')::date::text from memberships where id='$CD_FIX';")" \
+    "$(sql "select current_period_end from memberships where id='$CD_FIX';")"
+
+  cd_cleanup
+  reset_state
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 reset_state

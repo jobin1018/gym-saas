@@ -201,6 +201,12 @@ DELETE FROM membership_freezes WHERE membership_id = '0daded00-1111-0000-0000-00
 DELETE FROM memberships
  WHERE id IN ('0daded00-1111-0000-0000-0000000000e1', '0daded00-1111-0000-0000-0000000000e2',
               '0daded00-1111-0000-0000-0000000000e3');
+-- section 18's update_membership_duration fixtures (audit rows, payments and
+-- freezes FK-reference memberships, so they go first).
+DELETE FROM membership_duration_changes WHERE membership_id::text LIKE '0daded00-1111-0000-0000-0000000000d%';
+DELETE FROM payments WHERE idempotency_key = 'rls-test-ud-paid';
+DELETE FROM membership_freezes WHERE membership_id::text LIKE '0daded00-1111-0000-0000-0000000000d%';
+DELETE FROM memberships WHERE id::text LIKE '0daded00-1111-0000-0000-0000000000d%';
 UPDATE memberships SET status = 'active'
  WHERE id IN ('f1111111-1111-1111-1111-111111111111', '$MEMBERSHIP_LOC2') AND status <> 'active';
 DELETE FROM payments WHERE id = '$PAYMENT_LOC2';
@@ -1217,6 +1223,173 @@ assert_equals   "postgres (rolbypassrls) direct write to past_due -> allowed" "p
   "$(sql "select status from memberships where id='$GUARD_MEMBERSHIP';")"
 
 sql "delete from memberships where id='$GUARD_MEMBERSHIP';" >/dev/null
+
+# ---------------------------------------------------------------------------
+# 18. update_membership_duration() — front desk corrects a wrong duration_months
+#     after signup (migration 20261029090000). SECURITY DEFINER, so role / org /
+#     front_desk-location / suspended-org / frozen / cancelled gates are all
+#     hand-written; this section proves each one against real sessions.
+#     Plan 'cccc...' is Monthly Unlimited at Rs.1500/month.
+# ---------------------------------------------------------------------------
+printf '\n%s-- update_membership_duration --%s\n' "$B" "$N"
+
+UDP=0daded00-1111-0000-0000-0000000000d
+UD_UP=${UDP}1        # active, 1 month, derived total 1500
+UD_OVR=${UDP}2       # active, 1 month - explicit-total override
+UD_CUSTOM=${UDP}3    # active, negotiated total 1234 (not rate x duration)
+UD_FROZEN=${UDP}4
+UD_CANCEL=${UDP}5
+UD_LOC2=${UDP}6      # HSR Layout member
+UD_PASTDUE=${UDP}7   # past_due, lapsed -> corrected into the future
+UD_EXPIRED=${UDP}8   # expired,  lapsed -> corrected into the future
+UD_STILLPAST=${UDP}9 # past_due, corrected but still in the past
+UD_PAID=${UDP}a      # active, has a manual payment
+UD_PLAN=cccccccc-cccc-cccc-cccc-cccccccccccc
+
+sql "insert into memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end, duration_months, total_price)
+     values
+      ('$UD_UP',       '$ORG_IRON', '$ASHA', '$UD_PLAN', 'active',   CURRENT_DATE - 10,  (CURRENT_DATE - 10  + interval '1 month')::date, 1, NULL),
+      ('$UD_OVR',      '$ORG_IRON', '$ASHA', '$UD_PLAN', 'active',   CURRENT_DATE - 10,  (CURRENT_DATE - 10  + interval '1 month')::date, 1, NULL),
+      ('$UD_CUSTOM',   '$ORG_IRON', '$ASHA', '$UD_PLAN', 'active',   CURRENT_DATE - 10,  (CURRENT_DATE - 10  + interval '1 month')::date, 1, 1234),
+      ('$UD_FROZEN',   '$ORG_IRON', '$ASHA', '$UD_PLAN', 'active',   CURRENT_DATE - 10,  (CURRENT_DATE - 10  + interval '1 month')::date, 1, NULL),
+      ('$UD_CANCEL',   '$ORG_IRON', '$ASHA', '$UD_PLAN', 'active',   CURRENT_DATE - 10,  (CURRENT_DATE - 10  + interval '1 month')::date, 1, NULL),
+      ('$UD_LOC2',     '$ORG_IRON', '$MEMBER_LOC2', '$UD_PLAN', 'active', CURRENT_DATE - 10, (CURRENT_DATE - 10 + interval '1 month')::date, 1, NULL),
+      ('$UD_PASTDUE',  '$ORG_IRON', '$ASHA', '$UD_PLAN', 'past_due', CURRENT_DATE - 100, (CURRENT_DATE - 100 + interval '1 month')::date, 1, NULL),
+      ('$UD_EXPIRED',  '$ORG_IRON', '$ASHA', '$UD_PLAN', 'expired',  CURRENT_DATE - 100, (CURRENT_DATE - 100 + interval '1 month')::date, 1, NULL),
+      ('$UD_STILLPAST','$ORG_IRON', '$ASHA', '$UD_PLAN', 'past_due', CURRENT_DATE - 400, (CURRENT_DATE - 400 + interval '1 month')::date, 1, NULL),
+      ('$UD_PAID',     '$ORG_IRON', '$ASHA', '$UD_PLAN', 'active',   CURRENT_DATE - 10,  (CURRENT_DATE - 10  + interval '1 month')::date, 1, NULL);" >/dev/null
+sql "insert into payments (organization_id, membership_id, amount, provider, method, status, idempotency_key, reconciled_at)
+     values ('$ORG_IRON', '$UD_PAID', 1500, 'manual', 'cash', 'manual', 'rls-test-ud-paid', now());" >/dev/null
+assert_equals "setup: trigger derived total 1500 for the 1-month fixture" "1500.00" \
+  "$(sql "select total_price from memberships where id='$UD_UP';")"
+setup_freeze=$(rest_rpc "$RAVI" "freeze_membership" "{\"p_membership_id\":\"$UD_FROZEN\",\"p_days\":10}")
+assert_contains "setup: freeze UD_FROZEN" '"status":"frozen"' "$setup_freeze"
+sql "update memberships set status='cancelled' where id='$UD_CANCEL';" >/dev/null
+
+# --- 1 -> 3 months: end date moves by exactly 2 months, total follows the rate ---
+old_end=$(sql "select current_period_end from memberships where id='$UD_UP';")
+start=$(sql "select start_date from memberships where id='$UD_UP';")
+want_end=$(sql "select ('$start'::date + interval '3 months')::date::text;")
+got=$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$UD_UP\",\"p_duration_months\":3}")
+assert_contains "owner: 1 -> 3 months returns duration 3"       '"duration_months":3' "$got"
+assert_contains "  ...current_period_end = start_date + 3 months" "\"current_period_end\":\"$want_end\"" "$got"
+assert_equals   "  ...that is the old end date + 2 months"  "$(sql "select ('$old_end'::date + interval '2 months')::date::text;")" "$want_end"
+assert_contains "  ...total recomputed from plan rate: 1500 x 3 = 4500" '"total_price":4500' "$got"
+assert_contains "  ...status unchanged (active)"            '"status":"active"' "$got"
+assert_contains "  ...has_payments false (none recorded)"   '"has_payments":false' "$got"
+assert_equals   "  ...memberships row updated, start_date kept" "3|$want_end|4500.00|$start" \
+  "$(sql "select duration_months||'|'||current_period_end||'|'||total_price||'|'||start_date from memberships where id='$UD_UP';")"
+
+# --- audit row ---
+RAVI_UID=$(sql "select id from users where phone='919000000001' and organization_id='$ORG_IRON';")
+assert_equals "audit row: who / old->new duration, end, total, status" \
+  "$RAVI_UID|1|3|$old_end|$want_end|1500.00|4500.00|active|active|false|false" \
+  "$(sql "select changed_by||'|'||old_duration_months||'|'||new_duration_months||'|'||old_period_end||'|'||new_period_end||'|'||old_total_price||'|'||new_total_price||'|'||old_status||'|'||new_status||'|'||total_was_explicit||'|'||had_payments from membership_duration_changes where membership_id='$UD_UP';")"
+assert_equals "  ...changed_at is set (recent)" "t" \
+  "$(sql "select (changed_at > now() - interval '1 minute') from membership_duration_changes where membership_id='$UD_UP';")"
+assert_contains "  ...front_desk can read the audit row for their own location" "$UD_UP" \
+  "$(rest "$PRIYA" "membership_duration_changes?membership_id=eq.$UD_UP&select=membership_id")"
+assert_equals   "  ...staff cannot INSERT into the audit table directly" "403" \
+  "$(rest_post_status "$PRIYA" "membership_duration_changes" "{\"organization_id\":\"$ORG_IRON\",\"membership_id\":\"$UD_UP\",\"changed_by\":\"$RAVI_UID\",\"old_duration_months\":1,\"new_duration_months\":2,\"old_period_end\":\"2026-01-01\",\"new_period_end\":\"2026-02-01\",\"old_status\":\"active\",\"new_status\":\"active\",\"total_was_explicit\":false,\"had_payments\":false}")"
+
+# --- front_desk (own location) can do it too; 3 -> 2 shortens ---
+got=$(rest_rpc "$PRIYA" "update_membership_duration" "{\"p_membership_id\":\"$UD_UP\",\"p_duration_months\":2}")
+assert_contains "front_desk (own location): 3 -> 2 months ok" '"duration_months":2' "$got"
+assert_contains "  ...total follows: 1500 x 2 = 3000" '"total_price":3000' "$got"
+
+# --- explicit total overrides the calculation ---
+got=$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$UD_OVR\",\"p_duration_months\":2,\"p_total_price\":2800}")
+assert_contains "explicit p_total_price wins over rate x duration (2800, not 3000)" '"total_price":2800' "$got"
+assert_equals   "  ...audit marks it explicit" "t" \
+  "$(sql "select total_was_explicit from membership_duration_changes where membership_id='$UD_OVR';")"
+
+# --- custom-price (negotiated) membership: refuse to guess ---
+got=$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$UD_CUSTOM\",\"p_duration_months\":3}")
+assert_contains "custom total without p_total_price -> total_required" "total_required" "$got"
+assert_contains "  ...hint carries the rate-based suggestion (4500)" "4500" "$got"
+assert_equals   "  ...membership untouched" "1|1234.00" \
+  "$(sql "select duration_months||'|'||total_price from memberships where id='$UD_CUSTOM';")"
+assert_equals   "  ...no audit row for the refusal" "0" \
+  "$(sql "select count(*) from membership_duration_changes where membership_id='$UD_CUSTOM';")"
+got=$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$UD_CUSTOM\",\"p_duration_months\":3,\"p_total_price\":3300}")
+assert_contains "  ...same call WITH a total succeeds" '"total_price":3300' "$got"
+
+# --- frozen / cancelled refused ---
+got=$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$UD_FROZEN\",\"p_duration_months\":3}")
+assert_contains "frozen -> membership_frozen" "membership_frozen" "$got"
+assert_contains "  ...tells the user to unfreeze first" "Unfreeze" "$got"
+assert_contains "cancelled -> membership_cancelled" "membership_cancelled" \
+  "$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$UD_CANCEL\",\"p_duration_months\":3}")"
+assert_equals   "  ...cancelled stays cancelled, duration untouched" "cancelled|1" \
+  "$(sql "select status||'|'||duration_months from memberships where id='$UD_CANCEL';")"
+
+# --- authorization ---
+assert_contains "front_desk, other location -> membership_not_found" "membership_not_found" \
+  "$(rest_rpc "$PRIYA" "update_membership_duration" "{\"p_membership_id\":\"$UD_LOC2\",\"p_duration_months\":3}")"
+assert_equals   "  ...and nothing changed" "1" "$(sql "select duration_months from memberships where id='$UD_LOC2';")"
+assert_contains "owner CAN correct another branch's membership" '"duration_months":3' \
+  "$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$UD_LOC2\",\"p_duration_months\":3}")"
+assert_contains "coach -> not_authorized" "not_authorized" \
+  "$(rest_rpc "$FARAH" "update_membership_duration" "{\"p_membership_id\":\"$UD_OVR\",\"p_duration_months\":3}")"
+assert_equals   "  ...403" "403" \
+  "$(rest_rpc_status "$FARAH" "update_membership_duration" "{\"p_membership_id\":\"$UD_OVR\",\"p_duration_months\":3}")"
+assert_contains "cross-org owner -> membership_not_found" "membership_not_found" \
+  "$(rest_rpc "$SANJAY" "update_membership_duration" "{\"p_membership_id\":\"$UD_OVR\",\"p_duration_months\":3}")"
+assert_contains "unknown id -> membership_not_found" "membership_not_found" \
+  "$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"00000000-0000-0000-0000-000000000000\",\"p_duration_months\":3}")"
+anon_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$REST_URL/rpc/update_membership_duration" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" -H 'Content-Type: application/json' \
+  -d "{\"p_membership_id\":\"$UD_OVR\",\"p_duration_months\":3}")
+case "$anon_status" in 401|403|404) ok "anonymous (no staff session) cannot call it ($anon_status)" ;;
+  *) bad "anonymous (no staff session) cannot call it" "401/403/404" "$anon_status" ;; esac
+
+# --- validation ---
+for d in 0 37 -1; do
+  assert_contains "duration $d -> duration_invalid" "duration_invalid" \
+    "$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$UD_OVR\",\"p_duration_months\":$d}")"
+done
+assert_contains "duration null -> duration_invalid" "duration_invalid" \
+  "$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$UD_OVR\",\"p_duration_months\":null}")"
+assert_contains "duration 36 is allowed (upper bound)" '"duration_months":36' \
+  "$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$UD_OVR\",\"p_duration_months\":36,\"p_total_price\":100}")"
+assert_contains "negative total -> total_invalid" "total_invalid" \
+  "$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$UD_OVR\",\"p_duration_months\":2,\"p_total_price\":-1}")"
+
+# --- suspended org ---
+sql "UPDATE organizations SET status = 'suspended' WHERE id = '$ORG_IRON'" >/dev/null
+assert_contains "suspended org -> organization_suspended" "organization_suspended" \
+  "$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$UD_OVR\",\"p_duration_months\":3}")"
+sql "UPDATE organizations SET status = 'active' WHERE id = '$ORG_IRON'" >/dev/null
+
+# --- overdue / expired corrected into the future -> back to active ---
+for pair in "UD_PASTDUE|past_due" "UD_EXPIRED|expired"; do
+  var=${pair%%|*}; was=${pair##*|}; id=${!var}
+  want_end=$(sql "select (start_date + interval '6 months')::date::text from memberships where id='$id';")
+  assert_equals "setup: $was membership is lapsed" "$was" "$(sql "select status from memberships where id='$id';")"
+  got=$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$id\",\"p_duration_months\":6}")
+  assert_contains "$was, new end in the future -> returned status active" '"status":"active"' "$got"
+  assert_equals   "  ...row is active with the new end date" "active|$want_end" \
+    "$(sql "select status||'|'||current_period_end from memberships where id='$id';")"
+  assert_equals   "  ...audit records $was -> active" "$was|active" \
+    "$(sql "select old_status||'|'||new_status from membership_duration_changes where membership_id='$id';")"
+done
+got=$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$UD_STILLPAST\",\"p_duration_months\":2}")
+assert_contains "past_due, new end STILL in the past -> stays past_due" '"status":"past_due"' "$got"
+
+# --- has_payments flag (does not block) ---
+got=$(rest_rpc "$PRIYA" "update_membership_duration" "{\"p_membership_id\":\"$UD_PAID\",\"p_duration_months\":2}")
+assert_contains "membership with a payment: change still goes through" '"duration_months":2' "$got"
+assert_contains "  ...has_payments true (front_desk can't read payments, still told)" '"has_payments":true' "$got"
+assert_equals   "  ...audit row records had_payments" "t" \
+  "$(sql "select had_payments from membership_duration_changes where membership_id='$UD_PAID';")"
+
+# --- the status guard still bites direct writes ---
+assert_equals "direct PATCH active -> past_due still blocked (403)" "403" \
+  "$(rest_patch_status "$RAVI" "memberships?id=eq.$UD_UP" '{"status":"past_due"}')"
+assert_equals "direct PATCH past_due -> active still blocked (403)" "403" \
+  "$(rest_patch_status "$RAVI" "memberships?id=eq.$UD_STILLPAST" '{"status":"active"}')"
+assert_equals "  ...rows unchanged by the blocked PATCHes" "active|past_due" \
+  "$(sql "select (select status from memberships where id='$UD_UP')||'|'||(select status from memberships where id='$UD_STILLPAST');")"
 
 # ---------------------------------------------------------------------------
 # Summary

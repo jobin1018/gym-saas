@@ -652,6 +652,58 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# update_membership_duration (migration 20261029090000): renewal-scan treats a
+# membership whose duration was corrected like any other - selection is driven
+# only by status + current_period_end, which the RPC leaves in the normal shape.
+# DRY RUN only: nothing is sent and no Razorpay link is created.
+# ---------------------------------------------------------------------------
+printf '\n%s-- corrected memberships (update_membership_duration) --%s\n' "$B" "$N"
+
+if ! $have_psql; then
+  skipped "corrected-membership scan" "requires docker/psql"
+else
+  CD_PLAN=cccccccc-cccc-cccc-cccc-cccccccccccc
+  CD_MEMBER=e1111111-1111-1111-1111-111111111111      # Asha, Iron Temple
+  CD_FIX=0daded00-2222-0000-0000-0000000000b1         # past_due, lapsed -> corrected into the future
+  CD_CLAIMS='{"org_id":"11111111-1111-1111-1111-111111111111","user_id":"91111111-1111-1111-1111-111111111111","app_role":"owner"}'
+
+  correct_duration() { # <membership_id> <months> -> returned status
+    docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -tA -q <<SQL 2>&1 | tail -1 | tr -d '\r'
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims', '$CD_CLAIMS', true) \gset
+SELECT status FROM update_membership_duration('$1', $2);
+COMMIT;
+SQL
+  }
+  cd_cleanup() {
+    sql "delete from membership_duration_changes where membership_id='$CD_FIX';" >/dev/null
+    sql "delete from memberships where id='$CD_FIX';" >/dev/null
+  }
+
+  reset_state
+  cd_cleanup
+  sql "insert into memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end, duration_months)
+       values ('$CD_FIX', '$ORG_IRON', '$CD_MEMBER', '$CD_PLAN', 'past_due', CURRENT_DATE - 100, (CURRENT_DATE - 100 + interval '1 month')::date, 1);" >/dev/null
+
+  # Before the correction its end date (~-70d) is nowhere near any offset.
+  assert_equals "RPC: past_due membership corrected into the future -> active" "active" "$(correct_duration "$CD_FIX" 6)"
+  off=$(sql "select current_period_end - CURRENT_DATE from memberships where id='$CD_FIX';")
+  # +/-1 day: renewal-scan's "today" is the tenant's (IST) date, the DB's
+  # CURRENT_DATE is UTC; for a few hours a day they differ by one.
+  got=$(post "{\"dry_run\":true,\"offsets\":[$((off-1)),$off,$((off+1))]}")
+  assert_contains "dry run selects the corrected membership at its new end date" "\"membership_id\":\"$CD_FIX\"" "$got"
+  assert_contains "  ...reported as active (it left past_due)" '"membership_status":"active"' "$got"
+  assert_contains "  ...with the plan rate, not a stale amount" '"plan_name":"Monthly Unlimited"' "$got"
+
+  got=$(post '{"dry_run":true}')
+  assert_not_contains "default offsets (+7/+3) do not select it - the old lapsed date is gone" "$CD_FIX" "$got"
+
+  cd_cleanup
+  reset_state
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 reset_state
