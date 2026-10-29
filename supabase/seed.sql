@@ -945,4 +945,19 @@ INSERT INTO training_notes (organization_id, member_id, coach_id, pt_package_id,
    'a9ec0000-0000-0000-0000-0000000000d1', 'a9ec0000-0000-0000-0002-000000000001',
    'Quick technique check-in, felt strong.', CURRENT_DATE, now() - interval '1 hour');
 
+-- ---------------------------------------------------------------------------
+-- PT package payments. Until 20261101090000 an AFTER INSERT trigger on
+-- pt_packages recorded a collected 'manual' payment for every package with
+-- price > 0 at sale time. That trigger is gone (a sale no longer counts as
+-- collected money; the desk records it with record_manual_payment), so the
+-- seeded packages - which model packages sold and paid BEFORE that change - get
+-- the same payment row explicitly. Same shape the trigger wrote, plus the
+-- now-required payment_method; key 'ptpkg-<id>' is unchanged.
+-- ---------------------------------------------------------------------------
+INSERT INTO payments (organization_id, membership_id, pt_package_id, amount, provider,
+                      payment_method, status, idempotency_key, reconciled_at)
+SELECT organization_id, NULL, id, price, 'manual', 'cash', 'manual', 'ptpkg-' || id::text, now()
+  FROM pt_packages
+ WHERE price > 0;
+
 COMMIT;

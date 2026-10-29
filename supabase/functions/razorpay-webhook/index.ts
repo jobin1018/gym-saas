@@ -575,7 +575,10 @@ async function handlePaymentSuccess(
   // it would pay for is already covered by a collected payment. Record the money
   // honestly, mark it refund_due (excluded from revenue by payment_is_collected)
   // and DO NOT extend the membership a second time.
-  if (row.membership_id) {
+  // PT packages (20261101090000): there are no periods or instalments, so any
+  // OTHER collected payment on the same package means it is already paid - the
+  // Razorpay money is recorded as refund_due and nothing else changes.
+  if (row.membership_id || row.pt_package_id) {
     const { data: coveredBy, error: coverError } = await supabase.rpc(
       "payment_covering_collected",
       { p_payment_id: row.id },

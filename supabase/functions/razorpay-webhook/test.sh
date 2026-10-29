@@ -727,6 +727,62 @@ SQL
 fi
 
 # ---------------------------------------------------------------------------
+# PT package paid at the desk first, then the Razorpay PT link is paid anyway
+# (20261101090000). PT has no periods and no instalments, so ANY other collected
+# payment on the package means it is already paid: the Razorpay money is
+# recorded as refund_due and nothing else happens.
+# ---------------------------------------------------------------------------
+printf '\n%s-- PT package: desk payment, then the Razorpay link is paid --%s\n' "$B" "$N"
+
+if ! $have_psql; then
+  skipped "PT desk-payment-then-link group" "requires docker/psql"
+else
+  PD_PKG=0daded00-6666-0000-0000-0000000000c1
+  PD_PAY=0daded00-6666-0000-0000-0000000000c2         # pending Razorpay PT link
+  PD_CLAIMS='{"org_id":"11111111-1111-1111-1111-111111111111","user_id":"91111111-1111-1111-1111-111111111111","app_role":"owner"}'
+
+  pd_cleanup() {
+    docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+DELETE FROM whatsapp_messages WHERE related_payment_id IN (SELECT id FROM payments WHERE pt_package_id='$PD_PKG');
+DELETE FROM payments WHERE pt_package_id='$PD_PKG';
+DELETE FROM webhook_events WHERE event_id LIKE 'evt_$RUN.pd%';
+DELETE FROM pt_packages WHERE id='$PD_PKG';
+SQL
+  }
+  pd_cleanup
+  sql "insert into pt_packages (id, organization_id, member_id, coach_id, goal, duration_months, sessions_per_month, sessions_purchased, price, status, start_date)
+       values ('$PD_PKG', '$ORG_IRON', 'e1111111-1111-1111-1111-111111111111', 'c0ac0000-0000-0000-0000-000000000001', 'fat_loss', 3, 4, 12, 3000, 'active', CURRENT_DATE);" >/dev/null
+  assert_db "a PT sale creates no payment row" "0" "$(sql "select count(*) from payments where pt_package_id='$PD_PKG';")"
+  sql "insert into payments (id, organization_id, pt_package_id, amount, provider, razorpay_link_id, status, idempotency_key)
+       values ('$PD_PAY', '$ORG_IRON', '$PD_PKG', 3000, 'razorpay', 'plink_PD_DUP', 'pending', 'razpay-test-ptpd');" >/dev/null
+
+  rec=$(docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -tA -q <<SQL 2>&1 | tail -1 | tr -d '\r'
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims', '$PD_CLAIMS', true) \gset
+SELECT payment_id||'|'||voided_pending FROM record_manual_payment(p_pt_package_id => '$PD_PKG', p_amount => 3000, p_method => 'cash');
+COMMIT;
+SQL
+)
+  PD_MANUAL=${rec%%|*}
+  assert_equals "desk payment recorded for the package and superseded the pending link" "1" "${rec#*|}"
+  assert_db     "  ...the pending link is void" "void" "$(sql "select status from payments where id='$PD_PAY';")"
+
+  got=$(post "$(link_event "evt_$RUN.pd1" "plink_PD_DUP" "pay_PD_DUP" 300000)")
+  assert_contains "Razorpay pays the PT link anyway -> recorded as a duplicate" '"handled":"payment_duplicate_refund_due"' "$got"
+  assert_contains "  ...names the desk payment it duplicates" "\"duplicate_of\":\"$PD_MANUAL\"" "$got"
+  assert_db "  ...row is refund_due with the Razorpay payment attached" "refund_due|pay_PD_DUP" \
+    "$(sql "select status||'|'||provider_payment_id from payments where id='$PD_PAY';")"
+  assert_db "  ...no confirmation was sent" "0" "$(sql "select count(*) from whatsapp_messages where related_payment_id='$PD_PAY';")"
+  assert_db "  ...only the desk payment is collected money" "1" \
+    "$(sql "select count(*) from payments where pt_package_id='$PD_PKG' and payment_is_collected(status);")"
+  assert_db "  ...the package is untouched" "active" "$(sql "select status from pt_packages where id='$PD_PKG';")"
+
+  pd_cleanup
+  reset_state
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 reset_state

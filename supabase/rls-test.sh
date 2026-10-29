@@ -253,12 +253,16 @@ DELETE FROM payments
      '9c000000-0000-0000-0000-000000000001','9c000000-0000-0000-0000-000000000002',
      '9c000000-0000-0000-0000-000000000003','9c000000-0000-0000-0000-000000000004',
      '9c000000-0000-0000-0000-000000000005');
+-- section 21's PT payment fixtures (payments FK-reference pt_packages)
+DELETE FROM payments WHERE pt_package_id::text LIKE '0daded00-9999-%' OR idempotency_key LIKE 'manual-pt-%';
 DELETE FROM pt_packages
  WHERE (price >= 4321.00 AND price < 4400.00)   -- 4321.xx: this suite's created packages
     OR id IN ('9c000000-0000-0000-0000-0000000000f1',
               '9c000000-0000-0000-0000-0000000000f3',
               '9c000000-0000-0000-0000-0000000000f5',
               '9c000000-0000-0000-0000-0000000000f9');
+DELETE FROM training_notes WHERE pt_package_id::text LIKE '0daded00-9999-%';
+DELETE FROM pt_packages WHERE id::text LIKE '0daded00-9999-%';
 -- the session-count trigger bumps sessions_used on every note; deleting the
 -- note does not undo the bump, so restore the one seed package the coaching
 -- section writes a real note against (keeps repeated runs without `db reset`
@@ -1894,9 +1898,187 @@ assert_contains "a void row needs voided_at + a reason" "payments_void_fields" \
   "$(sql_err "insert into payments (organization_id, membership_id, amount, provider, status, idempotency_key) values ('$ORG_IRON','$MP_DUP',1,'razorpay','void','rls-test-mp-voidnoreason');")"
 assert_contains "covers_to must be after covers_from" "payments_coverage_consistent" \
   "$(sql_err "insert into payments (organization_id, membership_id, amount, provider, status, idempotency_key, covers_from, covers_to) values ('$ORG_IRON','$MP_DUP',1,'razorpay','pending','rls-test-mp-cov','2026-02-01','2026-01-01');")"
-assert_equals "PT-package sale rows (provider manual, no method) are still allowed - exemption until the PT flow is decided" "INSERT 0 1" \
-  "$(docker exec "$DB_CONTAINER" psql -U postgres -d postgres -c "insert into payments (organization_id, pt_package_id, amount, provider, status, idempotency_key, reconciled_at) values ('$ORG_IRON','$PKG_ASHA',1,'manual','manual','rls-test-mp-pt',now());" 2>&1 | tr -d '\r' | head -1)"
-sql "delete from payments where idempotency_key='rls-test-mp-pt';" >/dev/null
+
+# ---------------------------------------------------------------------------
+# 21. PT packages through the manual payment flow (migration 20261101090000):
+#     a sale records NO payment; the desk records it with record_manual_payment
+#     (p_pt_package_id), exact price only, no instalments; unpaid packages stay
+#     fully usable; is_paid shows in v_pt_packages_attention and
+#     v_pt_package_payment_status; same idempotency / location / suspended / void
+#     rules as memberships; the PT exemption in the method check is gone.
+# ---------------------------------------------------------------------------
+printf '\n%s-- PT package payments (manual flow) --%s\n' "$B" "$N"
+
+PTP=0daded00-9999-0000-0000-0000000000
+PT_A=${PTP}a1       # Asha (Indiranagar), 2 sessions -> shows in the attention view; price 4350
+PT_B=${PTP}a2       # Asha, price 4360 - front_desk / void / re-pay
+PT_LOC2=${PTP}a3    # HSR Layout member
+PT_CANC=${PTP}a4    # cancelled
+PT_PEND=${PTP}a5    # carries a pending payment row
+PT_RACE=${PTP}a6    # simultaneous-tap fixture
+PT_FREE=${PTP}a7    # price 0 (comp)
+PT_REST=${PTP}a8    # created through the owner's REST session (a real sale)
+PT_RAVI_UID=$(sql "select id from users where phone='919000000001' and organization_id='$ORG_IRON';")
+seed_pt_payments=$(sql "select count(*) from payments where idempotency_key like 'ptpkg-%';")
+
+mkpkg() { # <id> <member> <price> <sessions> [status]
+  sql "insert into pt_packages (id, organization_id, member_id, coach_id, goal, duration_months, sessions_per_month, sessions_purchased, sessions_used, price, status, start_date)
+       values ('$1', '$ORG_IRON', '$2', '$FARAH_UID', 'general_fitness', 1, $4, $4, 0, $3, '${5:-active}', CURRENT_DATE);" >/dev/null
+}
+mkpkg "$PT_A" "$ASHA" 4350 2
+mkpkg "$PT_B" "$ASHA" 4360 5
+mkpkg "$PT_LOC2" "$MEMBER_LOC2" 4355 5
+mkpkg "$PT_CANC" "$ASHA" 4352 5 cancelled
+mkpkg "$PT_PEND" "$ASHA" 4353 5
+mkpkg "$PT_RACE" "$ASHA" 4354 5
+mkpkg "$PT_FREE" "$ASHA" 0 5
+
+pay_count() { sql "select count(*) from payments where pt_package_id='$1';"; }
+paid_of()   { rest "$RAVI" "v_pt_package_payment_status?pt_package_id=eq.$1&select=is_paid"; }
+
+# --- a sale creates NO payment row, and no revenue ---
+assert_equals "SQL-inserted packages: no payment rows created at sale" "0" \
+  "$(sql "select count(*) from payments where pt_package_id in ('$PT_A','$PT_B','$PT_LOC2','$PT_CANC','$PT_PEND','$PT_RACE','$PT_FREE');")"
+got=$(rest_post "$RAVI" "pt_packages" "{\"id\":\"$PT_REST\",\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"coach_id\":\"$FARAH_UID\",\"goal\":\"general_fitness\",\"sessions_purchased\":6,\"price\":4357.00}")
+assert_contains "a real sale through the owner's session succeeds"    "$PT_REST" "$got"
+assert_equals   "  ...and creates no payment row either"              "0" "$(pay_count "$PT_REST")"
+assert_equals   "existing PT payments untouched (seed rows still there)" "$seed_pt_payments" "$(sql "select count(*) from payments where idempotency_key like 'ptpkg-%';")"
+
+# --- unpaid is information only: the package is fully usable ---
+assert_contains "owner: unpaid package shows is_paid=false in v_pt_package_payment_status" '"is_paid":false' "$(paid_of "$PT_A")"
+assert_contains "owner: v_pt_packages_attention carries is_paid=false" '"is_paid":false' \
+  "$(rest "$RAVI" "v_pt_packages_attention?id=eq.$PT_A&select=id,is_paid")"
+assert_contains "front_desk (own location) sees is_paid too" '"is_paid":false' \
+  "$(rest "$PRIYA" "v_pt_package_payment_status?pt_package_id=eq.$PT_A&select=is_paid")"
+assert_equals   "front_desk does NOT see another location's package status" "[]" \
+  "$(rest "$PRIYA" "v_pt_package_payment_status?pt_package_id=eq.$PT_LOC2&select=is_paid")"
+assert_equals   "coach gets no payment status at all" "[]" \
+  "$(rest "$FARAH" "v_pt_package_payment_status?pt_package_id=eq.$PT_A&select=is_paid")"
+assert_contains "price-0 (comp) package reads as paid - nothing is owed" '"is_paid":true' "$(paid_of "$PT_FREE")"
+assert_equals   "UNPAID package: the coach can still log a session" "200" \
+  "$(rest_rpc_status "$FARAH" log_session "{\"p_member_id\":\"$ASHA\",\"p_pt_package_id\":\"$PT_A\",\"p_note_text\":\"rls-test unpaid pkg\"}")"
+assert_equals   "  ...and the session counted" "1" "$(sql "select sessions_used from pt_packages where id='$PT_A';")"
+
+# --- recording the payment ---
+assert_contains "neither membership nor package -> subject_invalid" "subject_invalid" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_amount\":4350,\"p_method\":\"cash\"}")"
+assert_contains "both -> subject_invalid" "subject_invalid" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$MP_MAIN\",\"p_pt_package_id\":\"$PT_A\",\"p_amount\":4350,\"p_method\":\"cash\"}")"
+got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_A\",\"p_amount\":1000,\"p_method\":\"cash\"}")
+assert_contains "wrong amount -> amount_mismatch"   "amount_mismatch" "$got"
+assert_contains "  ...quotes the package price"      "4350" "$got"
+assert_contains "  ...says no instalments"           "instalments" "$got"
+assert_equals   "  ...nothing recorded"              "0" "$(pay_count "$PT_A")"
+assert_contains "a price of 4350 + 1 is also refused" "amount_mismatch" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_A\",\"p_amount\":4351,\"p_method\":\"cash\"}")"
+assert_contains "method 'other' is not accepted for PT either" "method_invalid" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_A\",\"p_amount\":4350,\"p_method\":\"other\"}")"
+
+PT_RECV=$(sql "select (CURRENT_DATE - 2)::text;")
+rev_pt_before=$(sql "select coalesce(sum(total),0) from v_daily_revenue_by_source where organization_id='$ORG_IRON' and source='pt_package' and day = date_trunc('day', ('$PT_RECV'::date)::timestamptz);")
+got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_A\",\"p_amount\":4350,\"p_method\":\"upi\",\"p_reference\":\"UPI-PT-1\",\"p_received_at\":\"$PT_RECV\",\"p_note\":\"pt note\"}")
+PT_PAY=$(printf '%s' "$got" | sed -n 's/.*"payment_id":"\([^"]*\)".*/\1/p')
+assert_contains "owner records the package payment"      "\"pt_package_id\":\"$PT_A\"" "$got"
+assert_contains "  ...membership_id is null"              '"membership_id":null' "$got"
+assert_contains "  ...payment_method + reference"         '"payment_method":"upi"' "$got"
+assert_contains "  ...no period, no instalments (current_period_end null)" '"current_period_end":null' "$got"
+assert_equals   "  ...stored row" "manual|manual|upi|UPI-PT-1|pt note|$PT_RECV|$PT_RAVI_UID|4350.00" \
+  "$(sql "select provider||'|'||status||'|'||payment_method||'|'||reference||'|'||note||'|'||received_at||'|'||recorded_by||'|'||amount from payments where id='$PT_PAY';")"
+assert_equals   "  ...the package itself is unchanged (status, sessions)" "active|1" \
+  "$(sql "select status||'|'||sessions_used from pt_packages where id='$PT_A';")"
+assert_contains "  ...is_paid flips to true (status view)" '"is_paid":true' "$(paid_of "$PT_A")"
+assert_contains "  ...and in v_pt_packages_attention"      '"is_paid":true' "$(rest "$RAVI" "v_pt_packages_attention?id=eq.$PT_A&select=id,is_paid")"
+assert_equals   "  ...PT revenue lands on received_at (+4350)" "$(( ${rev_pt_before%.*} + 4350 ))" \
+  "$(sql "select coalesce(sum(total),0)::bigint from v_daily_revenue_by_source where organization_id='$ORG_IRON' and source='pt_package' and day = date_trunc('day', ('$PT_RECV'::date)::timestamptz);")"
+got=$(rest "$RAVI" "v_payments_ledger?id=eq.$PT_PAY&select=payment_type,payment_method,recorded_by_name,is_collected")
+assert_contains "  ...ledger: personal_training, recorded_by_name, collected" '"payment_type":"personal_training"' "$got"
+assert_contains "  ...recorded_by_name" '"recorded_by_name":"Ravi Krishnan"' "$got"
+
+got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_A\",\"p_amount\":4350,\"p_method\":\"cash\"}")
+assert_contains "a second payment for the same package -> package_already_paid" "package_already_paid" "$got"
+assert_contains "  ...names the payment that already paid it" "$PT_PAY" "$got"
+assert_equals   "  ...still exactly one payment" "1" "$(pay_count "$PT_A")"
+
+# --- simultaneous taps: exactly one payment, never two ---
+( rest_rpc "$RAVI" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_RACE\",\"p_amount\":4354,\"p_method\":\"cash\"}" >/dev/null ) &
+( rest_rpc "$RAVI" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_RACE\",\"p_amount\":4354,\"p_method\":\"cash\"}" >/dev/null ) &
+wait
+assert_equals "two simultaneous taps record exactly one payment" "1" "$(pay_count "$PT_RACE")"
+assert_equals "  ...a deterministic key collision returns the existing row, not an error" "200" \
+  "$(sql "insert into payments (organization_id, pt_package_id, amount, provider, payment_method, status, idempotency_key, reconciled_at)
+          values ('$ORG_IRON','$PT_PEND',1,'razorpay',NULL,'pending','manual-pt-$PT_PEND-1',now());" >/dev/null; \
+        rest_rpc_status "$RAVI" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_PEND\",\"p_amount\":4353,\"p_method\":\"cash\"}")"
+assert_equals "  ...(that colliding pending row was just superseded or returned, never duplicated)" "1" \
+  "$(sql "select count(*) from payments where idempotency_key='manual-pt-$PT_PEND-1';")"
+sql "delete from payments where pt_package_id='$PT_PEND';" >/dev/null
+
+# --- a pending PT payment is superseded ---
+sql "insert into payments (organization_id, pt_package_id, amount, provider, razorpay_link_id, status, idempotency_key)
+     values ('$ORG_IRON','$PT_PEND',4353,'razorpay','plink_rls_pt_pend','pending','rls-test-mp-ptpend');" >/dev/null
+got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_PEND\",\"p_amount\":4353,\"p_method\":\"cash\"}")
+PT_PEND_PAY=$(printf '%s' "$got" | sed -n 's/.*"payment_id":"\([^"]*\)".*/\1/p')
+assert_contains "desk payment supersedes the pending PT link" '"voided_pending":1' "$got"
+assert_equals   "  ...the link is void" "void" "$(sql "select status from payments where idempotency_key='rls-test-mp-ptpend';")"
+assert_equals   "  ...payment_covering_collected tells the webhook it is already paid" "$PT_PEND_PAY" \
+  "$(sql "select payment_covering_collected(id) from payments where idempotency_key='rls-test-mp-ptpend';")"
+
+# --- authorization / scoping ---
+assert_contains "front_desk, own location, can record a package payment" '"pt_package_id"' \
+  "$(rest_rpc "$PRIYA" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_B\",\"p_amount\":4360,\"p_method\":\"cash\"}")"
+assert_contains "front_desk, other location -> pt_package_not_found" "pt_package_not_found" \
+  "$(rest_rpc "$PRIYA" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_LOC2\",\"p_amount\":4355,\"p_method\":\"cash\"}")"
+assert_equals   "  ...nothing recorded for the other location's package" "0" "$(pay_count "$PT_LOC2")"
+assert_contains "coach -> not_authorized" "not_authorized" \
+  "$(rest_rpc "$FARAH" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_LOC2\",\"p_amount\":4355,\"p_method\":\"cash\"}")"
+assert_contains "cross-org owner -> pt_package_not_found" "pt_package_not_found" \
+  "$(rest_rpc "$SANJAY" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_LOC2\",\"p_amount\":4355,\"p_method\":\"cash\"}")"
+assert_contains "cancelled package -> pt_package_cancelled" "pt_package_cancelled" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_CANC\",\"p_amount\":4352,\"p_method\":\"cash\"}")"
+sql "UPDATE organizations SET status = 'suspended' WHERE id = '$ORG_IRON'" >/dev/null
+assert_contains "suspended org -> organization_suspended" "organization_suspended" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_LOC2\",\"p_amount\":4355,\"p_method\":\"cash\"}")"
+sql "UPDATE organizations SET status = 'active' WHERE id = '$ORG_IRON'" >/dev/null
+assert_contains "owner CAN record at another location" '"pt_package_id"' \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_LOC2\",\"p_amount\":4355,\"p_method\":\"card\"}")"
+
+# --- void: same rules as memberships; the package simply becomes unpaid again ---
+assert_contains "void PT payment: front_desk -> not_authorized" "not_authorized" \
+  "$(rest_rpc "$PRIYA" "void_payment" "{\"p_payment_id\":\"$PT_PAY\",\"p_reason\":\"x\"}")"
+assert_contains "void PT payment: reason mandatory" "reason_required" \
+  "$(rest_rpc "$RAVI" "void_payment" "{\"p_payment_id\":\"$PT_PAY\",\"p_reason\":\"\"}")"
+rev_pt_with=$(sql "select coalesce(sum(total),0)::bigint from v_daily_revenue_by_source where organization_id='$ORG_IRON' and source='pt_package' and day = date_trunc('day', ('$PT_RECV'::date)::timestamptz);")
+got=$(rest_rpc "$RAVI" "void_payment" "{\"p_payment_id\":\"$PT_PAY\",\"p_reason\":\"wrong package\"}")
+assert_contains "owner voids a PT payment" '"status":"void"' "$got"
+assert_contains "  ...response names the package" "\"pt_package_id\":\"$PT_A\"" "$got"
+assert_contains "  ...advice says the package is unpaid again, sessions untouched" "unpaid again" "$got"
+assert_contains "  ...package reads unpaid again" '"is_paid":false' "$(paid_of "$PT_A")"
+assert_equals   "  ...package, sessions and notes untouched" "active|1" "$(sql "select status||'|'||sessions_used from pt_packages where id='$PT_A';")"
+assert_equals   "  ...voided PT payment leaves revenue (-4350)" "$((rev_pt_with - 4350))" \
+  "$(sql "select coalesce(sum(total),0)::bigint from v_daily_revenue_by_source where organization_id='$ORG_IRON' and source='pt_package' and day = date_trunc('day', ('$PT_RECV'::date)::timestamptz);")"
+assert_contains "  ...front_desk ledger: void flag yes, reason hidden" '"void_reason":null' \
+  "$(rest "$PRIYA" "v_payments_ledger?id=eq.$PT_PAY&select=is_void,void_reason")"
+got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_pt_package_id\":\"$PT_A\",\"p_amount\":4350,\"p_method\":\"cash\"}")
+assert_contains "after a void the package can be paid again (new payment)" '"pt_package_id"' "$got"
+assert_equals  "  ...two payment rows now: one void, one collected" "void,manual" \
+  "$(sql "select string_agg(status, ',' order by status desc) from payments where pt_package_id='$PT_A';")"
+
+# --- exemption removed; legacy method-less PT rows stay voidable ---
+sql_err() { docker exec "$DB_CONTAINER" psql -U postgres -d postgres -tAc "$1" 2>&1 | tr -d '\r' | head -1; }
+assert_contains "a manual PT payment WITHOUT a method is now rejected" "payments_manual_method_required" \
+  "$(sql_err "insert into payments (organization_id, pt_package_id, amount, provider, status, idempotency_key, reconciled_at) values ('$ORG_IRON','$PT_B',1,'manual','manual','rls-test-mp-ptnometh',now());")"
+docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+BEGIN;
+ALTER TABLE payments DROP CONSTRAINT payments_manual_method_required;
+INSERT INTO payments (id, organization_id, pt_package_id, amount, provider, status, idempotency_key, reconciled_at)
+  VALUES ('${PTP}f1', '$ORG_IRON', '$PT_FREE', 1, 'manual', 'manual', 'rls-test-mp-legacy', now());
+ALTER TABLE payments ADD CONSTRAINT payments_manual_method_required
+  CHECK (provider <> 'manual' OR payment_method IS NOT NULL OR status = 'void') NOT VALID;
+COMMIT;
+SQL
+assert_equals "setup: a legacy method-less PT payment exists (as the old trigger wrote them)" "1" \
+  "$(sql "select count(*) from payments where id='${PTP}f1' and payment_method is null;")"
+assert_contains "the owner can still void a legacy method-less PT payment" '"status":"void"' \
+  "$(rest_rpc "$RAVI" "void_payment" "{\"p_payment_id\":\"${PTP}f1\",\"p_reason\":\"legacy row\"}")"
 
 # ---------------------------------------------------------------------------
 # Summary
