@@ -207,6 +207,11 @@ DELETE FROM membership_duration_changes WHERE membership_id::text LIKE '0daded00
 DELETE FROM payments WHERE idempotency_key = 'rls-test-ud-paid';
 DELETE FROM membership_freezes WHERE membership_id::text LIKE '0daded00-1111-0000-0000-0000000000d%';
 DELETE FROM memberships WHERE id::text LIKE '0daded00-1111-0000-0000-0000000000d%';
+-- section 19's bundle-plan fixtures (same FK ordering: audit, payments, then memberships;
+-- the plans themselves are 'rls-test plan%' rows, removed at the end of this function).
+DELETE FROM membership_duration_changes WHERE membership_id::text LIKE '0daded00-4444-%';
+DELETE FROM payments WHERE membership_id::text LIKE '0daded00-4444-%';
+DELETE FROM memberships WHERE id::text LIKE '0daded00-4444-%';
 UPDATE memberships SET status = 'active'
  WHERE id IN ('f1111111-1111-1111-1111-111111111111', '$MEMBERSHIP_LOC2') AND status <> 'active';
 DELETE FROM payments WHERE id = '$PAYMENT_LOC2';
@@ -1390,6 +1395,176 @@ assert_equals "direct PATCH past_due -> active still blocked (403)" "403" \
   "$(rest_patch_status "$RAVI" "memberships?id=eq.$UD_STILLPAST" '{"status":"active"}')"
 assert_equals "  ...rows unchanged by the blocked PATCHes" "active|past_due" \
   "$(sql "select (select status from memberships where id='$UD_UP')||'|'||(select status from memberships where id='$UD_STILLPAST');")"
+
+# ---------------------------------------------------------------------------
+# 19. Bundle plans (migrations 20261030090000 / 90500 / 91000): a plan can carry
+#     a default duration, a FIXED total price and free bonus months
+#     ("6 months (3 + 3 free) = Rs 4,500"). amount stays the effective monthly
+#     rate, derived from total_price; memberships snapshot total + bonus;
+#     renewals bill the bundle price; update_membership_duration understands
+#     bundles. Exercised through real owner / front_desk / coach sessions.
+# ---------------------------------------------------------------------------
+printf '\n%s-- bundle plans --%s\n' "$B" "$N"
+
+BPP=0daded00-4444-0000-0000-0000000000
+PL_B6=${BPP}a1     # 6 months (3 + 3 free) = 4500 -> 750.00 / month
+PL_B7=${BPP}a2     # 7 months = 4500 -> 642.86 / month (does not divide evenly)
+PL_M=${BPP}a3      # ordinary monthly plan, amount 1500
+BM_OWN=${BPP}b1    # bundle membership at the plan's own duration
+BM_OVR=${BPP}b2    # bundle plan, different duration
+BM_TOT=${BPP}b3    # bundle plan, different duration + explicit total
+BM_MON=${BPP}b4    # ordinary plan, 3 months
+BM_ODD=${BPP}b5    # odd bundle at its own duration
+BM_WRONG=${BPP}b6  # bundle plan signed up with the WRONG duration (3 of 6)
+BM_LOC2=${BPP}b7   # bundle membership at HSR Layout
+BM_PATCH=${BPP}b8  # for the direct status PATCH guard check
+TODAY=$(sql "select CURRENT_DATE::text;")
+
+# --- plan CRUD through real sessions; the stale amount=3000 is deliberately sent ---
+got=$(rest_post "$RAVI" "membership_plans" "{\"id\":\"$PL_B6\",\"organization_id\":\"$ORG_IRON\",\"name\":\"rls-test plan bundle 6\",\"amount\":3000,\"duration_months\":6,\"total_price\":4500,\"bonus_months\":3}")
+assert_contains "owner creates a bundle plan"                       "\"id\":\"$PL_B6\"" "$got"
+assert_contains "  ...amount derived = total/duration (750), not the stale 3000" '"amount":750.00' "$got"
+assert_contains "  ...bonus_months stored" '"bonus_months":3' "$got"
+got=$(rest_post "$RAVI" "membership_plans" "{\"id\":\"$PL_B7\",\"organization_id\":\"$ORG_IRON\",\"name\":\"rls-test plan bundle 7\",\"duration_months\":7,\"total_price\":4500}")
+assert_contains "bundle with amount omitted entirely is accepted"   '"amount":642.86' "$got"
+got=$(rest_post "$RAVI" "membership_plans" "{\"id\":\"$PL_M\",\"organization_id\":\"$ORG_IRON\",\"name\":\"rls-test plan monthly\",\"amount\":1500}")
+assert_contains "ordinary plan: amount untouched (1500)"            '"amount":1500.00' "$got"
+assert_contains "  ...duration_months null"                         '"duration_months":null' "$got"
+assert_contains "  ...total_price null"                             '"total_price":null' "$got"
+assert_contains "  ...bonus_months 0"                               '"bonus_months":0' "$got"
+assert_equals   "amount x duration drifts for the odd bundle (the reason renewals read total_price)" "4500.02" \
+  "$(sql "select (amount * duration_months)::text from membership_plans where id='$PL_B7';")"
+
+assert_equals "front_desk can create a bundle plan (201)" "201" \
+  "$(rest_post_status "$PRIYA" "membership_plans" "{\"organization_id\":\"$ORG_IRON\",\"name\":\"rls-test plan fd bundle\",\"duration_months\":3,\"total_price\":2700}")"
+assert_equals "coach cannot create a plan (403)" "403" \
+  "$(rest_post_status "$FARAH" "membership_plans" "{\"organization_id\":\"$ORG_IRON\",\"name\":\"rls-test plan coach\",\"duration_months\":3,\"total_price\":2700}")"
+assert_equals "cross-org: FlexFit owner cannot create a plan in Iron Temple (403)" "403" \
+  "$(rest_post_status "$SANJAY" "membership_plans" "{\"organization_id\":\"$ORG_IRON\",\"name\":\"rls-test plan xorg\",\"duration_months\":3,\"total_price\":2700}")"
+
+# --- constraints ---
+bad_plan() { # <label> <json fields after name>
+  assert_equals "rejected: $1" "400" \
+    "$(rest_post_status "$RAVI" "membership_plans" "{\"organization_id\":\"$ORG_IRON\",\"name\":\"rls-test plan bad\",$2}")"
+}
+bad_plan "bonus_months = duration_months (6 of 6)"         '"duration_months":6,"total_price":4500,"bonus_months":6'
+bad_plan "bonus_months > duration_months"                  '"duration_months":6,"total_price":4500,"bonus_months":9'
+bad_plan "negative bonus_months"                           '"duration_months":6,"total_price":4500,"bonus_months":-1'
+bad_plan "total_price without duration_months"             '"amount":100,"total_price":4500'
+bad_plan "bonus_months without duration_months"            '"amount":100,"bonus_months":2'
+bad_plan "bonus_months without total_price (nothing to attach free months to)" '"amount":750,"duration_months":6,"bonus_months":2'
+bad_plan "duration_months 0"                               '"amount":100,"duration_months":0'
+bad_plan "duration_months 37"                              '"amount":100,"duration_months":37,"total_price":4500'
+bad_plan "negative total_price"                            '"duration_months":6,"total_price":-5'
+assert_equals "nothing leaked through the rejected inserts" "0" \
+  "$(sql "select count(*) from membership_plans where name='rls-test plan bad';")"
+
+# --- amount cannot be made to disagree with total_price / duration ---
+rest_patch_status "$RAVI" "membership_plans?id=eq.$PL_B6" '{"amount":9999}' >/dev/null
+assert_equals "direct PATCH of a bundle's amount is overwritten (still 750)" "750.00" \
+  "$(sql "select amount from membership_plans where id='$PL_B6';")"
+rest_patch_status "$RAVI" "membership_plans?id=eq.$PL_B6" '{"total_price":3000}' >/dev/null
+assert_equals "editing total_price re-derives amount (3000/6 = 500)" "500.00" \
+  "$(sql "select amount from membership_plans where id='$PL_B6';")"
+rest_patch_status "$RAVI" "membership_plans?id=eq.$PL_B6" '{"total_price":4500}' >/dev/null
+assert_equals "  ...and back (4500/6 = 750)" "750.00" "$(sql "select amount from membership_plans where id='$PL_B6';")"
+assert_equals "every bundle: |amount - total/duration| <= 0.005" "0" \
+  "$(sql "select count(*) from membership_plans where total_price is not null and abs(amount - total_price/duration_months) > 0.005;")"
+
+# --- membership creation (through the owner's session, so grants + RLS + trigger) ---
+mk() { # <id> <member> <plan> <duration> [extra json]
+  rest_post "$RAVI" "memberships" "{\"id\":\"$1\",\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$2\",\"plan_id\":\"$3\",\"start_date\":\"$TODAY\",\"duration_months\":$4${5:-}}"
+}
+got=$(mk "$BM_OWN" "$ASHA" "$PL_B6" 6)
+assert_contains "bundle membership at the plan's duration: total = bundle total" '"total_price":4500.00' "$got"
+assert_contains "  ...bonus_months snapshotted (3)" '"bonus_months":3' "$got"
+assert_equals   "  ...current_period_end = start_date + 6 months (filled when omitted)" \
+  "$(sql "select ('$TODAY'::date + interval '6 months')::date::text;")" \
+  "$(sql "select current_period_end from memberships where id='$BM_OWN';")"
+got=$(mk "$BM_OVR" "$ASHA" "$PL_B6" 3)
+assert_contains "overriding the duration on a bundle falls back to rate x duration (750 x 3)" '"total_price":2250.00' "$got"
+assert_contains "  ...no bonus months for a non-bundle duration" '"bonus_months":0' "$got"
+got=$(mk "$BM_TOT" "$ASHA" "$PL_B6" 3 ',"total_price":2000')
+assert_contains "  ...an explicit total_price still wins" '"total_price":2000.00' "$got"
+got=$(mk "$BM_MON" "$ASHA" "$PL_M" 3)
+assert_contains "ordinary monthly plan x 3 months: 1500 x 3 = 4500, unchanged rule" '"total_price":4500.00' "$got"
+assert_contains "  ...bonus_months 0" '"bonus_months":0' "$got"
+got=$(mk "$BM_ODD" "$ASHA" "$PL_B7" 7)
+assert_contains "odd bundle at its duration: total is exactly 4500.00 (not 4500.02)" '"total_price":4500.00' "$got"
+got=$(mk "$BM_WRONG" "$ASHA" "$PL_B6" 3)
+assert_contains "setup: bundle signed up with the wrong duration (3 of 6)" '"total_price":2250.00' "$got"
+got=$(mk "$BM_LOC2" "$MEMBER_LOC2" "$PL_B6" 6)
+assert_contains "setup: bundle membership at HSR Layout" '"bonus_months":3' "$got"
+mk "$BM_PATCH" "$ASHA" "$PL_B6" 6 >/dev/null
+assert_equals "memberships.bonus_months >= duration_months is rejected (6 of 6)" "400" \
+  "$(rest_post_status "$RAVI" "memberships" "{\"organization_id\":\"$ORG_IRON\",\"member_id\":\"$ASHA\",\"plan_id\":\"$PL_B6\",\"start_date\":\"$TODAY\",\"duration_months\":6,\"current_period_end\":\"$TODAY\",\"bonus_months\":6}")"
+
+# --- snapshots survive plan edits ---
+rest_patch_status "$RAVI" "membership_plans?id=eq.$PL_B6" '{"total_price":6000,"bonus_months":1}' >/dev/null
+assert_equals "plan edit does not rewrite an existing membership's total + bonus" "4500.00|3" \
+  "$(sql "select total_price||'|'||bonus_months from memberships where id='$BM_OWN';")"
+
+# --- renewal pricing (the rule send-renewal-reminder now calls) ---
+renew() { sql "select membership_renewal_amount('$1');"; }
+assert_equals "renewal: bundle at its own duration bills the CURRENT bundle total (plan now 6000)" "6000.00" "$(renew "$BM_OWN")"
+rest_patch_status "$RAVI" "membership_plans?id=eq.$PL_B6" '{"total_price":4500,"bonus_months":3}' >/dev/null
+assert_equals "renewal: bundle total restored -> 4500" "4500.00" "$(renew "$BM_OWN")"
+assert_equals "renewal: odd bundle bills exactly 4500.00, not amount x 7" "4500.00" "$(renew "$BM_ODD")"
+assert_equals "renewal: bundle membership at another duration bills rate x its duration (750 x 3)" "2250.00" "$(renew "$BM_OVR")"
+assert_equals "renewal: ordinary plan unchanged (1500 x 3)" "4500.00" "$(renew "$BM_MON")"
+assert_equals "renewal: unknown membership -> NULL" "" "$(renew 00000000-0000-0000-0000-000000000000)"
+case "$(rest_rpc_status "$RAVI" "membership_renewal_amount" "{\"p_membership_id\":\"$BM_OWN\"}")" in
+  401|403|404) ok "membership_renewal_amount is not callable by staff sessions (service_role only)" ;;
+  *) bad "membership_renewal_amount is not callable by staff sessions" "401/403/404" "$(rest_rpc_status "$RAVI" "membership_renewal_amount" "{\"p_membership_id\":\"$BM_OWN\"}")" ;;
+esac
+
+# --- update_membership_duration on bundles ---
+bstart=$(sql "select start_date from memberships where id='$BM_WRONG';")
+got=$(rest_rpc "$PRIYA" "update_membership_duration" "{\"p_membership_id\":\"$BM_WRONG\",\"p_duration_months\":6}")
+assert_contains "wrong duration corrected to the bundle's own: total snaps to the bundle price" '"total_price":4500' "$got"
+assert_contains "  ...bonus_months returned (3)" '"bonus_months":3' "$got"
+assert_equals   "  ...row: 6 months, 4500, bonus 3, end = start + 6 months" \
+  "6|4500.00|3|$(sql "select ('$bstart'::date + interval '6 months')::date::text;")" \
+  "$(sql "select duration_months||'|'||total_price||'|'||bonus_months||'|'||current_period_end from memberships where id='$BM_WRONG';")"
+assert_equals   "  ...audit records bonus 0 -> 3" "0|3" \
+  "$(sql "select old_bonus_months||'|'||new_bonus_months from membership_duration_changes where membership_id='$BM_WRONG';")"
+
+got=$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$BM_OWN\",\"p_duration_months\":3}")
+assert_contains "bundle -> another duration without a total: total_required" "total_required" "$got"
+assert_contains "  ...hint carries the monthly-rate figure (2250)" "2250" "$got"
+assert_equals   "  ...membership untouched (6, 4500, bonus 3)" "6|4500.00|3" \
+  "$(sql "select duration_months||'|'||total_price||'|'||bonus_months from memberships where id='$BM_OWN';")"
+got=$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$BM_OWN\",\"p_duration_months\":3,\"p_total_price\":2300}")
+assert_contains "  ...with an explicit total it goes through" '"total_price":2300' "$got"
+assert_contains "  ...bonus_months reset to 0 (the free months belong to the bundle as sold)" '"bonus_months":0' "$got"
+assert_equals   "  ...audit records bonus 3 -> 0" "3|0" \
+  "$(sql "select old_bonus_months||'|'||new_bonus_months from membership_duration_changes where membership_id='$BM_OWN' order by changed_at desc limit 1;")"
+assert_equals   "  ...renews at rate x its own duration now (750 x 3), no longer the bundle" "2250.00" "$(renew "$BM_OWN")"
+assert_contains "  ...back to the bundle duration from a custom 2300 total: total_required (not derivable)" "total_required" \
+  "$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$BM_OWN\",\"p_duration_months\":6}")"
+got=$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$BM_OWN\",\"p_duration_months\":6,\"p_total_price\":4500}")
+assert_contains "  ...with the total stated it returns to the bundle shape (bonus 3)" '"bonus_months":3' "$got"
+
+got=$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$BM_ODD\",\"p_duration_months\":7}")
+assert_contains "odd bundle re-saved at its own duration needs no total (4500, not total_required)" '"total_price":4500' "$got"
+got=$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$BM_MON\",\"p_duration_months\":2}")
+assert_contains "ordinary-plan membership: rule unchanged (1500 x 2 = 3000)" '"total_price":3000' "$got"
+assert_contains "  ...bonus_months 0 in the return shape" '"bonus_months":0' "$got"
+
+assert_contains "front_desk, other location, bundle membership -> membership_not_found" "membership_not_found" \
+  "$(rest_rpc "$PRIYA" "update_membership_duration" "{\"p_membership_id\":\"$BM_LOC2\",\"p_duration_months\":6}")"
+assert_contains "coach -> not_authorized (bundle membership)" "not_authorized" \
+  "$(rest_rpc "$FARAH" "update_membership_duration" "{\"p_membership_id\":\"$BM_OWN\",\"p_duration_months\":6}")"
+assert_contains "cross-org owner -> membership_not_found (bundle membership)" "membership_not_found" \
+  "$(rest_rpc "$SANJAY" "update_membership_duration" "{\"p_membership_id\":\"$BM_OWN\",\"p_duration_months\":6}")"
+assert_equals "direct PATCH of memberships.status still hits the guard (403)" "403" \
+  "$(rest_patch_status "$RAVI" "memberships?id=eq.$BM_PATCH" '{"status":"past_due"}')"
+
+# --- nothing pre-existing was altered ---
+assert_equals "no pre-existing plan became a bundle or gained a duration" "0" \
+  "$(sql "select count(*) from membership_plans where (total_price is not null or duration_months is not null or bonus_months <> 0) and name not like 'rls-test plan%';")"
+assert_equals "no pre-existing membership has bonus_months" "0" \
+  "$(sql "select count(*) from memberships where bonus_months <> 0 and id::text not like '0daded00-4444-%';")"
 
 # ---------------------------------------------------------------------------
 # Summary

@@ -595,11 +595,27 @@ async function handleReminder(req: Request): Promise<Response> {
     );
     return json({ ok: false, error: "plan_amount_invalid" }, 500);
   }
-  // A renewal renews for the membership's full committed duration, so the
-  // charge is the monthly rate x duration_months (1 for legacy monthly
-  // signups). See 20260829099000_move_duration_to_memberships.sql — duration
-  // is a property of the signup, not the plan.
-  const amountRupees = monthlyRupees * (membership.duration_months ?? 1);
+  // A renewal renews for the membership's full committed duration. The price
+  // rule lives in SQL (membership_renewal_amount, 20261030090500) so it is the
+  // single source of truth and testable without a live Razorpay link:
+  //   * bundle plan (plan.total_price set) at the bundle's own duration
+  //       -> the fixed plan.total_price (amount x duration would drift by
+  //          rounding, e.g. 4500 over 7 months);
+  //   * everything else -> monthly rate x duration_months, exactly as before
+  //       (1 for legacy monthly signups; see
+  //       20260829099000_move_duration_to_memberships.sql).
+  const { data: renewalAmount, error: renewalAmountError } = await supabase.rpc(
+    "membership_renewal_amount",
+    { p_membership_id: membership.id },
+  );
+  const amountRupees = Number(renewalAmount);
+  if (renewalAmountError || !Number.isFinite(amountRupees) || amountRupees <= 0) {
+    console.error(
+      `[${TAG}] membership_renewal_amount failed for ${membership.id}:`,
+      renewalAmountError ?? `got ${JSON.stringify(renewalAmount)}`,
+    );
+    return json({ ok: false, error: "plan_amount_invalid" }, 500);
+  }
 
   // --- (e) Reuse an existing payments row for this period if there is one ---
   // Checked BEFORE calling Razorpay so the ordinary repeat case (a second

@@ -503,6 +503,66 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Bundle plans (migrations 20261030090000/90500): a renewal of a bundle
+# membership is billed at the bundle's fixed total_price, not amount x duration.
+# Creates real Razorpay TEST links like every other group in this file, so when
+# the Razorpay test-mode link cap is hit the pricing assertions SKIP (the
+# pricing RULE itself is asserted in SQL by rls-test.sh section 19) - any other
+# failure, notably plan_amount_invalid, is a real FAIL.
+# ---------------------------------------------------------------------------
+printf '\n%s-- bundle plan renewal pricing --%s\n' "$B" "$N"
+
+if ! $have_psql; then
+  skipped "bundle renewal pricing" "requires docker/psql"
+else
+  BP_MEMBER=e2222222-2222-2222-2222-222222222222   # Bharat Rao, Iron Temple, opted in
+  BP_PLAN_EVEN=0daded00-3333-0000-0000-0000000000a1  # 6 months (3 + 3 free) = 4500 -> 750.00/mo exactly
+  BP_PLAN_ODD=0daded00-3333-0000-0000-0000000000a2   # 7 months = 4500 -> 642.86/mo, 7 x 642.86 = 4500.02
+  BP_MEM_EVEN=0daded00-3333-0000-0000-0000000000b1
+  BP_MEM_ODD=0daded00-3333-0000-0000-0000000000b2
+  BP_MEM_OVERRIDE=0daded00-3333-0000-0000-0000000000b3
+
+  bp_cleanup() {
+    sql "delete from payments where membership_id in ('$BP_MEM_EVEN','$BP_MEM_ODD','$BP_MEM_OVERRIDE');" >/dev/null
+    sql "delete from whatsapp_messages where member_id='$BP_MEMBER' and template_name='renewal_reminder' and body_preview like '%Bundle%';" >/dev/null
+    sql "delete from memberships where id in ('$BP_MEM_EVEN','$BP_MEM_ODD','$BP_MEM_OVERRIDE');" >/dev/null
+    sql "delete from membership_plans where id in ('$BP_PLAN_EVEN','$BP_PLAN_ODD');" >/dev/null
+  }
+  bp_cleanup
+  sql "insert into membership_plans (id, organization_id, name, duration_months, total_price, bonus_months)
+       values ('$BP_PLAN_EVEN', '$ORG_IRON', 'Bundle 6 (3+3 free)', 6, 4500, 3),
+              ('$BP_PLAN_ODD',  '$ORG_IRON', 'Bundle 7 odd',        7, 4500, 0);" >/dev/null
+  sql "insert into memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end, duration_months)
+       values
+        ('$BP_MEM_EVEN',     '$ORG_IRON', '$BP_MEMBER', '$BP_PLAN_EVEN', 'past_due', CURRENT_DATE - 200, CURRENT_DATE - 20, 6),
+        ('$BP_MEM_ODD',      '$ORG_IRON', '$BP_MEMBER', '$BP_PLAN_ODD',  'past_due', CURRENT_DATE - 230, CURRENT_DATE - 20, 7),
+        ('$BP_MEM_OVERRIDE', '$ORG_IRON', '$BP_MEMBER', '$BP_PLAN_EVEN', 'past_due', CURRENT_DATE - 100, CURRENT_DATE - 20, 3);" >/dev/null
+
+  # Pricing step precedes the Razorpay call, so anything but ok/razorpay_error
+  # (e.g. plan_amount_invalid) means the new amount lookup itself broke.
+  check_bundle_renewal() { # <label> <membership_id> <expected amount>
+    local got; got=$(post "$2")
+    case "$got" in
+      *'"ok":true'*)
+        assert_equals "$1: payment row amount is the bundle price" "$3" \
+          "$(sql "select amount from payments where membership_id='$2' and idempotency_key like 'renewal-%';")"
+        assert_contains "$1: response carries the same amount" "\"amount\":${3%.00}" "$got" ;;
+      *razorpay_error*)
+        skipped "$1: billed at $3" "Razorpay test-mode link cap/rate limit hit - pricing rule asserted in rls-test.sh section 19" ;;
+      *) bad "$1: renewal call reached Razorpay (pricing step ok)" "ok:true or razorpay_error" "$got" ;;
+    esac
+  }
+
+  check_bundle_renewal "bundle 6 months (3+3 free) at its own duration" "$BP_MEM_EVEN" "4500.00"
+  check_bundle_renewal "bundle 7 months (rate does not divide evenly)" "$BP_MEM_ODD" "4500.00"
+  # duration changed away from the bundle's own: rate x its own duration (750 x 3)
+  check_bundle_renewal "bundle membership at a different duration (3 of 6)" "$BP_MEM_OVERRIDE" "2250.00"
+
+  bp_cleanup
+  reset_state
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 reset_state
