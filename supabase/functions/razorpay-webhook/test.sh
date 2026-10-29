@@ -622,6 +622,111 @@ DELETE FROM pt_packages      WHERE id='$PT_PKG';
 SQL
 
 # ---------------------------------------------------------------------------
+# Desk payment first, Razorpay link paid afterwards (20261031090000/90500).
+# record_manual_payment voids the pending link for the same period; if the
+# member pays that link anyway the webhook must record the money as refund_due
+# and NOT extend the membership a second time.
+# ---------------------------------------------------------------------------
+printf '\n%s-- desk payment, then the Razorpay link is paid --%s\n' "$B" "$N"
+
+if ! $have_psql; then
+  skipped "desk-payment-then-link group" "requires docker/psql"
+else
+  DP_MEMBER=e1111111-1111-1111-1111-111111111111      # Asha Menon, Iron Temple
+  DP_PLAN=cccccccc-cccc-cccc-cccc-cccccccccccc        # Monthly Unlimited, 1500
+  DP_MEM=0daded00-6666-0000-0000-0000000000a1         # desk payment, then link paid
+  DP_MEM_CTL=0daded00-6666-0000-0000-0000000000a2     # control: link paid, no desk payment
+  DP_PAY=0daded00-6666-0000-0000-0000000000b1         # pending link, superseded
+  DP_PAY_CTL=0daded00-6666-0000-0000-0000000000b2
+  DP_PAY_VOID=0daded00-6666-0000-0000-0000000000b3    # an already-voided link receiving a failure callback
+  DP_CLAIMS='{"org_id":"11111111-1111-1111-1111-111111111111","user_id":"91111111-1111-1111-1111-111111111111","app_role":"owner"}'
+
+  dp_cleanup() {
+    docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -q >/dev/null 2>&1 <<SQL
+DELETE FROM whatsapp_messages WHERE related_payment_id IN (SELECT id FROM payments WHERE membership_id IN ('$DP_MEM','$DP_MEM_CTL'));
+DELETE FROM payments WHERE membership_id IN ('$DP_MEM','$DP_MEM_CTL');
+DELETE FROM webhook_events WHERE event_id LIKE 'evt_$RUN.dp%';
+DELETE FROM memberships WHERE id IN ('$DP_MEM','$DP_MEM_CTL');
+SQL
+  }
+
+  # Records a desk payment as the Iron Temple owner (role authenticated + JWT claims,
+  # the way PostgREST calls it). Prints the JSON-ish row.
+  dp_record() { # <membership_id>
+    docker exec -i "$DB_CONTAINER" psql -U postgres -d postgres -tA -q <<SQL 2>&1 | tail -1 | tr -d '\r'
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims', '$DP_CLAIMS', true) \gset
+SELECT payment_id||'|'||voided_pending||'|'||current_period_end FROM record_manual_payment('$1', 1500, 'cash', 'rcpt-dp', CURRENT_DATE, 'dp test');
+COMMIT;
+SQL
+  }
+
+  reset_state
+  dp_cleanup
+  sql "insert into memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end, duration_months)
+       values ('$DP_MEM',     '$ORG_IRON', '$DP_MEMBER', '$DP_PLAN', 'active', CURRENT_DATE - 10, CURRENT_DATE + 20, 1),
+              ('$DP_MEM_CTL', '$ORG_IRON', '$DP_MEMBER', '$DP_PLAN', 'active', CURRENT_DATE - 10, CURRENT_DATE + 20, 1);" >/dev/null
+  # pending links exactly as send-renewal-reminder creates them (no coverage given)
+  sql "insert into payments (id, organization_id, membership_id, amount, provider, razorpay_link_id, status, idempotency_key)
+       values ('$DP_PAY',     '$ORG_IRON', '$DP_MEM',     1500, 'razorpay', 'plink_DP_DUP', 'pending', 'renewal-$DP_MEM-'||(CURRENT_DATE + 20)),
+              ('$DP_PAY_CTL', '$ORG_IRON', '$DP_MEM_CTL', 1500, 'razorpay', 'plink_DP_CTL', 'pending', 'renewal-$DP_MEM_CTL-'||(CURRENT_DATE + 20));" >/dev/null
+
+  assert_db "a pending link gets its coverage filled by the trigger (end -> end + 1 month)" \
+    "$(sql "select (CURRENT_DATE + 20)::text||'|'||((CURRENT_DATE + 20) + interval '1 month')::date::text;")" \
+    "$(sql "select covers_from||'|'||covers_to from payments where id='$DP_PAY';")"
+
+  end_before=$(sql "select current_period_end from memberships where id='$DP_MEM';")
+  want_end=$(sql "select ('$end_before'::date + interval '1 month')::date::text;")
+  rec=$(dp_record "$DP_MEM")
+  DP_MANUAL_ID=${rec%%|*}
+  assert_equals "desk payment voided exactly the one pending link and extended the membership" "1|$want_end" "${rec#*|}"
+  assert_db "  ...the pending link is now void" "void" "$(sql "select status from payments where id='$DP_PAY';")"
+  assert_db "  ...membership extended once (end + 1 month)" "$want_end" "$(sql "select current_period_end from memberships where id='$DP_MEM';")"
+  assert_db "  ...payment_covering_collected sees the desk payment for the voided link" "$DP_MANUAL_ID" \
+    "$(sql "select payment_covering_collected('$DP_PAY');")"
+
+  # --- the member pays the (still live) Razorpay link anyway ---
+  got=$(post "$(link_event "evt_$RUN.dp1" "plink_DP_DUP" "pay_DP_DUP" 150000)")
+  assert_contains "webhook records it as a duplicate needing a refund" '"handled":"payment_duplicate_refund_due"' "$got"
+  assert_contains "  ...and names the desk payment it duplicates" "\"duplicate_of\":\"$DP_MANUAL_ID\"" "$got"
+  assert_db "  ...payment row is refund_due with the Razorpay payment id attached" "refund_due|pay_DP_DUP" \
+    "$(sql "select status||'|'||provider_payment_id from payments where id='$DP_PAY';")"
+  assert_db "  ...membership was NOT extended a second time" "$want_end" \
+    "$(sql "select current_period_end from memberships where id='$DP_MEM';")"
+  assert_db "  ...no payment confirmation was sent for it" "0" \
+    "$(sql "select count(*) from whatsapp_messages where related_payment_id='$DP_PAY';")"
+  assert_db "  ...refund_due money is NOT collected revenue" "0" \
+    "$(sql "select count(*) from payments where id='$DP_PAY' and payment_is_collected(status);")"
+  assert_db "  ...the note explains the refund" "t" \
+    "$(sql "select note like 'Duplicate of payment $DP_MANUAL_ID%' from payments where id='$DP_PAY';")"
+  assert_db "  ...webhook_events marked processed" "t" "$(sql "select processed from webhook_events where event_id='evt_$RUN.dp1';")"
+
+  # --- replay + late failure callback must not disturb it ---
+  got=$(post "$(link_event "evt_$RUN.dp1" "plink_DP_DUP" "pay_DP_DUP" 150000)")
+  assert_contains "replaying the same event is a no-op" '"duplicate":true' "$got"
+  sql "update payments set provider_payment_id='pay_DP_VOIDFAIL' where id='$DP_PAY_VOID';" >/dev/null 2>&1
+  sql "insert into payments (id, organization_id, membership_id, amount, provider, provider_payment_id, status, idempotency_key, voided_at, void_reason)
+       values ('$DP_PAY_VOID', '$ORG_IRON', '$DP_MEM', 1500, 'razorpay', 'pay_DP_VOIDFAIL', 'void', 'renewal-$DP_MEM-voidfail', now(), 'test');" >/dev/null
+  got=$(post "$(payment_event "payment.failed" "evt_$RUN.dp2" "pay_DP_VOIDFAIL" 150000)")
+  assert_db "a payment.failed callback does not un-void a voided link" "void" "$(sql "select status from payments where id='$DP_PAY_VOID';")"
+
+  # --- control: no desk payment -> the same event extends once and records coverage ---
+  ctl_end=$(sql "select current_period_end from memberships where id='$DP_MEM_CTL';")
+  ctl_want=$(sql "select ('$ctl_end'::date + interval '1 month')::date::text;")
+  got=$(post "$(link_event "evt_$RUN.dp3" "plink_DP_CTL" "pay_DP_CTL" 150000)")
+  assert_contains "control: an unpaid period is still extended normally" '"handled":"payment_success"' "$got"
+  assert_db "  ...membership extended by one month" "$ctl_want" "$(sql "select current_period_end from memberships where id='$DP_MEM_CTL';")"
+  assert_db "  ...the payment records the period it covered" "$ctl_end|$ctl_want" \
+    "$(sql "select covers_from||'|'||covers_to from payments where id='$DP_PAY_CTL';")"
+  assert_db "  ...and counts as collected" "1" "$(sql "select count(*) from payments where id='$DP_PAY_CTL' and payment_is_collected(status);")"
+
+  dp_cleanup
+  sql "delete from payments where id='$DP_PAY_VOID';" >/dev/null
+  reset_state
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 reset_state

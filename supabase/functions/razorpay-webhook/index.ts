@@ -557,15 +557,65 @@ async function handlePaymentSuccess(
   const { row, matchedBy } = found;
 
   // Defence in depth alongside the webhook_events guard: a payment already
-  // marked success must never be extended twice.
-  if (row.status === "success") {
+  // marked success must never be extended twice. refund_due rows were already
+  // diverted below on an earlier delivery.
+  if (row.status === "success" || row.status === "refund_due") {
     console.log(
-      `[razorpay-webhook] payment ${row.id} is already 'success' — no-op.`,
+      `[razorpay-webhook] payment ${row.id} is already '${row.status}' — no-op.`,
     );
-    return { skipped: "already_success", matched_by: matchedBy };
+    return { skipped: row.status === "success" ? "already_success" : "already_refund_due", matched_by: matchedBy };
   }
 
   warnOnAmountMismatch(row, extracted);
+
+  // --- Period already paid? (20261031090500) ---
+  // A pending link can be superseded by a desk payment (record_manual_payment
+  // voids it) while the link itself is still live at Razorpay. If the member
+  // pays it anyway, the matched row is the voided/pending one — but the period
+  // it would pay for is already covered by a collected payment. Record the money
+  // honestly, mark it refund_due (excluded from revenue by payment_is_collected)
+  // and DO NOT extend the membership a second time.
+  if (row.membership_id) {
+    const { data: coveredBy, error: coverError } = await supabase.rpc(
+      "payment_covering_collected",
+      { p_payment_id: row.id },
+    );
+    // Fail closed: a thrown error leaves the event unprocessed for a retry
+    // rather than risking a double extension.
+    if (coverError) throw coverError;
+    if (coveredBy) {
+      const dupUpdate: Record<string, unknown> = {
+        status: "refund_due",
+        reconciled_at: new Date().toISOString(),
+        note: `Duplicate of payment ${coveredBy}: the period was already paid ` +
+          "before this Razorpay payment arrived. Refund needed; membership not extended.",
+      };
+      if (extracted.razorpayPaymentId) dupUpdate.provider_payment_id = extracted.razorpayPaymentId;
+      const { error: dupError } = await supabase.from("payments").update(dupUpdate).eq("id", row.id);
+      if (dupError) {
+        if (dupError.code === "23505") {
+          console.error(
+            `[razorpay-webhook] provider_payment_id ${extracted.razorpayPaymentId} ` +
+              `is already attached to another payments row; refusing to reassign it to ${row.id}.`,
+          );
+          return { skipped: "provider_payment_id_conflict" };
+        }
+        throw dupError;
+      }
+      console.error(
+        `[razorpay-webhook] REFUND NEEDED: payment ${row.id} (razorpay ` +
+          `${extracted.razorpayPaymentId}, ₹${extracted.amount}) pays a period already ` +
+          `covered by payment ${coveredBy}. Marked refund_due; membership NOT extended.`,
+      );
+      return {
+        handled: "payment_duplicate_refund_due",
+        matched_by: matchedBy,
+        payment_id: row.id,
+        duplicate_of: coveredBy,
+        new_period_end: null,
+      };
+    }
+  }
 
   const paymentUpdate: Record<string, unknown> = {
     status: "success",
@@ -645,6 +695,19 @@ async function handlePaymentSuccess(
         .update({ status: "active", current_period_end: newPeriodEnd })
         .eq("id", membership.id);
       if (membershipError) throw membershipError;
+
+      // Record exactly which period this payment paid for, so a later desk
+      // payment / webhook can tell it is already covered.
+      const { error: coverUpdateError } = await supabase
+        .from("payments")
+        .update({ covers_from: extendFrom, covers_to: newPeriodEnd })
+        .eq("id", row.id);
+      if (coverUpdateError) {
+        console.error(
+          `[razorpay-webhook] could not record coverage on payment ${row.id}:`,
+          coverUpdateError,
+        );
+      }
 
       console.log(
         `[razorpay-webhook] membership ${membership.id} extended ` +
@@ -732,11 +795,12 @@ async function handlePaymentFailure(
 
   const { row, matchedBy } = found;
 
-  // A late failure callback must not clobber a payment that already succeeded.
-  if (row.status === "success") {
+  // A late failure callback must not clobber a payment that already succeeded,
+  // was voided, or was diverted to refund_due.
+  if (row.status === "success" || row.status === "void" || row.status === "refund_due") {
     console.warn(
       `[razorpay-webhook] ignoring '${event}' for payment ${row.id}: already ` +
-        "reconciled as success. Not downgrading.",
+        `reconciled as ${row.status}. Not downgrading.`,
     );
     return { skipped: "already_success", matched_by: matchedBy };
   }

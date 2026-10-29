@@ -213,6 +213,10 @@ DELETE FROM membership_duration_changes WHERE membership_id::text LIKE '0daded00
 DELETE FROM payments WHERE idempotency_key = 'rls-test-ud-paid';
 DELETE FROM membership_freezes WHERE membership_id::text LIKE '0daded00-1111-0000-0000-0000000000d%';
 DELETE FROM memberships WHERE id::text LIKE '0daded00-1111-0000-0000-0000000000d%';
+-- section 20's manual-payment fixtures (audit rows and payments FK-reference memberships)
+DELETE FROM membership_duration_changes WHERE membership_id::text LIKE '0daded00-7777-%';
+DELETE FROM payments WHERE membership_id::text LIKE '0daded00-7777-%' OR idempotency_key LIKE 'rls-test-mp-%';
+DELETE FROM memberships WHERE id::text LIKE '0daded00-7777-%';
 -- section 19's bundle-plan fixtures (same FK ordering: audit, payments, then memberships;
 -- the plans themselves are 'rls-test plan%' rows, removed at the end of this function).
 DELETE FROM membership_duration_changes WHERE membership_id::text LIKE '0daded00-4444-%';
@@ -1274,18 +1278,18 @@ sql "update memberships set status='cancelled' where id='$PAY_CANCELLED';" >/dev
 before_end=$(sql "select current_period_end from memberships where id='$PAY_ACTIVE';")
 got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$PAY_ACTIVE\",\"p_amount\":1500,\"p_method\":\"cash\"}")
 assert_contains "owner records a cash payment -> status active" '"status":"active"' "$got"
-assert_contains "  ...method echoed back" '"method":"cash"' "$got"
+assert_contains "  ...method echoed back" '"payment_method":"cash"' "$got"
 expected_end=$(sql "select (('$before_end'::date + interval '1 month'))::date::text;")
 assert_contains "  ...current_period_end extended by 1 month" "\"current_period_end\":\"$expected_end\"" "$got"
 assert_equals   "  ...memberships row actually updated"  "$expected_end" "$(sql "select current_period_end from memberships where id='$PAY_ACTIVE';")"
 PAY_ID=$(printf '%s' "$got" | sed -n 's/.*"payment_id":"\([^"]*\)".*/\1/p')
 assert_equals   "  ...a payments row exists with provider=manual, status=manual" "manual|manual|cash" \
-  "$(sql "select provider||'|'||status||'|'||method from payments where id='$PAY_ID';")"
+  "$(sql "select provider||'|'||status||'|'||payment_method from payments where id='$PAY_ID';")"
 
 # --- front_desk (Priya, own location) can also record a payment ---
 got=$(rest_rpc "$PRIYA" "record_manual_payment" "{\"p_membership_id\":\"$PAY_ACTIVE\",\"p_amount\":1500,\"p_method\":\"upi\"}")
 assert_contains "front_desk (own location) records a payment -> ok" '"status":"active"' "$got"
-assert_contains "  ...method=upi" '"method":"upi"' "$got"
+assert_contains "  ...method=upi" '"payment_method":"upi"' "$got"
 
 # --- front_desk, wrong location: masked as membership_not_found (same
 #     discipline as freeze_membership's own cross-location behaviour); owner
@@ -1344,13 +1348,13 @@ sql "UPDATE organizations SET status = 'active' WHERE id = '$ORG_IRON'" >/dev/nu
 #     test-only sleep in production code, so it isn't re-run here.) ---
 collision_period_end=$(sql "select current_period_end from memberships where id='$PAY_COLLISION';")
 collision_key="manual-${PAY_COLLISION}-${collision_period_end}"
-sql "insert into payments (organization_id, membership_id, amount, provider, method, status, idempotency_key, reconciled_at)
-     values ('$ORG_IRON', '$PAY_COLLISION', 1500, 'manual', 'cash', 'manual', '$collision_key', now());" >/dev/null
+sql "insert into payments (organization_id, membership_id, amount, provider, payment_method, status, idempotency_key, reconciled_at)
+     values ('$ORG_IRON', '$PAY_COLLISION', 3000, 'manual', 'cash', 'manual', '$collision_key', now());" >/dev/null
 PRESEEDED_PAYMENT_ID=$(sql "select id from payments where idempotency_key='$collision_key';")
 
-status_code=$(rest_rpc_status "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$PAY_COLLISION\",\"p_amount\":1500,\"p_method\":\"cash\"}")
+status_code=$(rest_rpc_status "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$PAY_COLLISION\",\"p_amount\":3000,\"p_method\":\"cash\"}")
 assert_equals   "a colliding idempotency key still returns 200, not an error" "200" "$status_code"
-got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$PAY_COLLISION\",\"p_amount\":1500,\"p_method\":\"cash\"}")
+got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$PAY_COLLISION\",\"p_amount\":3000,\"p_method\":\"cash\"}")
 assert_contains "  ...returns the PRE-EXISTING payment_id, not a new one" "\"payment_id\":\"$PRESEEDED_PAYMENT_ID\"" "$got"
 assert_equals   "  ...still exactly one payment row for that key" "1" \
   "$(sql "select count(*) from payments where idempotency_key='$collision_key';")"
@@ -1391,7 +1395,7 @@ sql "insert into memberships (id, organization_id, member_id, plan_id, status, s
       ('$UD_EXPIRED',  '$ORG_IRON', '$ASHA', '$UD_PLAN', 'expired',  CURRENT_DATE - 100, (CURRENT_DATE - 100 + interval '1 month')::date, 1, NULL),
       ('$UD_STILLPAST','$ORG_IRON', '$ASHA', '$UD_PLAN', 'past_due', CURRENT_DATE - 400, (CURRENT_DATE - 400 + interval '1 month')::date, 1, NULL),
       ('$UD_PAID',     '$ORG_IRON', '$ASHA', '$UD_PLAN', 'active',   CURRENT_DATE - 10,  (CURRENT_DATE - 10  + interval '1 month')::date, 1, NULL);" >/dev/null
-sql "insert into payments (organization_id, membership_id, amount, provider, method, status, idempotency_key, reconciled_at)
+sql "insert into payments (organization_id, membership_id, amount, provider, payment_method, status, idempotency_key, reconciled_at)
      values ('$ORG_IRON', '$UD_PAID', 1500, 'manual', 'cash', 'manual', 'rls-test-ud-paid', now());" >/dev/null
 assert_equals "setup: trigger derived total 1500 for the 1-month fixture" "1500.00" \
   "$(sql "select total_price from memberships where id='$UD_UP';")"
@@ -1693,6 +1697,206 @@ assert_equals "no pre-existing plan became a bundle or gained a duration" "0" \
   "$(sql "select count(*) from membership_plans where (total_price is not null or duration_months is not null or bonus_months <> 0) and name not like 'rls-test plan%';")"
 assert_equals "no pre-existing membership has bonus_months" "0" \
   "$(sql "select count(*) from memberships where bonus_months <> 0 and id::text not like '0daded00-4444-%';")"
+
+# ---------------------------------------------------------------------------
+# 20. Manual payment recording, hardened (migrations 20261031090000 / 90500):
+#     record_manual_payment v2 (full-amount only, reference, received_at,
+#     coverage, recorded_by, voids superseded pending links), void_payment
+#     (owner-only, never touches the membership), the single "collected" rule
+#     (payment_is_collected) behind revenue, and the extended v_payments_ledger.
+#     (Section 17 above was amended for the new signature and keeps its cases.)
+# ---------------------------------------------------------------------------
+printf '\n%s-- manual payments v2 + void --%s\n' "$B" "$N"
+
+MPP=0daded00-7777-0000-0000-0000000000
+MP_MAIN=${MPP}a1      # active, 1 month, ends in ~5 days (never renewed: end = start + 1 month)
+MP_LOC2=${MPP}a2      # HSR Layout member
+MP_PEND=${MPP}a3      # has a pending Razorpay link for the period
+MP_LATE=${MPP}a4      # past_due, lapsed
+MP_TWO=${MPP}a5       # 2 months, total 3000 (partial-payment refusal)
+MP_DUP=${MPP}a6       # double-tap collision fixture
+MP_SUCC=${MPP}a7      # carries a captured Razorpay payment (not voidable)
+MP_RAVI_UID=$(sql "select id from users where phone='919000000001' and organization_id='$ORG_IRON';")
+T20=$(sql "select CURRENT_DATE::text;")
+
+sql "insert into memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end, duration_months)
+     values
+      ('$MP_MAIN', '$ORG_IRON', '$ASHA', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'active',   CURRENT_DATE - 25, (CURRENT_DATE - 25 + interval '1 month')::date, 1),
+      ('$MP_LOC2', '$ORG_IRON', '$MEMBER_LOC2', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'active', CURRENT_DATE - 10, (CURRENT_DATE - 10 + interval '1 month')::date, 1),
+      ('$MP_PEND', '$ORG_IRON', '$ASHA', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'active',   CURRENT_DATE - 10, (CURRENT_DATE - 10 + interval '1 month')::date, 1),
+      ('$MP_LATE', '$ORG_IRON', '$ASHA', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'past_due', CURRENT_DATE - 60, (CURRENT_DATE - 60 + interval '1 month')::date, 1),
+      ('$MP_TWO',  '$ORG_IRON', '$ASHA', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'active',   CURRENT_DATE - 10, (CURRENT_DATE - 10 + interval '2 months')::date, 2),
+      ('$MP_DUP',  '$ORG_IRON', '$ASHA', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'active',   CURRENT_DATE - 10, (CURRENT_DATE - 10 + interval '1 month')::date, 1),
+      ('$MP_SUCC', '$ORG_IRON', '$ASHA', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'active',   CURRENT_DATE - 10, (CURRENT_DATE - 10 + interval '1 month')::date, 1);" >/dev/null
+sql "insert into payments (organization_id, membership_id, amount, provider, provider_payment_id, status, idempotency_key, reconciled_at)
+     values ('$ORG_IRON', '$MP_SUCC', 1500, 'razorpay', 'pay_rls_mp_succ', 'success', 'rls-test-mp-succ', now());" >/dev/null
+sql "insert into payments (id, organization_id, membership_id, amount, provider, razorpay_link_id, status, idempotency_key)
+     values ('${MPP}b1', '$ORG_IRON', '$MP_PEND', 1500, 'razorpay', 'plink_rls_mp_pend', 'pending',
+             'renewal-$MP_PEND-'||(CURRENT_DATE - 10 + interval '1 month')::date);" >/dev/null
+
+rev_on() { sql "select coalesce(sum(total),0) from v_daily_revenue where organization_id='$ORG_IRON' and day = date_trunc('day', ('$1'::date)::timestamptz);"; }
+rev_before_recv=$(rev_on "$(sql "select (CURRENT_DATE - 3)::text;")")
+rev_before_today=$(rev_on "$T20")
+mp_old_end=$(sql "select current_period_end from memberships where id='$MP_MAIN';")
+mp_new_end=$(sql "select ('$mp_old_end'::date + interval '1 month')::date::text;")
+RECV3=$(sql "select (CURRENT_DATE - 3)::text;")
+
+# --- owner records a UPI payment, back-dated 3 days ---
+got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$MP_MAIN\",\"p_amount\":1500,\"p_method\":\"upi\",\"p_reference\":\"UPI-RLS-1\",\"p_received_at\":\"$RECV3\",\"p_note\":\"rls test note\"}")
+MP_PAY=$(printf '%s' "$got" | sed -n 's/.*"payment_id":"\([^"]*\)".*/\1/p')
+assert_contains "owner records a UPI payment -> status active"        '"status":"active"' "$got"
+assert_contains "  ...payment_method + reference echoed"              '"payment_method":"upi"' "$got"
+assert_contains "  ...reference"                                      '"reference":"UPI-RLS-1"' "$got"
+assert_contains "  ...voided_pending 0 (nothing to supersede)"        '"voided_pending":0' "$got"
+assert_contains "  ...current_period_end extended by 1 month"         "\"current_period_end\":\"$mp_new_end\"" "$got"
+assert_equals   "  ...stored row: provider|status|method|reference|note|received_at|recorded_by" \
+  "manual|manual|upi|UPI-RLS-1|rls test note|$RECV3|$MP_RAVI_UID" \
+  "$(sql "select provider||'|'||status||'|'||payment_method||'|'||reference||'|'||note||'|'||received_at||'|'||recorded_by from payments where id='$MP_PAY';")"
+assert_equals   "  ...coverage = [old end, new end)" "$mp_old_end|$mp_new_end" \
+  "$(sql "select covers_from||'|'||covers_to from payments where id='$MP_PAY';")"
+assert_equals   "  ...counts as collected" "t" "$(sql "select payment_is_collected(status) from payments where id='$MP_PAY';")"
+assert_equals   "revenue: lands on its received_at day (+1500)" "$((${rev_before_recv%.*} + 1500))" "$(rev_on "$RECV3" | sed 's/\..*//')"
+assert_equals   "  ...and NOT on today (unchanged)" "${rev_before_today%.*}" "$(rev_on "$T20" | sed 's/\..*//')"
+
+# --- validation ---
+assert_contains "received_at tomorrow -> received_at_invalid" "received_at_invalid" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$MP_LATE\",\"p_amount\":1500,\"p_method\":\"cash\",\"p_received_at\":\"$(sql "select (CURRENT_DATE + 1)::text;")\"}")"
+assert_contains "received_at 8 days ago -> received_at_invalid" "received_at_invalid" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$MP_LATE\",\"p_amount\":1500,\"p_method\":\"cash\",\"p_received_at\":\"$(sql "select (CURRENT_DATE - 8)::text;")\"}")"
+assert_equals   "  ...nothing was recorded by the refused calls" "0" \
+  "$(sql "select count(*) from payments where membership_id='$MP_LATE';")"
+got=$(rest_rpc "$PRIYA" "record_manual_payment" "{\"p_membership_id\":\"$MP_LATE\",\"p_amount\":1500,\"p_method\":\"cash\",\"p_received_at\":\"$(sql "select (CURRENT_DATE - 7)::text;")\"}")
+assert_contains "received_at exactly 7 days ago is allowed (front_desk, own location)" '"status":"active"' "$got"
+assert_equals   "  ...past_due -> active, extended from TODAY (end was in the past)" \
+  "active|$(sql "select (CURRENT_DATE + interval '1 month')::date::text;")" \
+  "$(sql "select status||'|'||current_period_end from memberships where id='$MP_LATE';")"
+assert_equals   "  ...recorded_by is the front_desk user" "$(sql "select id from users where phone='919000000011' and organization_id='$ORG_IRON';")" \
+  "$(sql "select recorded_by from payments where membership_id='$MP_LATE';")"
+
+got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$MP_TWO\",\"p_amount\":1500,\"p_method\":\"cash\"}")
+assert_contains "partial payment (1500 of 3000) -> amount_mismatch" "amount_mismatch" "$got"
+assert_contains "  ...error quotes the expected total"   "3000" "$got"
+assert_contains "  ...and says partial payments are not supported" "Partial" "$got"
+assert_equals   "  ...nothing recorded, membership untouched" "0" "$(sql "select count(*) from payments where membership_id='$MP_TWO';")"
+assert_contains "overpayment -> amount_mismatch too" "amount_mismatch" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$MP_TWO\",\"p_amount\":3500,\"p_method\":\"cash\"}")"
+assert_contains "the full total (3000) is accepted" '"status":"active"' \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$MP_TWO\",\"p_amount\":3000,\"p_method\":\"cash\"}")"
+assert_contains "unknown method 'other' is no longer accepted" "method_invalid" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$MP_DUP\",\"p_amount\":1500,\"p_method\":\"other\"}")"
+
+# --- double tap: the key the function would compute already exists -> one row, no 2nd extension ---
+dup_end=$(sql "select current_period_end from memberships where id='$MP_DUP';")
+sql "insert into payments (organization_id, membership_id, amount, provider, payment_method, status, idempotency_key, reconciled_at, covers_from, covers_to)
+     values ('$ORG_IRON', '$MP_DUP', 1500, 'manual', 'cash', 'manual', 'manual-$MP_DUP-$dup_end', now(), '$dup_end', ('$dup_end'::date + interval '1 month')::date);" >/dev/null
+first_id=$(sql "select id from payments where idempotency_key='manual-$MP_DUP-$dup_end';")
+got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$MP_DUP\",\"p_amount\":1500,\"p_method\":\"cash\"}")
+assert_contains "double tap returns the EXISTING payment, not an error" "\"payment_id\":\"$first_id\"" "$got"
+assert_equals   "  ...still exactly one payment row"       "1"        "$(sql "select count(*) from payments where membership_id='$MP_DUP';")"
+assert_equals   "  ...membership not extended a second time" "$dup_end" "$(sql "select current_period_end from memberships where id='$MP_DUP';")"
+
+# --- a pending Razorpay link for the same period is voided ---
+pend_end=$(sql "select current_period_end from memberships where id='$MP_PEND';")
+assert_equals "setup: the pending link got coverage from the trigger" "$pend_end" "$(sql "select covers_from from payments where id='${MPP}b1';")"
+got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$MP_PEND\",\"p_amount\":1500,\"p_method\":\"cash\"}")
+MP_PEND_PAY=$(printf '%s' "$got" | sed -n 's/.*"payment_id":"\([^"]*\)".*/\1/p')
+assert_contains "desk payment reports it voided the pending link" '"voided_pending":1' "$got"
+assert_equals   "  ...the link is void, by the recording user, with a reason pointing at the desk payment" \
+  "void|$MP_RAVI_UID|true" \
+  "$(sql "select status||'|'||voided_by||'|'||(void_reason like 'Superseded by manual payment $MP_PEND_PAY%') from payments where id='${MPP}b1';")"
+assert_equals   "  ...a voided link is not revenue" "f" "$(sql "select payment_is_collected(status) from payments where id='${MPP}b1';")"
+assert_equals   "  ...and the later webhook would see the period as covered" "$MP_PEND_PAY" "$(sql "select payment_covering_collected('${MPP}b1');")"
+
+# --- authorization ---
+assert_contains "front_desk, other location -> membership_not_found" "membership_not_found" \
+  "$(rest_rpc "$PRIYA" "record_manual_payment" "{\"p_membership_id\":\"$MP_LOC2\",\"p_amount\":1500,\"p_method\":\"cash\"}")"
+assert_contains "coach -> not_authorized" "not_authorized" \
+  "$(rest_rpc "$FARAH" "record_manual_payment" "{\"p_membership_id\":\"$MP_LOC2\",\"p_amount\":1500,\"p_method\":\"cash\"}")"
+assert_contains "cross-org owner -> membership_not_found" "membership_not_found" \
+  "$(rest_rpc "$SANJAY" "record_manual_payment" "{\"p_membership_id\":\"$MP_LOC2\",\"p_amount\":1500,\"p_method\":\"cash\"}")"
+sql "UPDATE organizations SET status = 'suspended' WHERE id = '$ORG_IRON'" >/dev/null
+assert_contains "suspended org -> organization_suspended (record)" "organization_suspended" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$MP_LOC2\",\"p_amount\":1500,\"p_method\":\"cash\"}")"
+assert_contains "suspended org -> organization_suspended (void)" "organization_suspended" \
+  "$(rest_rpc "$RAVI" "void_payment" "{\"p_payment_id\":\"$MP_PAY\",\"p_reason\":\"x\"}")"
+sql "UPDATE organizations SET status = 'active' WHERE id = '$ORG_IRON'" >/dev/null
+got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$MP_LOC2\",\"p_amount\":1500,\"p_method\":\"cash\",\"p_reference\":\"HSR-1\"}")
+MP_LOC2_PAY=$(printf '%s' "$got" | sed -n 's/.*"payment_id":"\([^"]*\)".*/\1/p')
+assert_contains "owner CAN record at another branch" '"status":"active"' "$got"
+
+# --- ledger: new columns, scoping, void reasons hidden from front_desk ---
+got=$(rest "$RAVI" "v_payments_ledger?id=eq.$MP_PAY&select=payment_method,reference,recorded_by_name,received_at,is_void,is_collected,status")
+assert_contains "ledger (owner): payment_method"    '"payment_method":"upi"' "$got"
+assert_contains "  ...reference"                    '"reference":"UPI-RLS-1"' "$got"
+assert_contains "  ...recorded_by_name"             '"recorded_by_name":"Ravi Krishnan"' "$got"
+assert_contains "  ...received_at"                  "\"received_at\":\"$RECV3\"" "$got"
+assert_contains "  ...is_void false, is_collected true" '"is_void":false,"is_collected":true' "$got"
+got=$(rest "$PRIYA" "v_payments_ledger?id=eq.$MP_PAY&select=payment_method,recorded_by_name")
+assert_contains "ledger (front_desk, own location) sees the payment + who recorded it" '"recorded_by_name":"Ravi Krishnan"' "$got"
+assert_equals   "ledger (front_desk) does NOT see another location's payment" "[]" \
+  "$(rest "$PRIYA" "v_payments_ledger?id=eq.$MP_LOC2_PAY&select=id")"
+assert_contains "ledger (owner) sees the other location's payment" "$MP_LOC2_PAY" \
+  "$(rest "$RAVI" "v_payments_ledger?id=eq.$MP_LOC2_PAY&select=id")"
+assert_equals   "payments table itself is still invisible to front_desk" "[]" \
+  "$(rest "$PRIYA" "payments?id=eq.$MP_PAY&select=id")"
+
+# --- void_payment ---
+assert_contains "void: front_desk -> not_authorized" "not_authorized" \
+  "$(rest_rpc "$PRIYA" "void_payment" "{\"p_payment_id\":\"$MP_PAY\",\"p_reason\":\"typo\"}")"
+assert_equals   "  ...403"                          "403" "$(rest_rpc_status "$PRIYA" "void_payment" "{\"p_payment_id\":\"$MP_PAY\",\"p_reason\":\"typo\"}")"
+assert_contains "void: coach -> not_authorized"     "not_authorized" \
+  "$(rest_rpc "$FARAH" "void_payment" "{\"p_payment_id\":\"$MP_PAY\",\"p_reason\":\"typo\"}")"
+assert_contains "void: cross-org owner -> payment_not_found" "payment_not_found" \
+  "$(rest_rpc "$SANJAY" "void_payment" "{\"p_payment_id\":\"$MP_PAY\",\"p_reason\":\"typo\"}")"
+assert_contains "void: reason is mandatory"         "reason_required" \
+  "$(rest_rpc "$RAVI" "void_payment" "{\"p_payment_id\":\"$MP_PAY\",\"p_reason\":\"   \"}")"
+assert_contains "void: a captured Razorpay payment is not voidable here" "payment_not_voidable" \
+  "$(rest_rpc "$RAVI" "void_payment" "{\"p_payment_id\":\"$(sql "select id from payments where idempotency_key='rls-test-mp-succ';")\",\"p_reason\":\"x\"}")"
+assert_equals   "  ...nothing changed by the refused calls" "manual" "$(sql "select status from payments where id='$MP_PAY';")"
+
+rev_with=$(rev_on "$RECV3" | sed 's/\..*//')
+got=$(rest_rpc "$RAVI" "void_payment" "{\"p_payment_id\":\"$MP_PAY\",\"p_reason\":\"entered against the wrong member\"}")
+assert_contains "owner voids a manual payment"       '"status":"void"' "$got"
+assert_contains "  ...tells the owner the date before the payment" "\"previous_period_end\":\"$mp_old_end\"" "$got"
+assert_contains "  ...and the coverage it had"        "\"covers_to\":\"$mp_new_end\"" "$got"
+assert_contains "  ...membership still ends at the extended date (NOT silently changed)" "\"current_period_end\":\"$mp_new_end\"" "$got"
+assert_contains "  ...update_membership_duration CAN restore it (never renewed before)" '"can_restore_with_update_duration":true' "$got"
+assert_contains "  ...with the membership's duration" '"restore_duration_months":1' "$got"
+assert_equals   "  ...membership row really untouched by the void" "active|$mp_new_end" \
+  "$(sql "select status||'|'||current_period_end from memberships where id='$MP_MAIN';")"
+assert_equals   "  ...who/why recorded" "$MP_RAVI_UID|entered against the wrong member|true" \
+  "$(sql "select voided_by||'|'||void_reason||'|'||(voided_at is not null) from payments where id='$MP_PAY';")"
+assert_equals   "voided payment vanishes from revenue (-1500)" "$((rev_with - 1500))" "$(rev_on "$RECV3" | sed 's/\..*//')"
+assert_contains "void again -> payment_already_void" "payment_already_void" \
+  "$(rest_rpc "$RAVI" "void_payment" "{\"p_payment_id\":\"$MP_PAY\",\"p_reason\":\"again\"}")"
+assert_contains "ledger (owner) shows the void row, flagged, WITH the reason" '"is_void":true' \
+  "$(rest "$RAVI" "v_payments_ledger?id=eq.$MP_PAY&select=is_void,void_reason")"
+assert_contains "  ...reason visible to the owner" 'entered against the wrong member' \
+  "$(rest "$RAVI" "v_payments_ledger?id=eq.$MP_PAY&select=void_reason")"
+got=$(rest "$PRIYA" "v_payments_ledger?id=eq.$MP_PAY&select=is_void,void_reason,is_collected")
+assert_contains "ledger (front_desk) sees the void flag..." '"is_void":true' "$got"
+assert_contains "  ...but void_reason is null for them"     '"void_reason":null' "$got"
+assert_not_contains "  ...the reason text never reaches front_desk" "wrong member" "$got"
+got=$(rest_rpc "$RAVI" "update_membership_duration" "{\"p_membership_id\":\"$MP_MAIN\",\"p_duration_months\":1}")
+assert_contains "following the advice (update_membership_duration) restores the old end date" "\"current_period_end\":\"$mp_old_end\"" "$got"
+
+# --- the single collected rule ---
+assert_equals "payment_is_collected: success, manual -> true; everything else false" "true|true|false|false|false|false|false" \
+  "$(sql "select payment_is_collected('success')||'|'||payment_is_collected('manual')||'|'||payment_is_collected('void')||'|'||payment_is_collected('refund_due')||'|'||payment_is_collected('failed')||'|'||payment_is_collected('pending')||'|'||payment_is_collected('nonsense');")"
+
+# --- table constraints ---
+sql_err() { docker exec "$DB_CONTAINER" psql -U postgres -d postgres -tAc "$1" 2>&1 | tr -d '\r' | head -1; }
+assert_contains "manual membership payment without payment_method is rejected" "payments_manual_method_required" \
+  "$(sql_err "insert into payments (organization_id, membership_id, amount, provider, status, idempotency_key) values ('$ORG_IRON','$MP_DUP',1,'manual','manual','rls-test-mp-nometh');")"
+assert_contains "payment_method outside the list is rejected" "payments_payment_method_check" \
+  "$(sql_err "insert into payments (organization_id, membership_id, amount, provider, payment_method, status, idempotency_key) values ('$ORG_IRON','$MP_DUP',1,'manual','cheque','manual','rls-test-mp-badmeth');")"
+assert_contains "a void row needs voided_at + a reason" "payments_void_fields" \
+  "$(sql_err "insert into payments (organization_id, membership_id, amount, provider, status, idempotency_key) values ('$ORG_IRON','$MP_DUP',1,'razorpay','void','rls-test-mp-voidnoreason');")"
+assert_contains "covers_to must be after covers_from" "payments_coverage_consistent" \
+  "$(sql_err "insert into payments (organization_id, membership_id, amount, provider, status, idempotency_key, covers_from, covers_to) values ('$ORG_IRON','$MP_DUP',1,'razorpay','pending','rls-test-mp-cov','2026-02-01','2026-01-01');")"
+assert_equals "PT-package sale rows (provider manual, no method) are still allowed - exemption until the PT flow is decided" "INSERT 0 1" \
+  "$(docker exec "$DB_CONTAINER" psql -U postgres -d postgres -c "insert into payments (organization_id, pt_package_id, amount, provider, status, idempotency_key, reconciled_at) values ('$ORG_IRON','$PKG_ASHA',1,'manual','manual','rls-test-mp-pt',now());" 2>&1 | tr -d '\r' | head -1)"
+sql "delete from payments where idempotency_key='rls-test-mp-pt';" >/dev/null
 
 # ---------------------------------------------------------------------------
 # Summary

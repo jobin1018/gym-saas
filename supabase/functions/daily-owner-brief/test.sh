@@ -830,6 +830,45 @@ SQL
 fi
 
 # ---------------------------------------------------------------------------
+# Void / refund_due money never reaches the brief (20261031090000): the brief's
+# revenue figures read v_daily_revenue_by_source, which now filters on the one
+# rule payment_is_collected(status). A desk payment back-dated to today counts;
+# the same row voided (or diverted to refund_due) does not.
+# ---------------------------------------------------------------------------
+printf '\n%s-- brief revenue excludes void / refund_due payments --%s\n' "$B" "$N"
+
+if ! $have_psql; then
+  skipped "brief revenue vs void payments" "requires docker/psql"
+else
+  VB_MEM=f1111111-1111-1111-1111-111111111111       # Asha, Iron Temple (seed membership)
+  VB_PAY=0daded00-8888-0000-0000-0000000000b1
+
+  brief_rev() { # -> revenue_month_total for Iron Temple (v2 override exposes it), integer
+    local g; g=$(post "{\"dry_run\":true,\"organization_id\":\"$ORG_IRON\",\"template_version\":\"v2\"}")
+    field_num revenue_month_total "$g"
+  }
+
+  sql "delete from payments where id='$VB_PAY';" >/dev/null
+  base=$(brief_rev); base=${base:-0}
+
+  sql "insert into payments (id, organization_id, membership_id, amount, provider, payment_method, status, idempotency_key, reconciled_at, received_at)
+       values ('$VB_PAY', '$ORG_IRON', '$VB_MEM', 777, 'manual', 'cash', 'manual', 'dob-void-test', now(), CURRENT_DATE);" >/dev/null
+  assert_equals "a collected desk payment received today is in the brief's month revenue (+777)" "$((base + 777))" "$(brief_rev)"
+
+  sql "update payments set status='void', voided_at=now(), void_reason='dob test' where id='$VB_PAY';" >/dev/null
+  assert_equals "the same payment voided drops out of the brief" "$base" "$(brief_rev)"
+
+  sql "update payments set status='refund_due', voided_at=NULL, void_reason=NULL where id='$VB_PAY';" >/dev/null
+  assert_equals "refund_due money is not revenue either" "$base" "$(brief_rev)"
+
+  sql "update payments set status='manual' where id='$VB_PAY';" >/dev/null
+  assert_equals "back to collected -> counted again" "$((base + 777))" "$(brief_rev)"
+
+  sql "delete from payments where id='$VB_PAY';" >/dev/null
+  assert_equals "cleanup restored the original figure" "$base" "$(brief_rev)"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 reset_state
