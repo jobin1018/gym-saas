@@ -37,9 +37,13 @@
 //     (2026-09-08, org "MaxFit Kakkanad") confirmed it: v3 is 7 params, the
 //     SAME shape as v1, with the closing line fixed to "Reply ALERTS for
 //     what needs attention." (replacing the old broken DETAILS reference).
-//     v3 now reuses buildBrief() + the SAME 7-element bodyParams as v1,
-//     differing from it only in which template name a send targets — v2's
-//     richer computation is dead code for v3, never reintroduce it here
+//     v3 shares v1's SAME 7-element bodyParams (identical param count/order)
+//     but renders through its OWN buildBriefV3() — NOT buildBrief() — since
+//     v1 and v3's real registered bodies are not byte-identical text, only
+//     their params are. Sharing one render function briefly made v1's
+//     preview wrong the moment v3's wording was corrected (caught by this
+//     suite's own v1 assertions failing); kept apart so that can't recur.
+//     v2's richer computation is dead code for v3, never reintroduce it here
 //     without a matching richer approved template to actually send it to.
 //
 // Which one a send uses:
@@ -370,14 +374,62 @@ const toAmount = (v: number | string | null | undefined): number => {
  * The ❌ line is omitted entirely when nothing failed, exactly as specified.
  */
 function buildBrief(orgName: string, todayLocal: string, s: BriefStats): string {
-  // Confirmed against a real delivered daily_owner_brief_v3 message
-  // (2026-09-08 sample, org "MaxFit Kakkanad"): "Your Daily Gym Summary" /
-  // "Good morning, {{1}} 👋" / "{{2}}" / then the 📅/⚠️/✅ lines below, closing
-  // with "Reply ALERTS for what needs attention." — the ALERTS/OVERDUE line
-  // that replaced the old broken DETAILS reference. v1's own real body may
-  // not carry this exact closing line (v1 predates that fix), but v1 is
-  // rollback-only now; matching the confirmed v3 wording — the default — is
-  // the more useful preview to have accurate.
+  const lines: string[] = [
+    `Good morning! ${orgName} — ${formatDateForOwner(todayLocal)}`,
+    "",
+    s.renewals_due_count === 0
+      ? "💰 Renewals due this week: none"
+      : `💰 Renewals due this week: ${s.renewals_due_count} (₹${
+        formatRupees(s.renewals_due_amount)
+      })`,
+    s.overdue_count === 0
+      ? "⚠️ Overdue: none"
+      : `⚠️ Overdue: ${s.overdue_count} ${
+        plural(s.overdue_count, "member", "members")
+      }, ₹${formatRupees(s.overdue_amount)} pending`,
+    "",
+    s.checkins_yesterday === 0
+      ? "✅ Yesterday: no check-ins"
+      : `✅ Yesterday: ${s.checkins_yesterday} ${
+        plural(s.checkins_yesterday, "check-in", "check-ins")
+      }`,
+  ];
+
+  if (s.failed_sends > 0) {
+    lines.push(
+      `❌ ${s.failed_sends} ${
+        plural(s.failed_sends, "message", "messages")
+      } failed to send — tap to review`,
+    );
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * v3 brief text — the body_preview / dry-run rendering of the approved
+ * daily_owner_brief_v3 template, confirmed against a real delivered message
+ * (2026-09-08 sample, org "MaxFit Kakkanad"):
+ *
+ *   "Your Daily Gym Summary
+ *    Good morning, {{1}} 👋
+ *    {{2}}
+ *
+ *    📅 Renewals due this week: {{3}} (₹{{4}})
+ *    ⚠️ Overdue: {{5}} members, ₹{{6}} pending
+ *    ✅ Yesterday: {{7}} check-ins
+ *
+ *    Reply ALERTS for what needs attention."
+ *
+ * DELIBERATELY a separate function from buildBrief() (v1), not a shared one —
+ * despite v1 and v3 taking the identical 7 params in the identical order
+ * (see the bodyParams comment in briefOneOrg()), their REGISTERED template
+ * bodies are NOT identical text. v1's own real body was never independently
+ * re-confirmed here; only v3's has been. Sharing one render function between
+ * them made v1's preview wrong the moment v3's wording was corrected — kept
+ * apart so fixing one can never silently break the other's accuracy again.
+ */
+function buildBriefV3(orgName: string, todayLocal: string, s: BriefStats): string {
   const lines: string[] = [
     "Your Daily Gym Summary",
     `Good morning, ${orgName} 👋`,
@@ -416,8 +468,7 @@ function buildBrief(orgName: string, todayLocal: string, s: BriefStats): string 
 /**
  * v2 brief text ONLY — the body_preview / dry-run rendering of the
  * SUPERSEDED daily_owner_brief_v2 template (rollback use only; v3, the
- * default, uses buildBrief() instead — see that function's own note on how
- * this was discovered to be wrong for v3):
+ * default, has its own buildBriefV3() — see that function's own note):
  *
  *   "Good morning! {{1}} — {{2}}. Revenue this month: ₹{{3}} (₹{{4}} membership,
  *    ₹{{5}} PT). Needs attention: {{6}} items — {{7}} overdue, {{8}} PT alerts.
@@ -854,6 +905,8 @@ async function briefOneOrg(
 
   const message = version === "v2"
     ? buildBriefV2(org.name, todayLocal, stats)
+    : version === "v3"
+    ? buildBriefV3(org.name, todayLocal, stats)
     : buildBrief(org.name, todayLocal, stats);
 
   if (dryRun) {
@@ -886,18 +939,18 @@ async function briefOneOrg(
   // template's own wording fixed on Meta's side) — that assumption was
   // WRONG. Meta rejected a 12-param send with "(#132000) ... number of
   // localizable_params (12) does not match the expected number of params
-  // (7)". The actual approved v3 template takes 7 params, the SAME COUNT as
-  // v1 — so v3 now mirrors v1 exactly (buildBrief(), these 7 bodyParams),
-  // differing from v1 only in which template name a send targets. The richer
-  // per-org revenue/PT-alerts/coach-activity computation above only runs for
-  // v2 now — building it for v3 would be wasted work feeding a template that
-  // has nowhere to put it.
+  // (7)". The actual approved v3 template takes 7 params, the SAME COUNT AND
+  // ORDER as v1's — but rendered through its OWN buildBriefV3(), since v1
+  // and v3's real bodies are not the same text (see that function's note).
+  // The richer per-org revenue/PT-alerts/coach-activity computation above
+  // only runs for v2 now — building it for v3 would be wasted work feeding a
+  // template that has nowhere to put it.
   //
   // CONFIRMED (real delivered v3 message, 2026-09-08, org "MaxFit
   // Kakkanad"): order and meaning match this list exactly — org, date,
   // renewals due (count + amount), overdue (count + amount), yesterday's
   // check-ins — closing with the static "Reply ALERTS for what needs
-  // attention." line (not a param; see buildBrief()'s own note).
+  // attention." line (not a param; see buildBriefV3()'s own note).
   const bodyParams = version === "v2"
     ? [
       org.name,

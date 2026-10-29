@@ -28,6 +28,14 @@ import { hmacSha256Hex, timingSafeEqualHex } from "../_shared/crypto.ts";
 import { expectedServiceRoleKey } from "../_shared/auth.ts";
 import { orgStatusIsActive } from "../_shared/org-status.ts";
 import {
+  classifyInbound,
+  ownNumbersFor,
+  REPLY_CAP,
+  REPLY_CAP_STAFF,
+  REPLY_WINDOW_MINUTES,
+  type SuppressReason,
+} from "../_shared/inbound-guard.ts";
+import {
   ensureAuthUser,
   mintSession,
   syncUserMetadata,
@@ -92,6 +100,10 @@ interface InboundMessage {
   from: string | null;
   /** Best-effort text body of the message. */
   body: string;
+  /** Meta message type ("text", "system", ...). */
+  type: string | null;
+  /** Our own number as Meta reports it (value.metadata.display_phone_number). */
+  ownNumber: string | null;
 }
 
 interface GymOption {
@@ -148,6 +160,10 @@ function extractFirstMessage(payload: any): InboundMessage | null {
         id: typeof message?.id === "string" ? message.id : null,
         from: typeof message?.from === "string" ? message.from : null,
         body: extractBody(message),
+        type: typeof message?.type === "string" ? message.type : null,
+        ownNumber: typeof change?.value?.metadata?.display_phone_number === "string"
+          ? change.value.metadata.display_phone_number
+          : null,
       };
     }
   }
@@ -292,6 +308,7 @@ async function sendWhatsAppMessage(
     organization_id: context.organizationId ?? null,
     member_id: context.memberId ?? null,
     direction: "outbound",
+    phone,
     template_name: context.templateName ?? null,
     body_preview: text,
     wa_message_id: waMessageId,
@@ -424,11 +441,18 @@ async function requestPaymentLink(membershipId: string): Promise<string | null> 
 async function logInboundMessage(
   supabase: SupabaseClient,
   message: InboundMessage,
-  context: { memberId?: string | null; organizationId?: string | null },
+  context: {
+    memberId?: string | null;
+    organizationId?: string | null;
+    phone?: string | null;
+    suppressedReason?: SuppressReason | null;
+  },
 ): Promise<void> {
   const { error } = await supabase.from("whatsapp_messages").insert({
     organization_id: context.organizationId ?? null,
     member_id: context.memberId ?? null,
+    phone: context.phone ?? null,
+    suppressed_reason: context.suppressedReason ?? null,
     direction: "inbound",
     body_preview: message.body,
     wa_message_id: message.id,
@@ -1696,7 +1720,7 @@ async function handleStaffCommand(
       `WhatsApp commands can't tell them apart yet — please use the admin dashboard.`;
   }
 
-  await logInboundMessage(supabase, message, { memberId: null, organizationId: orgForLog });
+  await logInboundMessage(supabase, message, { memberId: null, organizationId: orgForLog, phone });
   await sendWhatsAppMessage(supabase, phone, reply, { memberId: null, organizationId: orgForLog });
 
   const { error: processedError } = await supabase
@@ -1789,6 +1813,50 @@ function handleVerification(url: URL): Response {
 // POST — inbound messages
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Loop protection — see ../_shared/inbound-guard.ts for the incident.
+// ---------------------------------------------------------------------------
+
+/** (a) Replies we've already sent this phone inside the sliding window. */
+async function repliesInWindow(supabase: SupabaseClient, phone: string): Promise<number> {
+  const since = new Date(Date.now() - REPLY_WINDOW_MINUTES * 60_000).toISOString();
+  const { count, error } = await supabase
+    .from("whatsapp_messages")
+    .select("id", { count: "exact", head: true })
+    .eq("direction", "outbound")
+    .eq("phone", phone)
+    .gte("created_at", since);
+  if (error) throw error;
+  return count ?? 0;
+}
+
+/**
+ * Best-effort org/member for a message we are NOT going to answer, so the
+ * suppressed inbound row shows up in that gym's message log. Read-only: unlike
+ * resolvePhone() it never pins member_active_context.
+ */
+async function attributeSuppressed(
+  supabase: SupabaseClient,
+  phone: string,
+  sender: SenderRole,
+): Promise<{ memberId: string | null; organizationId: string | null }> {
+  if (sender.kind === "member") {
+    const { data: active } = await supabase
+      .from("member_active_context").select("active_member_id, active_org_id")
+      .eq("phone", phone).maybeSingle();
+    if (active) {
+      return { memberId: (active as any).active_member_id, organizationId: (active as any).active_org_id };
+    }
+    const options = await findMembersForPhone(supabase, phone);
+    return options.length === 1
+      ? { memberId: options[0].memberId, organizationId: options[0].organizationId }
+      : { memberId: null, organizationId: null };
+  }
+  if ("organizationId" in sender) return { memberId: null, organizationId: sender.organizationId };
+  if (sender.kind === "owner_ambiguous") return { memberId: null, organizationId: sender.orgs[0]?.id ?? null };
+  return { memberId: null, organizationId: null };
+}
+
 async function handleWebhook(req: Request): Promise<Response> {
   // Read the raw body FIRST — the signature is computed over these exact bytes.
   const rawBody = await req.text();
@@ -1850,12 +1918,40 @@ async function handleWebhook(req: Request): Promise<Response> {
     // --- (b) Normalize the sender phone. ---
     const phone = normalizePhone(message.from);
 
+    // --- (b0) Loop protection. Runs BEFORE any handler so a suppressed message
+    // --- never checks anyone in, mints a link or sends a reply — but it is
+    // --- still logged (with suppressed_reason) so staff can see it.
+    // Resolved once and reused below. Known staff (owner/coach/front_desk) get
+    // a higher cap: they legitimately fire several commands in a row (REVENUE,
+    // TODAY, OVERDUE, ...), which a members-sized cap would silence mid-session.
+    const sender = await resolveSender(supabase, phone);
+    const cap = sender.kind === "member" ? REPLY_CAP : REPLY_CAP_STAFF;
+    const suppressReason: SuppressReason | null =
+      classifyInbound({
+        phone,
+        body: message.body,
+        type: message.type,
+        ownNumbers: ownNumbersFor(message.ownNumber),
+      }) ?? ((await repliesInWindow(supabase, phone)) >= cap ? "rate_limited" : null);
+
+    if (suppressReason) {
+      const attribution = await attributeSuppressed(supabase, phone, sender);
+      console.warn(
+        `[whatsapp-webhook] SUPPRESSED reason=${suppressReason} phone=${phone} ` +
+          `org=${attribution.organizationId} body=${JSON.stringify(message.body.slice(0, 80))}`,
+      );
+      await logInboundMessage(supabase, message, { ...attribution, phone, suppressedReason: suppressReason });
+      const { error: processedError } = await supabase
+        .from("webhook_events").update({ processed: true }).eq("id", event.id);
+      if (processedError) console.error("[whatsapp-webhook] failed to mark processed:", processedError);
+      return json({ ok: true, event_id: eventId, suppressed: suppressReason });
+    }
+
     // --- (b2) Owner / coach command path. Checked BEFORE member resolution:
     // --- an owner_phone / coach phone is never in the member flow. Returns
     // --- the full 200 response itself (logs inbound, sends reply, marks the
     // --- event processed). The member path below is untouched for everyone
     // --- else (in / pay / switch).
-    const sender = await resolveSender(supabase, phone);
     if (sender.kind !== "member") {
       return await handleStaffCommand(supabase, sender, message, phone, event.id, eventId);
     }
@@ -1882,7 +1978,7 @@ async function handleWebhook(req: Request): Promise<Response> {
 
     // --- (f) Log the inbound message. ---
     // Done before the reply so the whatsapp_messages log reads chronologically.
-    await logInboundMessage(supabase, message, { memberId, organizationId });
+    await logInboundMessage(supabase, message, { memberId, organizationId, phone });
 
     // --- (d) Decide the reply. `null` means "already sent elsewhere" (see
     // --- requestPaymentLink()) — no further send happens at step (e).

@@ -196,11 +196,17 @@ reset_state() {
 -- is enough for it.
 DELETE FROM membership_freezes WHERE membership_id IN
   ('f1111111-1111-1111-1111-111111111111', '$MEMBERSHIP_LOC2',
-   '0daded00-1111-0000-0000-0000000000e1', '0daded00-1111-0000-0000-0000000000e2');
+   '0daded00-1111-0000-0000-0000000000e1', '0daded00-1111-0000-0000-0000000000e2',
+   '0daded00-1111-0000-0000-0000000000e5');
 DELETE FROM membership_freezes WHERE membership_id = '0daded00-1111-0000-0000-0000000000e3';
+-- section 17's record_manual_payment fixtures (payments before memberships —
+-- same FK-ordering discipline as everything else in this function).
+DELETE FROM payments WHERE idempotency_key LIKE 'manual-0daded00-1111-0000-0000-0000000000e%';
 DELETE FROM memberships
  WHERE id IN ('0daded00-1111-0000-0000-0000000000e1', '0daded00-1111-0000-0000-0000000000e2',
-              '0daded00-1111-0000-0000-0000000000e3');
+              '0daded00-1111-0000-0000-0000000000e3', '0daded00-1111-0000-0000-0000000000e4',
+              '0daded00-1111-0000-0000-0000000000e5', '0daded00-1111-0000-0000-0000000000e6',
+              '0daded00-1111-0000-0000-0000000000e7', '0daded00-1111-0000-0000-0000000000e8');
 -- section 18's update_membership_duration fixtures (audit rows, payments and
 -- freezes FK-reference memberships, so they go first).
 DELETE FROM membership_duration_changes WHERE membership_id::text LIKE '0daded00-1111-0000-0000-0000000000d%';
@@ -1228,6 +1234,128 @@ assert_equals   "postgres (rolbypassrls) direct write to past_due -> allowed" "p
   "$(sql "select status from memberships where id='$GUARD_MEMBERSHIP';")"
 
 sql "delete from memberships where id='$GUARD_MEMBERSHIP';" >/dev/null
+
+# ---------------------------------------------------------------------------
+# 17. record_manual_payment() — a cash/UPI/card payment taken at the desk for
+#     a regular membership (migration 20260928090000). SECURITY DEFINER
+#     (payments has no authenticated INSERT grant at all, owner included —
+#     see that migration's header), so front_desk location scoping and the
+#     frozen/cancelled/suspended-org gates are all re-implemented explicitly
+#     rather than inherited from RLS; this section proves each one anyway.
+# ---------------------------------------------------------------------------
+printf '\n%s-- record_manual_payment --%s\n' "$B" "$N"
+
+PAY_ACTIVE=0daded00-1111-0000-0000-0000000000e4     # Asha, Indiranagar, active
+PAY_FROZEN=0daded00-1111-0000-0000-0000000000e5     # Asha, Indiranagar, frozen
+PAY_CANCELLED=0daded00-1111-0000-0000-0000000000e6  # Asha, Indiranagar, cancelled
+PAY_COLLISION=0daded00-1111-0000-0000-0000000000e7  # Asha, Indiranagar, active — idempotency test only
+# Dedicated throwaway at HSR Layout (member_id = MEMBER_LOC2) rather than
+# reusing the shared MEMBERSHIP_LOC2 fixture — a successful payment has no
+# symmetric undo the way freeze/unfreeze does, so mutating the SHARED
+# fixture's current_period_end would drift further on every re-run of this
+# suite without a full `db reset`. This one is deleted outright below.
+PAY_LOC2=0daded00-1111-0000-0000-0000000000e8       # MEMBER_LOC2, HSR Layout, active
+
+sql "insert into memberships (id, organization_id, member_id, plan_id, status, start_date, current_period_end, duration_months)
+     values
+       ('$PAY_ACTIVE',     '$ORG_IRON', '$ASHA', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'active',    CURRENT_DATE - 10, CURRENT_DATE + 5, 1),
+       ('$PAY_FROZEN',     '$ORG_IRON', '$ASHA', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'active',    CURRENT_DATE - 10, CURRENT_DATE + 5, 1),
+       ('$PAY_CANCELLED',  '$ORG_IRON', '$ASHA', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'active',    CURRENT_DATE - 10, CURRENT_DATE + 5, 1),
+       ('$PAY_COLLISION',  '$ORG_IRON', '$ASHA', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'past_due',  CURRENT_DATE - 40, CURRENT_DATE - 10, 2),
+       ('$PAY_LOC2',       '$ORG_IRON', '$MEMBER_LOC2', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'active', CURRENT_DATE - 10, CURRENT_DATE + 5, 1);" >/dev/null
+# PAY_FROZEN needs a real freeze (not just status='frozen') so it round-trips
+# cleanly through the same machinery as section 15's fixtures.
+freeze_setup=$(rest_rpc "$RAVI" "freeze_membership" "{\"p_membership_id\":\"$PAY_FROZEN\",\"p_days\":10}")
+assert_contains "setup: freeze PAY_FROZEN" '"status":"frozen"' "$freeze_setup"
+sql "update memberships set status='cancelled' where id='$PAY_CANCELLED';" >/dev/null
+
+# --- owner records a cash payment for an active membership: extends by
+#     duration_months from GREATEST(today, old current_period_end) ---
+before_end=$(sql "select current_period_end from memberships where id='$PAY_ACTIVE';")
+got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$PAY_ACTIVE\",\"p_amount\":1500,\"p_method\":\"cash\"}")
+assert_contains "owner records a cash payment -> status active" '"status":"active"' "$got"
+assert_contains "  ...method echoed back" '"method":"cash"' "$got"
+expected_end=$(sql "select (('$before_end'::date + interval '1 month'))::date::text;")
+assert_contains "  ...current_period_end extended by 1 month" "\"current_period_end\":\"$expected_end\"" "$got"
+assert_equals   "  ...memberships row actually updated"  "$expected_end" "$(sql "select current_period_end from memberships where id='$PAY_ACTIVE';")"
+PAY_ID=$(printf '%s' "$got" | sed -n 's/.*"payment_id":"\([^"]*\)".*/\1/p')
+assert_equals   "  ...a payments row exists with provider=manual, status=manual" "manual|manual|cash" \
+  "$(sql "select provider||'|'||status||'|'||method from payments where id='$PAY_ID';")"
+
+# --- front_desk (Priya, own location) can also record a payment ---
+got=$(rest_rpc "$PRIYA" "record_manual_payment" "{\"p_membership_id\":\"$PAY_ACTIVE\",\"p_amount\":1500,\"p_method\":\"upi\"}")
+assert_contains "front_desk (own location) records a payment -> ok" '"status":"active"' "$got"
+assert_contains "  ...method=upi" '"method":"upi"' "$got"
+
+# --- front_desk, wrong location: masked as membership_not_found (same
+#     discipline as freeze_membership's own cross-location behaviour); owner
+#     CAN pay across branches (org-wide) ---
+assert_contains "front_desk, wrong location -> membership_not_found" "membership_not_found" \
+  "$(rest_rpc "$PRIYA" "record_manual_payment" "{\"p_membership_id\":\"$PAY_LOC2\",\"p_amount\":1500,\"p_method\":\"cash\"}")"
+got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$PAY_LOC2\",\"p_amount\":1500,\"p_method\":\"cash\"}")
+assert_contains "owner CAN pay a different branch's membership" '"status":"active"' "$got"
+
+# --- coach cannot record a payment, regardless of target ---
+assert_contains "coach -> not_authorized" "not_authorized" \
+  "$(rest_rpc "$FARAH" "record_manual_payment" "{\"p_membership_id\":\"$PAY_ACTIVE\",\"p_amount\":1500,\"p_method\":\"cash\"}")"
+assert_equals   "  ...403" "403" \
+  "$(rest_rpc_status "$FARAH" "record_manual_payment" "{\"p_membership_id\":\"$PAY_ACTIVE\",\"p_amount\":1500,\"p_method\":\"cash\"}")"
+
+# --- cross-org: FlexFit owner cannot pay an Iron Temple membership ---
+assert_contains "cross-org payment attempt -> membership_not_found" "membership_not_found" \
+  "$(rest_rpc "$SANJAY" "record_manual_payment" "{\"p_membership_id\":\"$PAY_ACTIVE\",\"p_amount\":1500,\"p_method\":\"cash\"}")"
+
+# --- frozen / cancelled memberships refuse a payment, distinct errors each ---
+assert_contains "frozen membership -> membership_frozen" "membership_frozen" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$PAY_FROZEN\",\"p_amount\":1500,\"p_method\":\"cash\"}")"
+assert_contains "cancelled membership -> membership_cancelled" "membership_cancelled" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$PAY_CANCELLED\",\"p_amount\":1500,\"p_method\":\"cash\"}")"
+
+# --- input validation ---
+assert_contains "amount=0 -> amount_invalid"    "amount_invalid" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$PAY_ACTIVE\",\"p_amount\":0,\"p_method\":\"cash\"}")"
+assert_contains "amount=-5 -> amount_invalid"   "amount_invalid" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$PAY_ACTIVE\",\"p_amount\":-5,\"p_method\":\"cash\"}")"
+assert_contains "unknown method -> method_invalid" "method_invalid" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$PAY_ACTIVE\",\"p_amount\":1500,\"p_method\":\"cheque\"}")"
+
+# --- unknown membership: same 404-flavoured error as a wrong-org one, no
+#     existence leak either way ---
+assert_contains "unknown membership_id -> membership_not_found" "membership_not_found" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"00000000-0000-0000-0000-000000000000\",\"p_amount\":1500,\"p_method\":\"cash\"}")"
+
+# --- suspended org ---
+sql "UPDATE organizations SET status = 'suspended' WHERE id = '$ORG_IRON'" >/dev/null
+assert_contains "suspended org blocks record_manual_payment" "organization_suspended" \
+  "$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$PAY_ACTIVE\",\"p_amount\":1500,\"p_method\":\"cash\"}")"
+sql "UPDATE organizations SET status = 'active' WHERE id = '$ORG_IRON'" >/dev/null
+
+# --- idempotent against a double-tap: pre-seed the row a first call would
+#     have produced (same 'manual-<membership>-<period_end>' key the
+#     function itself computes from PAY_COLLISION's CURRENT (unmoved)
+#     current_period_end), so the function's own INSERT is GUARANTEED to
+#     collide — this deterministically exercises the unique_violation
+#     recovery branch every run, rather than depending on two requests
+#     genuinely overlapping in real time. (True concurrent-overlap safety —
+#     two requests racing before either commits — was separately verified
+#     by hand with a forced delay inside the function: both callers received
+#     the identical payment_id and exactly one month's extension applied,
+#     not two. That proof doesn't fit a repeatable script without leaving a
+#     test-only sleep in production code, so it isn't re-run here.) ---
+collision_period_end=$(sql "select current_period_end from memberships where id='$PAY_COLLISION';")
+collision_key="manual-${PAY_COLLISION}-${collision_period_end}"
+sql "insert into payments (organization_id, membership_id, amount, provider, method, status, idempotency_key, reconciled_at)
+     values ('$ORG_IRON', '$PAY_COLLISION', 1500, 'manual', 'cash', 'manual', '$collision_key', now());" >/dev/null
+PRESEEDED_PAYMENT_ID=$(sql "select id from payments where idempotency_key='$collision_key';")
+
+status_code=$(rest_rpc_status "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$PAY_COLLISION\",\"p_amount\":1500,\"p_method\":\"cash\"}")
+assert_equals   "a colliding idempotency key still returns 200, not an error" "200" "$status_code"
+got=$(rest_rpc "$RAVI" "record_manual_payment" "{\"p_membership_id\":\"$PAY_COLLISION\",\"p_amount\":1500,\"p_method\":\"cash\"}")
+assert_contains "  ...returns the PRE-EXISTING payment_id, not a new one" "\"payment_id\":\"$PRESEEDED_PAYMENT_ID\"" "$got"
+assert_equals   "  ...still exactly one payment row for that key" "1" \
+  "$(sql "select count(*) from payments where idempotency_key='$collision_key';")"
+assert_equals   "  ...membership was NOT extended a second time (still unmoved)" "$collision_period_end" \
+  "$(sql "select current_period_end from memberships where id='$PAY_COLLISION';")"
 
 # ---------------------------------------------------------------------------
 # 18. update_membership_duration() — front desk corrects a wrong duration_months

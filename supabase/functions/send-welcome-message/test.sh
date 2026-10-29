@@ -2,12 +2,13 @@
 # ---------------------------------------------------------------------------
 # Integration tests for send-welcome-message.
 #
-# The welcome_message Meta template is NOT approved yet, so every send here is
-# in TEMPORARY SEND MODE: the function writes the whatsapp_messages audit row
-# (status 'queued', template_name 'welcome_message') and makes NO Meta call.
-# That is what these tests assert. WHATSAPP_SEND_MODE=mock is still required
-# (shared guard) even though this function never reaches the shared sender
-# while the template is unapproved.
+# The approved template is "member_welcome" (corrected 2026-09-28 from the
+# never-actually-approved "welcome_message"). WELCOME_TEMPLATE_APPROVED is
+# unset in this local/test env, so every send here is in TEMPORARY SEND MODE:
+# the function writes the whatsapp_messages audit row (status 'queued',
+# template_name 'member_welcome') and makes NO Meta call. That is what these
+# tests assert. WHATSAPP_SEND_MODE=mock is still required (shared guard) even
+# though this function never reaches the shared sender in this mode.
 #
 # PREREQUISITES: supabase start; supabase db reset; supabase functions serve
 #   --env-file supabase/functions/.env ; then run this file.
@@ -122,7 +123,7 @@ assert_contains "opted-in member at an active org -> ok"      '"ok":true' "$got"
 assert_contains "  ...simulated (template pending approval)"  '"simulated":true' "$got"
 assert_contains "  ...reason is template_pending_approval"    '"reason":"template_pending_approval"' "$got"
 row=$(sql "select status||'|'||template_name||'|'||left(body_preview,22) from whatsapp_messages where member_id='$M_OPTIN' order by created_at desc limit 1")
-assert_equals   "  ...one queued welcome_message audit row"   "queued|welcome_message|Welcome to Iron Temple" "$row"
+assert_equals   "  ...one queued member_welcome audit row"    "queued|member_welcome|Welcome to Iron Temple" "$row"
 assert_equals   "  ...no Meta id (nothing was sent)"          "" "$(sql "select coalesce(wa_message_id::text,'') from whatsapp_messages where member_id='$M_OPTIN' order by created_at desc limit 1")"
 
 printf '\n%s-- idempotency + skip paths --%s\n' "$B" "$N"

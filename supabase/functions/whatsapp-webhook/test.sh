@@ -917,6 +917,108 @@ else
   sql "update users set pin_hash = extensions.crypt('1111', extensions.gen_salt('bf', 12)) where id='$PRIYA_ID';" >/dev/null
   reset_state
 fi
+# ---------------------------------------------------------------------------
+# Loop protection (incident 2026-10-22: JioCare auto-responder ping-pong)
+#   (a) at most 5 replies per phone per 10 min, then silence + log
+#   (b) known auto-responder text is never answered
+#   (c) our own number / Meta system senders are never answered
+# Suppressed inbound messages are still logged (suppressed_reason set).
+# ---------------------------------------------------------------------------
+printf '\n%s-- loop protection --%s\n' "$B" "$N"
+
+if ! $have_psql; then
+  skipped "loop protection suite" "requires docker/psql for data assertions"
+else
+  JIO="For any support related queries, please chat with JioCare. (7000770007)"
+  PHONE_LOOP=915555500001   # unknown number: every normal message gets a 'not found' reply
+  OWN_NUMBER=911111111111   # metadata.display_phone_number in envelope()
+
+  replies_to()    { sql "select count(*) from whatsapp_messages where direction='outbound' and phone='$1';"; }
+  inbound_of()    { sql "select count(*) from whatsapp_messages where direction='inbound' and phone='$1';"; }
+  suppressed_of() { sql "select count(*) from whatsapp_messages where direction='inbound' and phone='$1' and suppressed_reason='$2';"; }
+
+  # --- (b) auto-responder text from a REAL member: no reply, no check-in, logged ---
+  reset_state
+  out=$(send_message "$PHONE_ACTIVE" "wamid.$RUN.lp-b1" "$JIO")
+  assert_contains "(b) JioCare text -> 200 suppressed=auto_responder" '"suppressed":"auto_responder"' "$out"
+  assert_db "(b) ...no reply sent" "0" "$(replies_to $PHONE_ACTIVE)"
+  assert_db "(b) ...no check-in side effect" "0" "$(attendance_count $PHONE_ACTIVE)"
+  assert_db "(b) ...inbound still logged with suppressed_reason" "1" "$(suppressed_of $PHONE_ACTIVE auto_responder)"
+  assert_db "(b) ...logged against the member's gym (staff can see it)" "$ORG_IRON" \
+    "$(sql "select organization_id from whatsapp_messages where phone='$PHONE_ACTIVE' and suppressed_reason is not null;")"
+  assert_db "(b) ...webhook_event marked processed" "t" \
+    "$(sql "select processed from webhook_events where event_id='wamid.$RUN.lp-b1';")"
+
+  n_ar=0
+  for t in "This is an automated message. Please do not reply." "Auto-reply: I am out of office" "Thank you for contacting us, we will get back to you shortly"; do
+    n_ar=$((n_ar+1))
+    out=$(send_message "$PHONE_LOOP" "wamid.$RUN.lp-b2-$n_ar" "$t")
+    assert_contains "(b) generic auto-responder text suppressed: ${t:0:30}..." '"suppressed":"auto_responder"' "$out"
+  done
+  assert_db "(b) ...none of those were answered" "0" "$(replies_to $PHONE_LOOP)"
+
+  # --- (c) own number / system senders ---
+  reset_state
+  out=$(send_message "$OWN_NUMBER" "wamid.$RUN.lp-c1" "Reply IN to check in")
+  assert_contains "(c) message from our own number -> suppressed=own_number" '"suppressed":"own_number"' "$out"
+  out=$(send_message "12345" "wamid.$RUN.lp-c2" "hello")
+  assert_contains "(c) non-phone sender id -> suppressed=system_sender" '"suppressed":"system_sender"' "$out"
+  sys_body='{"object":"whatsapp_business_account","entry":[{"id":"W","changes":[{"field":"messages","value":{"messaging_product":"whatsapp","metadata":{"display_phone_number":"911111111111","phone_number_id":"P"},"messages":[{"from":"919999999999","id":"wamid.'"$RUN"'.lp-c3","timestamp":"1700000000","type":"system","system":{"body":"User changed number","type":"user_changed_number"}}]}}]}]}'
+  out=$(post "$sys_body")
+  assert_contains "(c) Meta type=system message -> suppressed=system_sender" '"suppressed":"system_sender"' "$out"
+  assert_db "(c) ...zero replies across all three" "0" \
+    "$(sql "select count(*) from whatsapp_messages where direction='outbound';")"
+  assert_db "(c) ...all three still logged as inbound with a reason" "3" \
+    "$(sql "select count(*) from whatsapp_messages where direction='inbound' and suppressed_reason in ('own_number','system_sender');")"
+
+  # --- (a) simulated loop: a bot answering every reply with text that is NOT in
+  # --- the pattern list, 10 times. The cap alone must stop it at 5 replies.
+  reset_state
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    send_message "$PHONE_LOOP" "wamid.$RUN.lp-a$i" "Your request is being processed (ref $i)" >/dev/null
+  done
+  assert_db "(a) 10 loop messages -> exactly 5 replies sent" "5" "$(replies_to $PHONE_LOOP)"
+  assert_db "(a) ...all 10 inbound still logged" "10" "$(inbound_of $PHONE_LOOP)"
+  assert_db "(a) ...5 of them marked rate_limited" "5" "$(suppressed_of $PHONE_LOOP rate_limited)"
+  assert_db "(a) ...the first 5 were handled normally (not suppressed)" "5" \
+    "$(sql "select count(*) from whatsapp_messages where direction='inbound' and phone='$PHONE_LOOP' and suppressed_reason is null;")"
+
+  # the cap is per phone: someone else is unaffected while the loop is muted
+  out=$(send_message "$PHONE_ACTIVE" "wamid.$RUN.lp-a-other" "IN")
+  assert_contains "(a) a different phone is unaffected by another's cap" "Checked in" "$(last_reply $PHONE_ACTIVE)"
+  assert_not_contains "(a) ...and was not suppressed" "suppressed" "$out"
+
+  # the window slides: once the 5 replies age past 10 min, replies resume
+  sql "update whatsapp_messages set created_at = now() - interval '11 minutes' where direction='outbound' and phone='$PHONE_LOOP';" >/dev/null
+  out=$(send_message "$PHONE_LOOP" "wamid.$RUN.lp-a-after" "hello again")
+  assert_not_contains "(a) after the window passes the phone is answered again" "suppressed" "$out"
+  assert_db "(a) ...a new reply was sent" "6" "$(replies_to $PHONE_LOOP)"
+
+  # --- staff get the higher cap (30): a normal working session is never muted,
+  # --- but a staff phone stuck in a loop is still bounded.
+  reset_state
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    send_cmd "$PHONE_OWNER_IRON" "lp-s$i" "help"
+  done
+  assert_db "staff: 10 commands in a row are all answered (cap is not 5 for staff)" "10" "$(replies_to $PHONE_OWNER_IRON)"
+  for i in $(seq 11 34); do
+    send_cmd "$PHONE_OWNER_IRON" "lp-s$i" "help"
+  done
+  assert_db "staff: a 34-message loop is still cut off at the staff cap (30)" "30" "$(replies_to $PHONE_OWNER_IRON)"
+  assert_db "staff: ...the other 4 logged as rate_limited" "4" "$(suppressed_of $PHONE_OWNER_IRON rate_limited)"
+
+  # --- normal traffic is untouched ---
+  reset_state
+  send_cmd "$PHONE_OWNER_IRON" lp-n1 "help"
+  assert_db "normal: owner command still answered" "1" "$(replies_to $PHONE_OWNER_IRON)"
+  send_message "$PHONE_ACTIVE" "wamid.$RUN.lp-n2" "IN" >/dev/null
+  assert_contains "normal: member IN still checks in" "Checked in" "$(last_reply $PHONE_ACTIVE)"
+  assert_db "normal: member attendance recorded" "1" "$(attendance_count $PHONE_ACTIVE)"
+  assert_db "normal: nothing flagged suppressed" "0" \
+    "$(sql "select count(*) from whatsapp_messages where suppressed_reason is not null;")"
+  reset_state
+fi
+
 
 # ---------------------------------------------------------------------------
 # Summary

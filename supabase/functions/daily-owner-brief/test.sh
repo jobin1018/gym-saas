@@ -419,11 +419,16 @@ printf '%s' "$got" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p' | head -1 \
 printf '\n'
 
 # ---------------------------------------------------------------------------
-# 3b. dry_run for a single org, v2 (DEFAULT) template — all 12 values, and
-#     each cross-referenced against the SAME source the owner's REVENUE / PT /
-#     COACHES commands read, so the brief and those commands can never disagree.
+# 3b. dry_run for a single org, v2 (SUPERSEDED, rollback path via EXPLICIT
+#     override — NOT the default since 20260928's v3 fix) template — all 12
+#     values, each cross-referenced against the SAME source the owner's
+#     REVENUE / PT / COACHES commands read, so the brief and those commands
+#     can never disagree. Still worth keeping exact: v2's underlying stats
+#     computation (revenue/PT-alerts/coach-activity) is real, tested
+#     production logic, not just dead rollback code. (v3, the ACTUAL default,
+#     is section 3c below.)
 # ---------------------------------------------------------------------------
-printf '\n%s-- dry_run (single org, v2 default) --%s\n' "$B" "$N"
+printf '\n%s-- dry_run (single org, v2 via explicit override) --%s\n' "$B" "$N"
 
 # reset_state above already ran; arrange_activity/checkins/failed_sends still in
 # place from section 3. Add ONE session logged YESTERDAY so {{12}} is non-zero.
@@ -440,9 +445,9 @@ if $have_psql; then
        values ('$ORG_IRON','$V2_PKG_MEMBER','$V2_COACH','$V2_PKG','dob-v2 yesterday marker', CURRENT_DATE - 1);" >/dev/null
 fi
 
-got=$(post "{\"dry_run\":true,\"organization_id\":\"$ORG_IRON\"}")
+got=$(post "{\"dry_run\":true,\"organization_id\":\"$ORG_IRON\",\"template_version\":\"v2\"}")
 
-assert_contains "default version is v2"            '"brief_version":"v2"' "$got"
+assert_contains "v2 override is honoured"          '"brief_version":"v2"' "$got"
 assert_contains "outcome is computed"              '"outcome":"computed"' "$got"
 
 # --- {{7}} overdue and {{11}} check-ins: same fixture as section 3 ---
@@ -510,6 +515,51 @@ if $have_psql && [ -n "$V2_PKG" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 3c. dry_run for a single org, v3 — the ACTUAL DEFAULT (no override at all).
+#     Same 7 values/params as v1 (proven in section 3's fixture, still in
+#     effect: reset_state + arrange_activity/checkins/failed_sends), but its
+#     OWN confirmed wording (buildBriefV3(), 20260928) — "Your Daily Gym
+#     Summary" header, 📅 not 💰, and the "Reply ALERTS" closing line that
+#     replaced the old broken DETAILS reference. This is the regression the
+#     earlier full-suite run actually caught: v1 and v3 briefly shared one
+#     render function, so correcting v3's wording silently broke v1's.
+# ---------------------------------------------------------------------------
+printf '\n%s-- dry_run (single org, v3 — no override, proves the real default) --%s\n' "$B" "$N"
+
+got=$(post "{\"dry_run\":true,\"organization_id\":\"$ORG_IRON\"}")
+
+assert_contains "no override -> v3 (the real default)" '"brief_version":"v3"' "$got"
+assert_contains "outcome is computed"                  '"outcome":"computed"' "$got"
+
+# Same underlying numbers as section 3 (v1) — v3 shares v1's plain 7-value
+# computation, not v2's richer one (that block only runs for version=='v2').
+assert_contains "v3 keeps renewals_due_count"  '"renewals_due_count":3' "$got"
+assert_contains "v3 keeps overdue_count"       '"overdue_count":3'      "$got"
+assert_contains "v3 keeps checkins_yesterday"  '"checkins_yesterday":3' "$got"
+
+# --- the v3 message text — confirmed real wording, not v1's or v2's ---
+assert_contains "v3 message has the header line"     'Your Daily Gym Summary' "$got"
+assert_contains "v3 message greets with a comma+emoji, not v1's em-dash" \
+  'Good morning, Iron Temple Gym 👋' "$got"
+assert_contains "v3 message has the 📅 renewals line (not 💰)" \
+  '📅 Renewals due this week: 3 (₹4,200)' "$got"
+assert_contains "v3 message has the overdue line"    '⚠️ Overdue: 3 members, ₹4,200 pending' "$got"
+assert_contains "v3 message has the check-ins line"  '✅ Yesterday: 3 check-ins' "$got"
+assert_contains "v3 message has the ALERTS closing line (replaces old DETAILS)" \
+  'Reply ALERTS for what needs attention.' "$got"
+assert_contains "v3 message still shows the failure line when present" \
+  '❌ 2 messages failed to send — tap to review' "$got"
+assert_not_contains "v3 message carries no v1-only phrasing" 'Good morning! Iron Temple Gym —' "$got"
+assert_not_contains "v3 message carries no v2-only phrasing" 'Revenue this month:' "$got"
+
+assert_db "v3 dry run still wrote no brief" "0" "$(briefs_for "$ORG_IRON")"
+
+printf '\n  %sv3 BRIEF THAT WOULD BE SENT%s (Iron Temple, the real default):\n' "$B" "$N"
+printf '%s' "$got" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p' | head -1 \
+  | sed 's/\\n/\n/g' | sed 's/^/    /'
+printf '\n'
+
+# ---------------------------------------------------------------------------
 # 4. Zero-activity org — a clean v1 brief, NOT a skip and NOT an error
 #    (the "reads as words" behaviour is v1's buildBrief(); v2 always shows the
 #    number, tested in 3b.)
@@ -559,8 +609,10 @@ assert_db "brief row is scoped to the right tenant" \
   "$ORG_IRON" "$(sql "select organization_id from whatsapp_messages where template_name like 'daily_owner_brief%' limit 1;")"
 assert_db "brief row has no related_payment_id" \
   "1" "$(sql "select count(*) from whatsapp_messages where template_name like 'daily_owner_brief%' and related_payment_id is null;")"
+# No override here -> v3 (the real default) -> buildBriefV3()'s wording,
+# not v1's "Good morning! X —" (see section 3c for why they now differ).
 assert_db "body_preview holds the real brief text" \
-  "1" "$(sql "select count(*) from whatsapp_messages where template_name like 'daily_owner_brief%' and body_preview like 'Good morning! Iron Temple Gym%';")"
+  "1" "$(sql "select count(*) from whatsapp_messages where template_name like 'daily_owner_brief%' and body_preview like 'Your Daily Gym Summary%';")"
 assert_db "wa_message_id is NULL (send was mocked for this test run)" \
   "1" "$(sql "select count(*) from whatsapp_messages where template_name like 'daily_owner_brief%' and wa_message_id is null;")"
 
