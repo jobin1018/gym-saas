@@ -563,3 +563,17 @@ entrypoint = "./functions/whatsapp-webhook/index.ts"
 # Specifies static files to be bundled with the function. Supports glob patterns.
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/whatsapp-webhook/*.html" ]
+
+[functions.get-pay-page]
+# PUBLIC: the member opening a pay-page link has no account. The 128-bit token
+# is the credential; the function is rate limited and returns 404 for anything
+# unknown or expired.
+verify_jwt = false
+import_map = "./functions/get-pay-page/deno.json"
+entrypoint = "./functions/get-pay-page/index.ts"
+
+[functions.claim-paid]
+# PUBLIC for the same reason as get-pay-page. Only stamps claimed_paid_at.
+verify_jwt = false
+import_map = "./functions/claim-paid/deno.json"
+entrypoint = "./functions/claim-paid/index.ts"
