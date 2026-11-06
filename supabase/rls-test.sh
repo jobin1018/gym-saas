@@ -1649,9 +1649,20 @@ assert_equals "renewal: odd bundle bills exactly 4500.00, not amount x 7" "4500.
 assert_equals "renewal: bundle membership at another duration bills rate x its duration (750 x 3)" "2250.00" "$(renew "$BM_OVR")"
 assert_equals "renewal: ordinary plan unchanged (1500 x 3)" "4500.00" "$(renew "$BM_MON")"
 assert_equals "renewal: unknown membership -> NULL" "" "$(renew 00000000-0000-0000-0000-000000000000)"
-case "$(rest_rpc_status "$RAVI" "membership_renewal_amount" "{\"p_membership_id\":\"$BM_OWN\"}")" in
+ren_body="{\"p_membership_id\":\"$BM_OWN\"}"
+for who in RAVI PRIYA; do
+  tok="${!who}"
+  got=$(rest_rpc "$tok" "membership_renewal_amount" "$ren_body")
+  assert_contains "membership_renewal_amount: $who (staff) is not authorised (permission denied)" "permission denied" "$got"
+  assert_not_contains "  ...$who got no price back" "4500" "$got"
+done
+case "$(rest_rpc_status "$RAVI" "membership_renewal_amount" "$ren_body")" in
   401|403|404) ok "membership_renewal_amount is not callable by staff sessions (service_role only)" ;;
-  *) bad "membership_renewal_amount is not callable by staff sessions" "401/403/404" "$(rest_rpc_status "$RAVI" "membership_renewal_amount" "{\"p_membership_id\":\"$BM_OWN\"}")" ;;
+  *) bad "membership_renewal_amount is not callable by staff sessions" "401/403/404" "$(rest_rpc_status "$RAVI" "membership_renewal_amount" "$ren_body")" ;;
+esac
+case "$(rest_rpc_status "$ANON_KEY" "membership_renewal_amount" "$ren_body")" in
+  401|403|404) ok "membership_renewal_amount is not callable by anon" ;;
+  *) bad "membership_renewal_amount is not callable by anon" "401/403/404" "$(rest_rpc_status "$ANON_KEY" "membership_renewal_amount" "$ren_body")" ;;
 esac
 
 # --- update_membership_duration on bundles ---
