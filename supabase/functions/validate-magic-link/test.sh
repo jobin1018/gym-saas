@@ -94,6 +94,10 @@ DELETE FROM training_notes  WHERE coach_id = '$DEACT_COACH_ID';
 DELETE FROM users           WHERE id = '$DEACT_COACH_ID';
 DELETE FROM whatsapp_messages
   WHERE organization_id = '$ORG_IRON' AND body_preview LIKE '%coach/quick-log%';
+-- staff-login's throwaway "Cross-Org Test Fixture" shares Priya's phone. While
+-- it exists that phone is registered at two gyms and ADD PT mints no link, so
+-- this suite must not depend on staff-login having cleaned up after itself.
+DELETE FROM users WHERE id = '9eeeeeee-eeee-eeee-eeee-eeeeeeeeeeee';
 SQL
 }
 arrange() {
@@ -205,11 +209,12 @@ else
     SIG=$(printf '%s' "$ENVELOPE" | openssl dgst -sha256 -hmac "$APP_SECRET" | sed 's/^.*= */sha256=/')
     wargs+=(-H "X-Hub-Signature-256: $SIG")
   fi
+  sql "delete from whatsapp_messages where organization_id='$ORG_IRON' and direction='outbound' and phone='$FARAH_PHONE'" >/dev/null  # reply cap is per phone; don't inherit earlier suites' history
   wresp=$(curl "${wargs[@]}" -d "$ENVELOPE")
   assert_contains "whatsapp-webhook accepts the SESSION message" '"resolution":"coach"' "$wresp"
 
   LINK=$(sql "select body_preview from whatsapp_messages
-              where organization_id='$ORG_IRON' and body_preview like '%coach/quick-log?token=%'
+              where organization_id='$ORG_IRON' and direction='outbound' and phone='$FARAH_PHONE' and body_preview like '%coach/quick-log?token=%'
               order by created_at desc limit 1")
   E2E_TOKEN=$(printf '%s' "$LINK" | sed -n 's/.*token=\([A-Za-z0-9_-]\{32,128\}\).*/\1/p')
   if [ -z "$E2E_TOKEN" ]; then
@@ -248,10 +253,11 @@ else
     SIG2=$(printf '%s' "$ENVELOPE2" | openssl dgst -sha256 -hmac "$APP_SECRET" | sed 's/^.*= */sha256=/')
     wargs2+=(-H "X-Hub-Signature-256: $SIG2")
   fi
+  sql "delete from whatsapp_messages where organization_id='$ORG_IRON' and direction='outbound' and phone='$FARAH_PHONE'" >/dev/null  # reply cap is per phone; don't inherit earlier suites' history
   curl "${wargs2[@]}" -d "$ENVELOPE2" >/dev/null
 
   LINK2=$(sql "select body_preview from whatsapp_messages
-               where organization_id='$ORG_IRON' and body_preview like '%coach/quick-log?token=%'
+               where organization_id='$ORG_IRON' and direction='outbound' and phone='$FARAH_PHONE' and body_preview like '%coach/quick-log?token=%'
                order by created_at desc limit 1")
   BOUND_TOKEN=$(printf '%s' "$LINK2" | sed -n 's/.*token=\([A-Za-z0-9_-]\{32,128\}\).*/\1/p')
 
@@ -384,6 +390,15 @@ printf '\n%s-- expiry boundary + single-use race, per purpose (add_member / add_
 RAVI_PHONE=919000000001    # owner, Iron Temple
 PRIYA_PHONE=919000000011   # front_desk, Iron Temple
 
+# The webhook caps replies per phone per window (REPLY_CAP_STAFF) and silently
+# suppresses anything past it. Earlier suites in the full run use these same
+# seeded staff phones, so this suite must not inherit their reply history: clear
+# the phone's outbound rows and any unredeemed links so the link read back below
+# is guaranteed to be the one this very command just minted.
+fresh_phone_state() {
+  sql "delete from whatsapp_messages where organization_id='$ORG_IRON' and direction='outbound' and phone='$1'" >/dev/null
+}
+
 # <purpose> <phone> <wa-command> <expected-role> <expected-name>
 test_purpose_boundary_and_race() {
   local purpose="$1" phone="$2" cmd="$3" role="$4" name="$5"
@@ -402,10 +417,12 @@ test_purpose_boundary_and_race() {
     sig=$(printf '%s' "$envelope" | openssl dgst -sha256 -hmac "$APP_SECRET" | sed 's/^.*= */sha256=/')
     wargs+=(-H "X-Hub-Signature-256: $sig")
   fi
+  fresh_phone_state "$phone"
   curl "${wargs[@]}" -d "$envelope" >/dev/null
 
   link=$(sql "select body_preview from whatsapp_messages
-              where organization_id='$ORG_IRON' and body_preview like '%token=%'
+              where organization_id='$ORG_IRON' and direction='outbound' and phone='$phone'
+                and body_preview like '%token=%'
               order by created_at desc limit 1")
   token=$(printf '%s' "$link" | sed -n 's/.*token=\([A-Za-z0-9_-]\{32,128\}\).*/\1/p')
 
@@ -429,10 +446,12 @@ test_purpose_boundary_and_race() {
     sig=$(printf '%s' "$envelope" | openssl dgst -sha256 -hmac "$APP_SECRET" | sed 's/^.*= */sha256=/')
     wargs+=(-H "X-Hub-Signature-256: $sig")
   fi
+  fresh_phone_state "$phone"
   curl "${wargs[@]}" -d "$envelope" >/dev/null
 
   link=$(sql "select body_preview from whatsapp_messages
-              where organization_id='$ORG_IRON' and body_preview like '%token=%'
+              where organization_id='$ORG_IRON' and direction='outbound' and phone='$phone'
+                and body_preview like '%token=%'
               order by created_at desc limit 1")
   token=$(printf '%s' "$link" | sed -n 's/.*token=\([A-Za-z0-9_-]\{32,128\}\).*/\1/p')
 

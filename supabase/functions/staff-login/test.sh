@@ -480,6 +480,10 @@ reset_state
 # Summary
 # ---------------------------------------------------------------------------
 reset_state
+# The cross-org fixture shares Priya's phone, which makes that phone ambiguous
+# ("registered at more than one gym") for every command-by-WhatsApp flow. It
+# exists only for this suite, so don't leave it behind for later suites.
+$have_psql && sql "DELETE FROM public.users WHERE id = '$CROSS_ORG_USER'" >/dev/null
 
 printf '\n%s== summary ==%s\n' "$B" "$N"
 printf '  %spassed %d%s   %sfailed %d%s   %sskipped %d%s\n' "$G" "$PASS" "$N" "$R" "$FAIL" "$N" "$Y" "$SKIP" "$N"
