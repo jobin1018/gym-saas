@@ -24,6 +24,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 SUITES=(
   whatsapp-webhook
+  pay-page
   mark-overdue
   daily-owner-brief
   send-renewal-reminder

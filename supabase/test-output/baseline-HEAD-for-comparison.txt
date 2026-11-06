@@ -1,0 +1,1528 @@
+# Same run-all-tests.sh at the commit BEFORE this work (57474b6), real-Razorpay suites cannot pass offline; shown only to prove validate-magic-link fails identically there.
+
+=========================================
+  full Edge Function suite
+=========================================
+
+>>> whatsapp-webhook
+
+== mock-meta webhook tests ==
+target: http://127.0.0.1:54321/functions/v1/whatsapp-webhook
+razorpay: rzp_test_placeholder (TEST MODE)
+signature mode: enforcing
+
+-- verification handshake --
+  PASS  GET with valid verify_token echoes hub.challenge
+  PASS  GET with wrong verify_token is 403
+  PASS  GET with no params is 403
+
+-- POST signature authentication --
+  PASS  POST with invalid signature is rejected 403
+  PASS  POST with missing signature header is rejected 403
+  PASS  POST with malformed signature header is rejected 403
+  PASS  rejected POSTs wrote no webhook_events row
+  PASS  rejected POSTs created no attendance
+  PASS  POST with valid signature is accepted 200
+
+-- check-in --
+  PASS  active member 'in' resolves
+  PASS  active member 'in' replies checked-in
+  PASS  active member 'in' records attendance
+  PASS  past_due member 'in' resolves
+  FAIL  past_due member 'in' gets a real payment link
+        expected: contains 'Pay here to continue: https://rzp.io/'
+        actual:   Sorry, we couldn't generate your payment link right now — please contact the front desk to renew.
+  FAIL  past_due member 'in' reply names them
+        expected: contains 'Bharat Rao'
+        actual:   Sorry, we couldn't generate your payment link right now — please contact the front desk to renew.
+  PASS  past_due member 'in' records NO attendance
+
+  REAL RAZORPAY LINK CREATED (via send-renewal-reminder, PHONE_PAST_DUE):
+    Sorry, we couldn't generate your payment link right now — please contact the front desk to renew.
+
+  PASS  repeat 'PAY' the same day resolves
+  FAIL  repeat 'PAY' the same day says a link was already sent
+        expected: We already sent you a payment link earlier today — check your recent WhatsApp messages, or ask the front desk if you can't find it.
+        actual:   Sorry, we couldn't generate your payment link right now — please contact the front desk to renew.
+
+-- tenant resolution --
+  PASS  multi-gym phone with no context is ambiguous
+  PASS  ambiguous reply lists both gyms
+  PASS  ambiguous phone records NO attendance
+  PASS  ambiguous phone gets NO auto-context
+  PASS  unknown phone is not_found
+  PASS  unknown phone replies front-desk message
+  PASS  single-gym phone got an auto-created context
+  PASS  messy phone format '+91-99999-99999' resolves
+  PASS  messy phone format maps to the same member
+
+-- other intents --
+  PASS  'PAY' resolves
+  FAIL  'PAY' from an active member also gets a real payment link
+        expected: contains 'Pay here to continue: https://rzp.io/'
+        actual:   Sorry, we couldn't generate your payment link right now — please contact the front desk to renew.
+
+  REAL RAZORPAY LINK CREATED (via send-renewal-reminder, PHONE_ACTIVE / PAY):
+    Sorry, we couldn't generate your payment link right now — please contact the front desk to renew.
+
+  PASS  gibberish resolves
+  PASS  gibberish replies fallback help text
+  PASS  'switch' from single-gym member resolves
+  PASS  'switch' from single-gym member says nothing to switch to
+  PASS  'switch' without context short-circuits to ambiguous
+  PASS  'switch' with context resolves
+  PASS  'switch' with context lists both gyms
+
+-- idempotency --
+  PASS  first delivery of event is processed
+  PASS  replayed event is skipped as duplicate
+  PASS  replayed event creates NO second attendance row
+  PASS  replayed event stored only once
+
+-- malformed payloads --
+  PASS  statuses-only callback is acked without processing
+  PASS  unparseable body is acked, not crashed
+  PASS  unsupported method is rejected
+
+-- owner / coach commands --
+  PASS  REVENUE names the org + both sources
+  PASS  REVENUE has the membership line
+  PASS  REVENUE has the PT line
+  PASS  REVENUE has last-month comparison
+  PASS  ALERTS summarises overdue
+  PASS  ALERTS summarises PT attention
+  PASS  ALERTS points to detail commands
+  PASS  TODAY counts the 3 check-ins
+  PASS  TODAY counts the failed send (24h)
+  PASS  TODAY has the renewals line
+  PASS  TODAY has the PT sessions line
+  PASS  OVERDUE lists the past_due member
+  PASS  OVERDUE shows an amount owed
+  PASS  OVERDUE shows days late
+  PASS  PT shows active package count
+  PASS  PT shows this month's PT revenue
+  PASS  PT shows the low-sessions list
+  PASS  PT shows the expiring-soon list
+  PASS  COACHES lists Rhea as logging
+  PASS  COACHES flags an active logger
+  PASS  COACHES flags a quiet coach (Sam, 26d)
+  PASS  LAPSED highlights the total + window
+  PASS  NEW shows this vs last month
+  PASS  NEW lists a joiner with their plan
+  PASS  NEW caps the list at 10 with +N more
+  PASS  unknown owner command falls back to owner HELP
+  PASS  owner HELP has the Money heading
+  PASS  owner HELP lists REVENUE
+  PASS  owner HELP lists OVERDUE
+  PASS  owner HELP has the Your Business heading
+  PASS  owner HELP lists ALERTS
+  PASS  owner HELP lists TODAY
+  PASS  owner HELP lists NEW
+  PASS  owner HELP lists LAPSED
+  PASS  owner HELP has the Team heading
+  PASS  owner HELP lists COACHES
+  PASS  owner HELP lists PT
+  PASS  owner HELP closes with the footer
+  PASS  owner HELP is Gymdean-branded
+  PASS  Money's REVENUE line follows immediately
+  PASS  Team's COACHES line follows immediately
+  PASS  owner HELP does not leak member-facing copy
+  PASS  owner HELP no longer shows the old per-org header
+  PASS  owner HELP does not mention SESSION (coach-only, not owner-facing)
+  PASS  primary owner (matches owner_phone) gets the Apex REVENUE report
+  PASS  co-owner (matches only a users role='owner' row) also gets it
+  PASS  both co-owners see byte-identical data
+  PASS  co-owner unknown command -> owner HELP (routed as owner, not not_found)
+  PASS  MYCLIENTS returns the coach's own list
+  PASS  MYCLIENTS shows a client name + goal
+  PASS  MYCLIENTS shows sessions used/purchased
+  PASS  MYCLIENTS never leaks Sam's client
+  PASS  MYCLIENTS never leaks Lena's client
+  PASS  SESSION replies with a /coach/quick-log link
+  PASS  SESSION link says one use / 15 min
+  PASS    ...persisted a fresh staff_magic_links row for this coach, purpose=session_log
+  PASS    ...expiry is ~15 min out (13-15 min)
+  PASS  LOG is an alias for SESSION
+  PASS  a coach texting an owner command gets coach help
+  PASS  coach help mentions SESSION / LOG
+  PASS  coach help says owner reports are owner-only
+  PASS  coach does not receive owner REVENUE data
+  PASS  Iron owner's REVENUE names Iron Temple
+  PASS  Iron owner's REVENUE never shows Apex
+  PASS  Iron owner's OVERDUE never shows an Apex member
+  PASS  Iron owner's COACHES never shows an Apex coach
+  PASS  unknown phone gets a clean not_found (not an error)
+  PASS  unknown phone response is still ok:true
+  PASS  multi-org owner_phone is flagged, not guessed
+  PASS  the ambiguous reply names both orgs
+  PASS  long OVERDUE shows the true total
+  PASS  long OVERDUE caps at 10 + summarises
+  PASS  long OVERDUE reply stays a sane length (416 bytes)
+  PASS  long LAPSED caps at 10 + summarises
+  PASS  long LAPSED reply stays a sane length (439 bytes)
+  PASS  suspended org: owner REVENUE -> org_suspended resolution
+  PASS    ...owner gets the 'account inactive' reply
+  PASS  suspended org: coach MYCLIENTS -> org_suspended resolution
+  PASS  suspended org: coach SESSION mints no magic link
+  PASS    ...no staff_magic_links row was created
+  PASS  suspended org: member check-in -> clean inactive reply
+  PASS    ...no attendance row written
+  PASS  member IN still resolves + checks in
+  PASS  member IN still writes an attendance row
+
+-- frozen membership check-in --
+  PASS  frozen member 'in' resolves
+  PASS  frozen member 'in' reply names the paused-until date
+  PASS  frozen member 'in' records NO attendance
+
+-- owner/front_desk action commands --
+  PASS  front_desk resolves
+  PASS  front_desk gets its own command list
+  PASS    ...lists PAUSE MEMBER
+  PASS    ...does NOT list REVENUE (report commands are owner-only)
+  PASS    ...does NOT list RESET PIN (owner-only)
+  PASS  owner PAUSE MEMBER pauses Asha for 5 days
+  PASS    ...names the day count
+  PASS    ...memberships.status is actually frozen
+  PASS  pausing an already-paused membership gives a clear reply
+  PASS  owner RESUME MEMBER resumes Asha
+  PASS    ...memberships.status is active again
+  PASS  resuming a non-frozen membership gives a clear reply
+  PASS  days out of range (1-365) is rejected before the RPC
+  PASS  unknown member name -> clean 'not found', not a crash
+  PASS  ambiguous name lists the matches
+  PASS    ...tells the sender to resend by phone
+  PASS    ...nobody was actually paused by the ambiguous attempt
+  PASS  front_desk PAUSE MEMBER works for their own location
+  PASS  cross-org PAUSE MEMBER finds no such member
+  PASS    ...Asha's own membership is untouched
+  PASS  owner ADD MEMBER replies with a members/add link
+  PASS    ...a staff_magic_links row was written with purpose=add_member
+  PASS  front_desk ADD PT replies with a pt/add link
+  PASS    ...a staff_magic_links row was written with purpose=add_pt_package
+  PASS  front_desk RESET PIN is not even parsed as a command (falls to HELP)
+  PASS  owner RESET PIN succeeds
+  PASS    ...pin_hash actually changed
+  PASS    ...the new hash verifies the new PIN via bcrypt
+  PASS  unknown staff name -> clean 'not found'
+
+-- loop protection --
+  PASS  (b) JioCare text -> 200 suppressed=auto_responder
+  PASS  (b) ...no reply sent
+  PASS  (b) ...no check-in side effect
+  PASS  (b) ...inbound still logged with suppressed_reason
+  PASS  (b) ...logged against the member's gym (staff can see it)
+  PASS  (b) ...webhook_event marked processed
+  PASS  (b) generic auto-responder text suppressed: This is an automated message. ...
+  PASS  (b) generic auto-responder text suppressed: Auto-reply: I am out of office...
+  PASS  (b) generic auto-responder text suppressed: Thank you for contacting us, w...
+  PASS  (b) ...none of those were answered
+  PASS  (c) message from our own number -> suppressed=own_number
+  PASS  (c) non-phone sender id -> suppressed=system_sender
+  PASS  (c) Meta type=system message -> suppressed=system_sender
+  PASS  (c) ...zero replies across all three
+  PASS  (c) ...all three still logged as inbound with a reason
+  PASS  (a) 10 loop messages -> exactly 5 replies sent
+  PASS  (a) ...all 10 inbound still logged
+  PASS  (a) ...5 of them marked rate_limited
+  PASS  (a) ...the first 5 were handled normally (not suppressed)
+  PASS  (a) a different phone is unaffected by another's cap
+  PASS  (a) ...and was not suppressed
+  PASS  (a) after the window passes the phone is answered again
+  PASS  (a) ...a new reply was sent
+  PASS  staff: 10 commands in a row are all answered (cap is not 5 for staff)
+  PASS  staff: a 34-message loop is still cut off at the staff cap (30)
+  PASS  staff: ...the other 4 logged as rate_limited
+  PASS  normal: owner command still answered
+  PASS  normal: member IN still checks in
+  PASS  normal: member attendance recorded
+  PASS  normal: nothing flagged suppressed
+
+== summary ==
+  passed 185   failed 4   skipped 0
+
+  failing cases:
+    - past_due member 'in' gets a real payment link
+    - past_due member 'in' reply names them
+    - repeat 'PAY' the same day says a link was already sent
+    - 'PAY' from an active member also gets a real payment link
+
+>>> mark-overdue
+
+== mark-overdue tests ==
+target: http://127.0.0.1:54321/functions/v1/mark-overdue
+tenant timezone: Asia/Kolkata
+
+-- caller authentication --
+  PASS  no Authorization header is rejected 401
+  PASS  a wrong bearer token is rejected 401
+  PASS  the ANON key is rejected 401 (it is public)
+  PASS  GET is rejected (this endpoint is POST-only)
+  PASS  rejected calls changed no membership status
+
+-- input validation --
+  PASS  unparseable body is a clear 400
+  PASS  a JSON array body is rejected
+  PASS  dry_run must be a real boolean
+  PASS  limit below 1 is rejected
+
+-- dry_run --
+  PASS  response is flagged as a dry run
+  PASS  the transition direction is stated
+  PASS  the target status is stated
+  PASS  the tenant timezone is reported
+  PASS  dry run found the two lapsed memberships
+  PASS  dry run names the yesterday membership
+  PASS  dry run names the long-overdue membership
+  PASS  dry run reports days_overdue
+  PASS  dry run never reports a transitioned count
+  PASS  dry run excludes the membership due TODAY
+  PASS  dry run excludes the membership due TOMORROW
+  PASS  dry run left Asha active
+  PASS  dry run left Bharat active
+  PASS  dry run changed nothing at all
+
+-- real run: the today/yesterday boundary --
+  PASS  response is not flagged dry
+  PASS  exactly two memberships transitioned
+  PASS  no zone errored
+  PASS  the transitioned ids are listed
+  PASS  Asha is in the transitioned list
+  PASS  membership due YESTERDAY became past_due
+  PASS  membership 30 days overdue became past_due
+  PASS  membership due TODAY is still active (valid all day)
+  PASS  membership due TOMORROW is still active
+  PASS  current_period_end was not modified
+  PASS  no membership was pushed to expired or cancelled
+
+-- idempotency --
+  PASS  second run transitions nothing
+  PASS  second run finds nothing eligible
+  PASS  second run returns an empty id list
+  PASS  second run is still ok:true
+  PASS  second run returns 200
+  PASS  already-past_due rows were left alone
+  PASS  still exactly two past_due (of this suite's 4 known fixtures)
+  PASS  a third run also transitions nothing
+  PASS  dry run after the fact reports nothing pending
+
+-- past_due is not re-processed --
+  PASS  run transitions nothing
+  PASS  the past_due/future-dated membership is untouched
+
+-- reverse transition (real razorpay-webhook delivery) --
+  PASS  mark-overdue transitioned the lapsed membership
+  PASS  membership is now past_due
+  PASS  the webhook reconciled the payment
+  PASS  it matched by provider_payment_id
+  PASS  paying a past_due membership flipped it back to ACTIVE
+  PASS  the payment was marked success
+  PASS  the period was extended past today
+  PASS  the period actually moved forward
+  PASS  mark-overdue no longer sees the paid membership
+  PASS  the paid membership stays active
+
+-- auto-unfreeze --
+  PASS  dry run: F_DUE is in would_unfreeze
+  PASS  dry run: F_NOT_DUE is NOT due yet
+  PASS  dry run touched nothing: F_DUE still frozen
+  PASS  dry run touched nothing: F_DUE's date is unchanged
+  PASS  real run: F_DUE was auto-unfrozen
+  PASS  real run: F_NOT_DUE was left alone
+  PASS  F_DUE is active again
+  PASS  F_DUE shifted by the STORED days (12), not the 20 elapsed
+  PASS  F_DUE's freeze row reactivated_at is STILL NULL (auto-unfreeze, not manual)
+  PASS  F_NOT_DUE is still frozen (not due yet)
+  PASS  F_NOT_DUE's date is untouched
+  PASS  F_STALE stays frozen — a stale current_period_end is irrelevant while frozen
+  PASS  F_ORDER ends the run past_due (unfreeze-then-scan, same run)
+  PASS  F_ORDER's date reflects the +3 day credit (still in the past)
+  PASS  second run finds nothing left to unfreeze
+
+-- corrected memberships (update_membership_duration) --
+  PASS  setup: lapsed past_due membership
+  PASS  RPC: past_due membership corrected into the future -> active
+  PASS  RPC: active membership shortened into the past stays active (the sweep owns that flip)
+  PASS    ...shortened membership's end date is now in the past
+  PASS  dry run flags the shortened membership (end in the past)
+  PASS  dry run leaves the corrected-into-the-future membership alone
+  PASS  real run reports the shortened membership as transitioned
+  PASS  shortened membership became past_due, like any lapsed row
+  PASS  corrected-into-the-future membership is still active
+  PASS  the sweep did not touch the corrected end date
+
+== summary ==
+  passed 80   failed 0   skipped 0
+  note: no external API was called; seed data restored to seed.sql state.
+
+>>> daily-owner-brief
+
+== daily-owner-brief tests ==
+target: http://127.0.0.1:54321/functions/v1/daily-owner-brief
+
+-- caller authentication --
+  PASS  no Authorization header is rejected 401
+  PASS  a wrong bearer token is rejected 401
+  PASS  the ANON key is rejected 401 (it is public)
+  PASS  GET is rejected (this endpoint is POST-only)
+  PASS  rejected calls sent no briefs
+
+-- input validation --
+  PASS  unparseable body is a clear 400
+  PASS  a JSON array body is rejected
+  PASS  dry_run must be a real boolean
+  PASS  malformed organization_id is caught before Postgres
+  PASS  limit below 1 is rejected
+  PASS  an unknown organization_id is reported, not silently empty
+  PASS  unknown organization_id returns 404
+  PASS  no rejected request sent a brief
+
+-- dry_run (single org, v1 rollback path) --
+  PASS  v1 override is honoured
+  PASS  response is flagged as a dry run
+  PASS  only the requested org is computed
+  PASS  outcome is computed, never sent
+  PASS  a dry run never reports anything as sent
+  PASS  the org timezone is resolved from locations
+  PASS  renewals due this week counted
+  PASS  renewals due amount summed
+  PASS  overdue counted
+  PASS  overdue amount summed
+  PASS  yesterday's check-ins counted
+  PASS  failed sends counted
+  PASS  23:30 IST counts as yesterday and 00:30 IST does not (implied by count of 3)
+  PASS  message greets with org name and date
+  PASS  v1 message has the renewals line
+  PASS  v1 message has the overdue line
+  PASS  v1 message has the check-ins line
+  PASS  v1 message has the failure line
+  PASS  v1 message carries no v2-only phrasing
+  PASS  dry run wrote no brief
+  PASS  dry run wrote no rows at all
+
+  v1 BRIEF THAT WOULD BE SENT (Iron Temple):
+    Good morning! Iron Temple Gym — 6 Nov 2026
+    
+    💰 Renewals due this week: 3 (₹4,200)
+    ⚠️ Overdue: 3 members, ₹4,200 pending
+    
+    ✅ Yesterday: 3 check-ins
+    ❌ 2 messages failed to send — tap to review
+
+-- dry_run (single org, v2 via explicit override) --
+  PASS  v2 override is honoured
+  PASS  outcome is computed
+  PASS  v2 keeps overdue_count
+  PASS  v2 keeps checkins_yesterday
+  PASS  v2 {{3}} revenue_month_total == v_daily_revenue_by_source
+  PASS  v2 {{4}} revenue_month_membership == view (membership rows)
+  PASS  v2 {{5}} revenue_month_pt == view (pt_package rows)
+  PASS  v2 {{8}} pt_alert_count == the attention predicate on pt_packages
+  PASS  v2 {{6}} attention_items == overdue_count + pt_alert_count
+  PASS  v2 {{9}} coaches_active == users role='coach' count
+  PASS  v2 {{10}} coaches_need_checkin == quiet-coach count (7d rule)
+  PASS  v2 {{12}} sessions_logged_yesterday == training_notes yesterday
+  PASS    ...and it is the non-zero we just arranged
+  PASS  v2 message greets + dates
+  PASS  v2 message has the revenue clause
+  PASS  v2 message has membership/PT split
+  PASS  v2 message has the attention clause
+  PASS  v2 message has the coaches clause
+  PASS  v2 message has the yesterday clause
+  PASS  v2 dry run still wrote no brief
+
+  v2 BRIEF THAT WOULD BE SENT (Iron Temple):
+    Good morning! Iron Temple Gym — 6 Nov 2026. Revenue this month: ₹49,500 (₹1,500 membership, ₹48,000 PT). Needs attention: 4 items — 3 overdue, 1 PT alerts. Coaches: 2 active, 0 need a check-in. Yesterday: 3 check-ins, 1 sessions logged.
+
+-- dry_run (single org, v3 — no override, proves the real default) --
+  PASS  no override -> v3 (the real default)
+  PASS  outcome is computed
+  PASS  v3 keeps renewals_due_count
+  PASS  v3 keeps overdue_count
+  PASS  v3 keeps checkins_yesterday
+  PASS  v3 message has the header line
+  PASS  v3 message greets with a comma+emoji, not v1's em-dash
+  PASS  v3 message has the 📅 renewals line (not 💰)
+  PASS  v3 message has the overdue line
+  PASS  v3 message has the check-ins line
+  PASS  v3 message has the ALERTS closing line (replaces old DETAILS)
+  PASS  v3 message still shows the failure line when present
+  PASS  v3 message carries no v1-only phrasing
+  PASS  v3 message carries no v2-only phrasing
+  PASS  v3 dry run still wrote no brief
+
+  v3 BRIEF THAT WOULD BE SENT (Iron Temple, the real default):
+    Your Daily Gym Summary
+    Good morning, Iron Temple Gym 👋
+    6 Nov 2026
+    
+    📅 Renewals due this week: 3 (₹4,200)
+    ⚠️ Overdue: 3 members, ₹4,200 pending
+    ✅ Yesterday: 3 check-ins
+    
+    Reply ALERTS for what needs attention.
+    ❌ 2 messages failed to send — tap to review
+
+-- zero-activity organization (v1) --
+  PASS  quiet org is still computed
+  PASS  quiet org has no renewals due
+  PASS  quiet org has nothing overdue
+  PASS  quiet org had no check-ins
+  PASS  quiet org had no failed sends
+  PASS  quiet org still gets a greeting
+  PASS  zero renewals read as words
+  PASS  zero overdue reads as words
+  PASS  zero check-ins read as words
+  PASS  no failure line when nothing failed
+
+-- real send --
+  PASS  brief reports as sent
+  PASS  response is not flagged dry
+  PASS  one brief was sent
+  PASS  nothing errored
+  PASS  the logged message id is returned
+  PASS  exactly one brief row was written
+  PASS  brief is outbound and queued
+  PASS  brief row has member_id NULL (recipient is the owner, not a member)
+  PASS  brief row is scoped to the right tenant
+  PASS  brief row has no related_payment_id
+  PASS  body_preview holds the real brief text
+  PASS  wa_message_id is NULL (send was mocked for this test run)
+  PASS  the NULL-member brief row is invisible to a member-scoped lookup
+
+-- Meta rejects the send --
+  PASS  a rejected send is reported as errored
+  PASS  the failure reason is surfaced
+  PASS  a rejected send is never reported as sent
+  PASS  nothing counts as sent
+  PASS  one org errored
+  PASS  the failed send was still logged (once-per-day guard sees it)
+  PASS  a re-run today is skipped, not retried
+  PASS  still exactly one row for this org
+
+-- duplicate same day --
+  PASS  second brief today is skipped
+  PASS  skip is still ok:true
+  PASS  nothing was sent on the repeat
+  PASS  skip is attributed in the summary
+  PASS  still only one brief row
+  PASS  a third call is also skipped
+  PASS  still only one brief row after three calls
+  PASS  dry run still renders an already-sent brief
+  PASS  the dry run did not add a second brief row
+
+-- multi-org batch with one failure --
+  PASS  all 4 briefable orgs were attempted
+  PASS  exactly one org errored
+  PASS  the healthy orgs were still sent their briefs
+  PASS  the failing org is named for follow-up
+  PASS  the failure reason is surfaced
+  PASS  a partial failure is still ok:true overall
+  PASS  a partial failure still returns 200, not 5xx
+  PASS  the healthy org got its brief
+  PASS  the failing org got no brief row
+  PASS  the suspended org was never briefed
+  PASS  suspended org is absent from the results
+  PASS  the repaired org is briefed on the next run
+  PASS  nothing errors after the repair
+  PASS  the already-briefed orgs are skipped, not re-sent
+  PASS  repaired org now has exactly one brief
+  PASS  the other org still has exactly one brief
+
+-- trial organizations --
+  PASS  a trial org is briefable
+  PASS  a suspended org is refused even when named directly
+
+-- batch dry run --
+  PASS  batch dry run covers all 4 briefable orgs
+  PASS  batch dry run reports computed, not sent
+  PASS  batch dry run never reports a sent count
+  PASS  batch dry run wrote nothing
+  PASS  limit truncates the batch
+  PASS  limit is echoed back
+
+-- co-owner brief fan-out --
+  PASS  co-owner brief is sent
+  PASS  co-owner brief has 2 distinct recipients
+  PASS  co-owner brief reached both (deduped, not 3)
+  PASS  one brief row per distinct owner phone (2), not 3
+  PASS  co-owner brief re-run same day is skipped
+  PASS  co-owner brief re-run re-messaged nobody (still 2)
+
+-- brief revenue excludes void / refund_due payments --
+  PASS  a collected desk payment received today is in the brief's month revenue (+777)
+  PASS  the same payment voided drops out of the brief
+  PASS  refund_due money is not revenue either
+  PASS  back to collected -> counted again
+  PASS  cleanup restored the original figure
+
+== summary ==
+  passed 144   failed 0   skipped 0
+  note: no external API was called — the WhatsApp send was mocked
+        (WHATSAPP_SEND_MODE=mock) and this function creates no Razorpay links.
+  note: seed data has been restored to seed.sql state.
+
+>>> send-renewal-reminder
+
+== send-renewal-reminder tests ==
+target: http://127.0.0.1:54321/functions/v1/send-renewal-reminder
+razorpay: rzp_test_placeholder (TEST MODE)
+
+-- caller authentication --
+  PASS  no Authorization header is rejected 401
+  PASS  a wrong bearer token is rejected 401
+  PASS  the ANON key is rejected 401 (it is public)
+  PASS  GET is rejected (this endpoint is POST-only)
+  PASS  rejected calls created no payment rows
+
+-- input validation --
+  PASS  missing membership_id is a clear 400
+  PASS  missing membership_id returns 400
+  PASS  unparseable body is a clear 400
+  PASS  malformed uuid is caught before it reaches Postgres
+
+-- nonexistent membership --
+  PASS  unknown membership_id is reported, not guessed at
+  PASS  unknown membership_id response is ok:false
+  PASS  unknown membership_id returns 404, not 5xx
+  PASS  unknown membership created no payment row
+  PASS  unknown membership queued no message
+
+-- normal send (calls the real Razorpay API) --
+  FAIL  reminder reports created
+        expected: contains '"created":true'
+        actual:   {"ok":false,"error":"razorpay_error","detail":"Authentication failed"}
+  FAIL  response is ok
+        expected: contains '"ok":true'
+        actual:   {"ok":false,"error":"razorpay_error","detail":"Authentication failed"}
+  FAIL  response carries the pay URL
+        expected: contains '"payment_url":"https://rzp.io/'
+        actual:   {"ok":false,"error":"razorpay_error","detail":"Authentication failed"}
+  FAIL  response carries the link id
+        expected: contains '"razorpay_link_id":"plink_'
+        actual:   {"ok":false,"error":"razorpay_error","detail":"Authentication failed"}
+  FAIL  amount is the plan price in rupees, not paise
+        expected: contains '"amount":1500'
+        actual:   {"ok":false,"error":"razorpay_error","detail":"Authentication failed"}
+  FAIL  body_preview is the member-facing text
+        expected: contains '"body_preview":"Hi Bharat Rao, your Monthly Unlimited membership renews on '
+        actual:   {"ok":false,"error":"razorpay_error","detail":"Authentication failed"}
+  FAIL  message contains the pay link
+        expected: contains 'Pay here to continue: https://rzp.io/'
+        actual:   {"ok":false,"error":"razorpay_error","detail":"Authentication failed"}
+
+  REAL RAZORPAY LINK CREATED — verify this in the dashboard:
+    link id : <none>
+    url     : <none>
+
+  FAIL  a Razorpay link id was returned
+        expected: plink_...
+        actual:   (none)
+  FAIL  exactly one payment row for this renewal period
+        expected: 1
+        actual:   0
+  FAIL  idempotency_key is renewal-{membership}-{period_end}
+        expected: renewal-f2222222-2222-2222-2222-222222222222-2026-10-27
+        actual:   
+  FAIL  payment status is pending
+        expected: pending
+        actual:   
+  FAIL  provider is razorpay
+        expected: razorpay
+        actual:   
+  FAIL  amount stored in RUPEES (1500.00), paise only went to Razorpay
+        expected: 1500.00
+        actual:   
+  PASS  razorpay_link_id was stored
+  FAIL  razorpay_link_id is NOT NULL — the webhook's only handle
+        expected: f
+        actual:   
+  FAIL  provider_payment_id left NULL for the webhook to backfill
+        expected: t
+        actual:   
+  FAIL  reconciled_at left NULL (nothing is reconciled yet)
+        expected: t
+        actual:   
+  FAIL  payment is scoped to the right tenant
+        expected: 11111111-1111-1111-1111-111111111111
+        actual:   
+  FAIL  one outbound renewal_reminder was logged
+        expected: 1
+        actual:   0
+  FAIL  message status is queued
+        expected: queued
+        actual:   
+  FAIL  message is linked to the new payment via related_payment_id
+        expected: 1
+        actual:   
+  FAIL  message body carries the real payment link
+        expected: 1
+        actual:   
+  FAIL  wa_message_id is NULL (send was mocked, nothing was delivered)
+        expected: t
+        actual:   
+
+-- duplicate call, same day --
+  FAIL  second call today is skipped
+        expected: contains '"skipped":"already_sent_today"'
+        actual:   {"ok":false,"error":"razorpay_error","detail":"Authentication failed"}
+  FAIL  skip is still ok:true (not an error for renewal-scan)
+        expected: contains '"ok":true'
+        actual:   {"ok":false,"error":"razorpay_error","detail":"Authentication failed"}
+  PASS  skip returns no new payment url
+  FAIL  no second message was queued
+        expected: 1
+        actual:   0
+  FAIL  no second payment row was created
+        expected: 1
+        actual:   0
+  FAIL  third call today is also skipped
+        expected: contains '"skipped":"already_sent_today"'
+        actual:   {"ok":false,"error":"razorpay_error","detail":"Authentication failed"}
+
+-- same period, later day (reuse, do not re-charge) --
+  FAIL  re-send reports reused, not created
+        expected: contains '"reused":true'
+        actual:   {"ok":false,"error":"razorpay_error","detail":"Authentication failed"}
+  PASS  re-send reuses the SAME payments row
+  PASS  re-send reuses the SAME Razorpay link
+  PASS  re-send serves the SAME pay URL
+  FAIL  still exactly one payment row for the period
+        expected: 1
+        actual:   0
+  FAIL  the re-send was logged as a new message
+        expected: 1
+        actual:   0
+
+-- already paid --
+  FAIL  a paid renewal is skipped
+        expected: contains '"skipped":"already_paid"'
+        actual:   {"ok":false,"error":"razorpay_error","detail":"Authentication failed"}
+  PASS  no reminder was queued for a paid renewal
+  FAIL  the paid payment row was not duplicated
+        expected: 1
+        actual:   0
+
+-- whatsapp_opt_in = false --
+  PASS  opted-out member is skipped
+  PASS  opt-out skip is ok:true
+  PASS  opt-out skip created no pay URL
+  PASS  opted-out member got no payment row
+  PASS  opted-out member got no message row
+  FAIL  re-opted-in member is messaged
+        expected: contains '"created":true'
+        actual:   {"ok":false,"error":"razorpay_error","detail":"Authentication failed"}
+  FAIL  other tenant's plan price is used (₹2000)
+        expected: contains '"amount":2000'
+        actual:   {"ok":false,"error":"razorpay_error","detail":"Authentication failed"}
+
+  REAL RAZORPAY LINK CREATED (FlexFit / ₹2000):
+    link id : <none>
+    url     : <none>
+
+  FAIL  the second tenant's payment is scoped to the second tenant
+        expected: 22222222-2222-2222-2222-222222222222
+        actual:   
+
+-- bundle plan renewal pricing --
+  SKIP  bundle 6 months (3+3 free) at its own duration: billed at 4500.00
+           Razorpay test-mode link cap/rate limit hit - pricing rule asserted in rls-test.sh section 19
+  SKIP  bundle 7 months (rate does not divide evenly): billed at 4500.00
+           Razorpay test-mode link cap/rate limit hit - pricing rule asserted in rls-test.sh section 19
+  SKIP  bundle membership at a different duration (3 of 6): billed at 2250.00
+           Razorpay test-mode link cap/rate limit hit - pricing rule asserted in rls-test.sh section 19
+
+== summary ==
+  passed 25   failed 35   skipped 3
+  note: the Razorpay TEST MODE links printed above still exist in your
+        dashboard. They are unpaid and were never sent to anyone.
+
+  failing cases:
+    - reminder reports created
+    - response is ok
+    - response carries the pay URL
+    - response carries the link id
+    - amount is the plan price in rupees, not paise
+    - body_preview is the member-facing text
+    - message contains the pay link
+    - a Razorpay link id was returned
+    - exactly one payment row for this renewal period
+    - idempotency_key is renewal-{membership}-{period_end}
+    - payment status is pending
+    - provider is razorpay
+    - amount stored in RUPEES (1500.00), paise only went to Razorpay
+    - razorpay_link_id is NOT NULL — the webhook's only handle
+    - provider_payment_id left NULL for the webhook to backfill
+    - reconciled_at left NULL (nothing is reconciled yet)
+    - payment is scoped to the right tenant
+    - one outbound renewal_reminder was logged
+    - message status is queued
+    - message is linked to the new payment via related_payment_id
+    - message body carries the real payment link
+    - wa_message_id is NULL (send was mocked, nothing was delivered)
+    - second call today is skipped
+    - skip is still ok:true (not an error for renewal-scan)
+    - no second message was queued
+    - no second payment row was created
+    - third call today is also skipped
+    - re-send reports reused, not created
+    - still exactly one payment row for the period
+    - the re-send was logged as a new message
+    - a paid renewal is skipped
+    - the paid payment row was not duplicated
+    - re-opted-in member is messaged
+    - other tenant's plan price is used (₹2000)
+    - the second tenant's payment is scoped to the second tenant
+
+>>> renewal-scan
+
+== renewal-scan tests ==
+target: http://127.0.0.1:54321/functions/v1/renewal-scan
+razorpay: rzp_test_placeholder (TEST MODE)
+
+-- caller authentication --
+  PASS  no Authorization header is rejected 401
+  PASS  a wrong bearer token is rejected 401
+  PASS  the ANON key is rejected 401 (it is public)
+  PASS  GET is rejected (this endpoint is POST-only)
+  PASS  rejected calls triggered no reminders
+
+-- input validation --
+  PASS  unparseable body is a clear 400
+  PASS  a JSON array body is rejected
+  PASS  dry_run must be a real boolean, not a string
+  PASS  fractional offsets are rejected
+  PASS  an empty offsets list is rejected
+  PASS  limit below 1 is rejected
+  PASS  no rejected request reached send-renewal-reminder
+
+-- dry_run --
+  PASS  response is flagged as a dry run
+  PASS  dry run reports the offsets used
+  PASS  dry run names the two target dates
+  PASS  dry run matched the 4 in-window memberships
+  PASS  dry run lists the membership id
+  PASS  dry run lists the member name
+  PASS  dry run lists the amount
+  PASS  dry run lists the plan name
+  PASS  dry run shows days_until_due
+  PASS  dry run totals the amount at risk
+  PASS  dry run says skip guards are NOT evaluated
+  PASS  past_due membership on an offset IS included
+  PASS  membership BETWEEN the offsets (+5) is excluded
+  PASS  cancelled membership on an offset is excluded
+  PASS  dry run created no payments
+  PASS  dry run created no messages
+  PASS  dry run hit Razorpay zero times (no link rows exist)
+  PASS  offsets override [5] matches only the +5 membership
+  PASS  offsets override selects Chitra (Iron Temple)
+  PASS  offsets override drops the +7 membership
+
+-- zero matches --
+  PASS  empty scan is ok:true
+  PASS  empty scan returns 200
+  PASS  empty scan scanned 0
+  PASS  empty scan created 0
+  PASS  empty scan errored 0
+  PASS  empty scan reports no error ids
+  PASS  empty scan still reports its target dates
+  PASS  empty scan wrote nothing
+  PASS  empty dry run matched 0
+  PASS  empty dry run lists nothing
+  PASS  empty dry run totals zero
+
+-- real scan --
+  PASS  real scan is not flagged dry
+  PASS  scanned all 4 in-window memberships
+  FAIL  all 4 reminders were created
+        expected: 4
+        actual:   0
+  FAIL  nothing errored
+        expected: 0
+        actual:   4
+  PASS  nothing was skipped
+  FAIL  response carries real payment links
+        expected: contains '"payment_url":"https://rzp.io/'
+        actual:   {"ok":true,"dry_run":false,"scan_date":"2026-11-06","timezone":"Asia/Kolkata","offset_days":[7,3],"target_dates":["2026-11-13","2026-11-09"],"statuses":["active","past_due"],"matched":4,"truncated":false,"limit":100,"scanned":4,"created":0,"reused":0,"skipped":0,"skipped_by_reason":{},"errored":4,"errored_membership_ids":["70000000-0000-0000-0000-000000000012","f2222222-2222-2222-2222-222222222222","70000000-0000-0000-0000-000000000002","f1111111-1111-1111-1111-111111111111"],"errors":[{"membership_id":"70000000-0000-0000-0000-000000000012","member_name":"Priyanka Shah","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"f2222222-2222-2222-2222-222222222222","member_name":"Bharat Rao","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"70000000-0000-0000-0000-000000000002","member_name":"Sneha Gupta","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"f1111111-1111-1111-1111-111111111111","member_name":"Asha Menon","error":"razorpay_error","detail":"Authentication failed","http_status":502}],"results":[{"membership_id":"70000000-0000-0000-0000-000000000012","member_name":"Priyanka Shah","outcome":"error","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"f2222222-2222-2222-2222-222222222222","member_name":"Bharat Rao","outcome":"error","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"70000000-0000-0000-0000-000000000002","member_name":"Sneha Gupta","outcome":"error","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"f1111111-1111-1111-1111-111111111111","member_name":"Asha Menon","outcome":"error","error":"razorpay_error","detail":"Authentication failed","http_status":502}],"duration_ms":1011}
+  PASS  duration is reported
+
+  REAL RAZORPAY LINKS CREATED — verify these in the dashboard:
+
+  FAIL  four payment rows were created by the fan-out
+        expected: 4
+        actual:   0
+  FAIL  four reminders were logged
+        expected: 4
+        actual:   0
+  FAIL  Asha got a payment row
+        expected: 1
+        actual:   0
+  FAIL  Bharat (past_due) got a payment row
+        expected: 1
+        actual:   0
+  PASS  the +5 membership was NOT contacted
+  PASS  the cancelled membership was NOT contacted
+  FAIL  every payment row is pending with a link and no payment id yet
+        expected: 4
+        actual:   0
+  PASS  same-day re-scan created nothing new
+  FAIL  same-day re-scan skipped all 4
+        expected: 4
+        actual:   0
+  FAIL  skips are attributed to already_sent_today
+        expected: contains '"already_sent_today":4'
+        actual:   {"ok":true,"dry_run":false,"scan_date":"2026-11-06","timezone":"Asia/Kolkata","offset_days":[7,3],"target_dates":["2026-11-13","2026-11-09"],"statuses":["active","past_due"],"matched":4,"truncated":false,"limit":100,"scanned":4,"created":0,"reused":0,"skipped":0,"skipped_by_reason":{},"errored":4,"errored_membership_ids":["70000000-0000-0000-0000-000000000012","f2222222-2222-2222-2222-222222222222","70000000-0000-0000-0000-000000000002","f1111111-1111-1111-1111-111111111111"],"errors":[{"membership_id":"70000000-0000-0000-0000-000000000012","member_name":"Priyanka Shah","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"f2222222-2222-2222-2222-222222222222","member_name":"Bharat Rao","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"70000000-0000-0000-0000-000000000002","member_name":"Sneha Gupta","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"f1111111-1111-1111-1111-111111111111","member_name":"Asha Menon","error":"razorpay_error","detail":"Authentication failed","http_status":502}],"results":[{"membership_id":"70000000-0000-0000-0000-000000000012","member_name":"Priyanka Shah","outcome":"error","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"f2222222-2222-2222-2222-222222222222","member_name":"Bharat Rao","outcome":"error","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"70000000-0000-0000-0000-000000000002","member_name":"Sneha Gupta","outcome":"error","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"f1111111-1111-1111-1111-111111111111","member_name":"Asha Menon","outcome":"error","error":"razorpay_error","detail":"Authentication failed","http_status":502}],"duration_ms":1238}
+  FAIL  same-day re-scan created no extra payment rows
+        expected: 4
+        actual:   0
+  FAIL  same-day re-scan queued no extra messages
+        expected: 4
+        actual:   0
+  FAIL  next-day scan reused all 4 payment rows
+        expected: 4
+        actual:   0
+  PASS  next-day scan created nothing new
+  FAIL  still only four payment rows for the period
+        expected: 4
+        actual:   0
+
+-- partial failure --
+  PASS  all 5 memberships were attempted
+  FAIL  exactly one errored
+        expected: 1
+        actual:   5
+  FAIL  the other four still completed
+        expected: 4
+        actual:   0
+  FAIL  the failing membership id is reported for follow-up
+        expected: contains '"errored_membership_ids":["0badbad0-0000-0000-0000-000000000003"]'
+        actual:   {"ok":true,"dry_run":false,"scan_date":"2026-11-06","timezone":"Asia/Kolkata","offset_days":[7,3],"target_dates":["2026-11-13","2026-11-09"],"statuses":["active","past_due"],"matched":5,"truncated":false,"limit":100,"scanned":5,"created":0,"reused":0,"skipped":0,"skipped_by_reason":{},"errored":5,"errored_membership_ids":["70000000-0000-0000-0000-000000000012","f2222222-2222-2222-2222-222222222222","0badbad0-0000-0000-0000-000000000003","70000000-0000-0000-0000-000000000002","f1111111-1111-1111-1111-111111111111"],"errors":[{"membership_id":"70000000-0000-0000-0000-000000000012","member_name":"Priyanka Shah","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"f2222222-2222-2222-2222-222222222222","member_name":"Bharat Rao","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"0badbad0-0000-0000-0000-000000000003","member_name":"Zero Amount Tester","error":"plan_amount_invalid","http_status":500},{"membership_id":"70000000-0000-0000-0000-000000000002","member_name":"Sneha Gupta","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"f1111111-1111-1111-1111-111111111111","member_name":"Asha Menon","error":"razorpay_error","detail":"Authentication failed","http_status":502}],"results":[{"membership_id":"70000000-0000-0000-0000-000000000012","member_name":"Priyanka Shah","outcome":"error","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"f2222222-2222-2222-2222-222222222222","member_name":"Bharat Rao","outcome":"error","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"0badbad0-0000-0000-0000-000000000003","member_name":"Zero Amount Tester","outcome":"error","error":"plan_amount_invalid","http_status":500},{"membership_id":"70000000-0000-0000-0000-000000000002","member_name":"Sneha Gupta","outcome":"error","error":"razorpay_error","detail":"Authentication failed","http_status":502},{"membership_id":"f1111111-1111-1111-1111-111111111111","member_name":"Asha Menon","outcome":"error","error":"razorpay_error","detail":"Authentication failed","http_status":502}],"duration_ms":2104}
+  PASS  the failure reason is surfaced
+  PASS  the failing member is named
+  PASS  the downstream HTTP status is kept
+  PASS  a partial failure is still ok:true overall
+  PASS  a partial failure still returns 200, not 5xx
+  FAIL  the four healthy memberships kept their payment rows
+        expected: 4
+        actual:   0
+  PASS  the failing membership got no payment row
+  PASS  the failing membership got no message
+  PASS  soonest-due membership was processed first (tiebreak by id)
+
+-- limit and truncation --
+  PASS  limit=1 matched only one
+  PASS  truncation is reported
+  PASS  the limit used is echoed back
+  PASS  an unlimited scan is not flagged truncated
+
+-- frozen memberships --
+  PASS  Asha (active, +7) is still included as a positive control
+  PASS  the frozen membership at the same offset is excluded
+
+-- corrected memberships (update_membership_duration) --
+  PASS  RPC: past_due membership corrected into the future -> active
+  PASS  dry run selects the corrected membership at its new end date
+  PASS    ...reported as active (it left past_due)
+  PASS    ...with the plan rate, not a stale amount
+  PASS  default offsets (+7/+3) do not select it - the old lapsed date is gone
+
+== summary ==
+  passed 71   failed 18   skipped 0
+  note: the Razorpay TEST MODE links printed above still exist in your
+        dashboard. They are unpaid and were never sent to anyone.
+  note: seeded memberships and members have been restored to seed.sql state.
+
+  failing cases:
+    - all 4 reminders were created
+    - nothing errored
+    - response carries real payment links
+    - four payment rows were created by the fan-out
+    - four reminders were logged
+    - Asha got a payment row
+    - Bharat (past_due) got a payment row
+    - every payment row is pending with a link and no payment id yet
+    - same-day re-scan skipped all 4
+    - skips are attributed to already_sent_today
+    - same-day re-scan created no extra payment rows
+    - same-day re-scan queued no extra messages
+    - next-day scan reused all 4 payment rows
+    - still only four payment rows for the period
+    - exactly one errored
+    - the other four still completed
+    - the failing membership id is reported for follow-up
+    - the four healthy memberships kept their payment rows
+
+>>> razorpay-webhook
+
+== mock-razorpay webhook tests ==
+target: http://127.0.0.1:54321/functions/v1/razorpay-webhook
+
+-- signature verification --
+  PASS  invalid signature is rejected 400
+  PASS  missing signature header is rejected 400
+  PASS  rejection body says invalid_signature
+  PASS  rejected delivery wrote NO webhook_events row
+  PASS  rejected delivery did NOT touch the payment
+  PASS  correctly-signed delivery is accepted 200
+
+-- payment.captured --
+  PASS  payment.captured is handled
+  PASS  matched by provider_payment_id
+  PASS  payment marked success
+  PASS  reconciled_at was stamped
+  PASS  membership set active
+  PASS  period extended 1 month from the later of today/current end
+  PASS  confirmation message queued with related_payment_id
+  PASS  confirmation names the member, amount and plan
+  PASS  confirmation uses the approved payment_confirmation template
+  PASS  webhook_events marked processed
+  PASS  early payment did not shorten the period
+
+-- duplicate replay --
+  PASS  replayed event returns duplicate
+  PASS  replayed event did NOT extend the period again
+  PASS  replayed event stored only once
+  PASS  replayed event queued no second message
+  PASS  already-success payment is an idempotent no-op
+  PASS  already-success no-op did not extend the period
+
+-- payment.failed --
+  PASS  payment.failed is handled
+  PASS  payment marked failed
+  PASS  membership status left UNCHANGED
+  PASS  membership period left UNCHANGED
+  PASS  failure notice queued
+  PASS  failure notice is free-form (no approved template yet)
+  PASS  failure event marked processed
+
+-- unmatched payment --
+  PASS  unmatched payment is skipped gracefully
+  PASS  unmatched payment still returns ok
+  PASS  unmatched payment returns 200, not 5xx
+  PASS  unmatched event still marked processed
+  PASS  unmatched event changed none of this suite's own payment rows
+
+-- payment_link.paid --
+  PASS  payment_link.paid is handled
+  PASS  fell back to razorpay_link_id
+  PASS  provider_payment_id was backfilled
+  PASS  link payment marked success
+  PASS  link membership period extended
+
+-- unhandled event types --
+  PASS  unhandled event type is ignored, not an error
+  PASS  unhandled event took no action
+  PASS  unhandled event marked processed
+  PASS  signed-but-unparseable body is acked, not crashed
+  PASS  GET is rejected (Razorpay only POSTs)
+
+-- notes fallback lookup --
+  PASS  BEFORE: a link-less failure with no notes is still unmatched
+  PASS  BEFORE: the payment row was left pending
+  PASS  AFTER: the same failure WITH notes is reconciled
+  PASS  AFTER: matched via notes.idempotency_key
+  PASS  AFTER: the payment row was marked failed
+  PASS  AFTER: the member was told the payment failed
+  PASS  AFTER: membership status was still left alone (dunning is not a webhook's job)
+  PASS  tier 4: matched via notes.membership_id
+  PASS  tier 4: the right payment row was marked failed
+  PASS  tier 4: it did NOT touch another member's pending payment
+  PASS  safety: membership_id alone is NOT enough to match
+  PASS  safety: nothing was reconciled without a tenant to scope to
+  PASS  safety: a cross-tenant notes pair matches nothing
+  PASS  safety: the other tenant's payment was untouched
+  PASS  a captured payment with only notes is reconciled
+  PASS  captured-by-notes matched on idempotency_key
+  PASS  captured-by-notes backfilled provider_payment_id
+  PASS  captured-by-notes extended the membership period
+  PASS  precedence: provider_payment_id still wins when present
+  PASS  precedence: notes do not override a known payment id
+  PASS  precedence: the payment id's row was the one reconciled
+  PASS  precedence: the row named only by notes was NOT touched
+  PASS  a payment with unrelated notes is still unattributable
+  PASS  unattributable payments are still acked, not retried forever
+
+-- multi-month membership period extension --
+  PASS  3-month-membership capture is handled
+  PASS  membership.duration_months=3 extends current_period_end by 3 months
+  PASS  3-month membership did NOT fall back to the old +1-month behaviour
+  PASS  membership total_price snapshots amount x duration_months (12000)
+  PASS  total_price stays frozen after a plan rate change (still 12000, not 15000)
+
+-- PT-package payment reconciliation --
+  PASS  PT-package capture is handled
+  PASS    ...identified as a PT-package payment
+  PASS    ...no membership period was extended
+  PASS  the PT payment row is now success
+  PASS    ...reconciled_at was stamped
+  PASS    ...provider_payment_id backfilled
+  PASS    ...the pt_package itself was NOT touched
+  PASS  a confirmation was queued for the PT payment
+  PASS    ...free-form (no pt_payment_confirmation template yet)
+  PASS  replayed PT event is a duplicate no-op
+
+-- desk payment, then the Razorpay link is paid --
+  PASS  a pending link gets its coverage filled by the trigger (end -> end + 1 month)
+  PASS  desk payment voided exactly the one pending link and extended the membership
+  PASS    ...the pending link is now void
+  PASS    ...membership extended once (end + 1 month)
+  PASS    ...payment_covering_collected sees the desk payment for the voided link
+  PASS  webhook records it as a duplicate needing a refund
+  PASS    ...and names the desk payment it duplicates
+  PASS    ...payment row is refund_due with the Razorpay payment id attached
+  PASS    ...membership was NOT extended a second time
+  PASS    ...no payment confirmation was sent for it
+  PASS    ...refund_due money is NOT collected revenue
+  PASS    ...the note explains the refund
+  PASS    ...webhook_events marked processed
+  PASS  replaying the same event is a no-op
+  PASS  a payment.failed callback does not un-void a voided link
+  PASS  control: an unpaid period is still extended normally
+  PASS    ...membership extended by one month
+  PASS    ...the payment records the period it covered
+  PASS    ...and counts as collected
+
+-- PT package: desk payment, then the Razorpay link is paid --
+  PASS  a PT sale creates no payment row
+  PASS  desk payment recorded for the package and superseded the pending link
+  PASS    ...the pending link is void
+  PASS  Razorpay pays the PT link anyway -> recorded as a duplicate
+  PASS    ...names the desk payment it duplicates
+  PASS    ...row is refund_due with the Razorpay payment attached
+  PASS    ...no confirmation was sent
+  PASS    ...only the desk payment is collected money
+  PASS    ...the package is untouched
+
+== summary ==
+  passed 112   failed 0   skipped 0
+
+>>> staff-login
+
+== staff-login tests ==
+target: http://127.0.0.1:54321/functions/v1/staff-login
+
+-- CORS preflight --
+  PASS  OPTIONS preflight is answered 200
+  PASS  preflight allows the calling origin
+  PASS  preflight allows authorization/content-type
+  PASS  preflight names POST as an allowed method
+
+-- input validation --
+  PASS  unparseable body is a clear 400
+  PASS  missing organization_id is a clear 400
+  PASS  malformed organization_id is caught before Postgres
+  PASS  missing phone is a clear 400
+  PASS  missing pin is a clear 400
+  PASS  non-numeric pin is a clear 400
+  PASS  GET is rejected (this endpoint is POST-only)
+  PASS  no rejected request wrote a login_attempts row
+
+-- correct pin succeeds --
+  PASS  correct pin returns ok:true
+  PASS  response has a real access_token
+  PASS  response has a refresh_token
+  PASS  response has token_type bearer
+  PASS  response carries the staff name
+  PASS  response carries the role
+  PASS  response carries organization_id
+  PASS  expires_in matches jwt_expiry (3600s)
+  PASS  access_token looks like a real JWT (three dot-separated segments)
+  PASS  a real auth.users row now exists for Priya
+  PASS  the auth.users row uses the synthetic staff.internal.invalid email
+  PASS  successful login was recorded
+  PASS  auth.users.user_metadata.name is set on first login
+  PASS  auth.users.user_metadata.role is set on first login
+  PASS  second correct login also succeeds
+  PASS  still exactly one auth.users row for Priya (no duplicate on re-login)
+  PASS  login after a name change still succeeds
+  PASS  the response reflects the NEW name immediately
+  PASS  user_metadata.name self-healed to the new name
+  PASS  still exactly one auth.users row (sync updates, does not duplicate)
+
+-- wrong pin / nonexistent phone --
+  PASS  wrong pin for a real phone is 401 invalid_credentials
+  PASS  nonexistent phone is ALSO 401 invalid_credentials
+  PASS  wrong-pin and not-found response bodies are byte-identical
+  PASS  invalid_credentials never carries an access_token
+  PASS  wrong pin recorded a failed attempt for the real phone
+  PASS  nonexistent phone ALSO recorded a failed attempt (same rate-limit treatment)
+
+-- cross-org phone --
+  PASS  FlexFit + Priya's phone + Iron Temple's correct pin is rejected
+  PASS  FlexFit + that phone + the FLEXFIT fixture's own correct pin succeeds
+  PASS  it authenticates as the FlexFit fixture, not Priya
+
+-- lockout after 5 failures --
+  PASS  wrong-pin attempt #1 is 401, not locked yet
+  PASS  wrong-pin attempt #2 is 401, not locked yet
+  PASS  wrong-pin attempt #3 is 401, not locked yet
+  PASS  wrong-pin attempt #4 is 401, not locked yet
+  PASS  wrong-pin attempt #5 is 401, not locked yet
+  PASS  6th attempt is locked out
+  PASS  lockout returns 429
+  PASS  retry_after_seconds is a sane value (0, 900]: 899
+  PASS  lockout does not add a 7th login_attempts row
+  PASS  correct pin is STILL rejected during lockout
+  PASS  the correct-pin attempt during lockout was not recorded either
+
+-- lockout expires after cooldown --
+  PASS  correct pin succeeds once the backdated failures have aged out
+  PASS  5 failures from 2-6 minutes ago still lock the account
+
+-- success resets the counter --
+  PASS  4 failures recorded, not yet locked
+  PASS  the correct pin on attempt #5 still succeeds (not locked yet)
+  PASS  still not locked — the success above reset the counter
+  PASS  confirms it did not lock out yet
+
+-- suspended organization --
+  PASS  correct PIN at a SUSPENDED org -> org_suspended
+  PASS    ...carries a human-readable message
+  PASS    ...403, not 200
+  PASS    ...a WRONG PIN at a suspended org is still generic
+  PASS  reactivating restores login with no other action -> 200
+  PASS  re-suspending blocks it again -> 403
+
+== summary ==
+  passed 64   failed 0   skipped 0
+
+>>> staff-lookup-by-phone
+
+== staff-lookup-by-phone tests ==
+target: http://127.0.0.1:54321/functions/v1/staff-lookup-by-phone
+
+-- CORS preflight --
+  PASS  OPTIONS preflight is answered 200
+  PASS  preflight allows the calling origin
+  PASS  preflight allows authorization/content-type
+  PASS  preflight names POST as an allowed method
+
+-- input validation --
+  PASS  unparseable body is a clear 400
+  PASS  missing phone is a clear 400
+  PASS  garbage (non-digit) phone is a clear 400
+  PASS  too-short digit string is a clear 400
+  PASS  GET is rejected (this endpoint is POST-only)
+
+-- zero matches --
+  PASS  unregistered phone returns not_found
+  PASS  unregistered phone returns 404
+  PASS  zero-match response has no organization_id
+
+-- exactly one match --
+  PASS  single match is ok:true
+  PASS  single match returns organization_id
+  PASS  single match returns organization_name
+  PASS  single match returns the staff name
+  PASS  single match returns the role
+  PASS  single-match response is not a list
+  PASS  single match returns 200
+
+-- two-plus matches --
+  PASS  two-org phone is ok:true
+  PASS  response is a matches list
+  PASS  Iron Temple match is present
+  PASS  FlexFit match is present
+  PASS  Iron Temple fixture name present
+  PASS  FlexFit fixture name present
+  PASS  Iron Temple fixture role present
+  PASS  FlexFit fixture role present
+  PASS  two-org phone returns 200
+
+-- suspended org is hidden --
+  PASS  phone only at a SUSPENDED org -> org_suspended
+  PASS    ...403, not 200
+  PASS    ...no organization_id is leaked
+
+-- pin_hash never leaks --
+  PASS  pin_hash never appears in any response body
+  PASS  no bcrypt-shaped hash ('$2a$' or '$2b$') ever appears
+  PASS  no bcrypt-shaped hash ($2b$ variant) ever appears
+
+== summary ==
+  passed 34   failed 0   skipped 0
+
+>>> staff-pin-reset
+
+== staff-pin-reset tests ==
+target: http://127.0.0.1:54321/functions/v1/staff-pin-reset
+  PASS  minted owner / front_desk / other-org-owner sessions
+
+-- CORS preflight --
+  PASS  OPTIONS preflight answered 200
+  PASS  preflight allows an origin
+
+-- input validation --
+  PASS  unparseable body -> 400
+  PASS  missing target_user_id -> 400
+  PASS  garbage target_user_id -> 400
+  PASS  missing new_pin -> 400
+  PASS  3-digit pin -> 400
+  PASS  non-digit pin -> 400
+  PASS  GET is rejected
+
+-- authorization --
+  PASS  anon key (not a staff session) -> 401
+  PASS  front_desk cannot reset a PIN -> 403
+  PASS  front_desk gets 403, not 200
+  PASS  an owner of ANOTHER org -> 404 (same-org only)
+  PASS    ...404, not 200
+  PASS  owner + unknown target uuid -> 404
+  PASS  target pin_hash unchanged by any rejected call
+
+-- owner resets a same-org PIN --
+  PASS  owner reset -> ok
+  PASS    ...echoes the target id
+  PASS    ...pin_hash actually changed
+  PASS  the NEW pin now logs in
+  PASS  the OLD pin no longer logs in
+
+-- lockout recovery --
+  PASS  target is now locked out (429)
+  PASS  owner reset succeeds despite the lockout
+  PASS    ...login_attempts for that phone were cleared
+  PASS    ...the staffer can log in immediately with the newest pin
+
+-- owner resets own pin --
+  PASS  owner resetting their own pin is allowed
+  PASS  Ravi's seeded pin (1234) still works after restore
+
+== summary ==
+  passed 28   failed 0   skipped 0
+
+>>> staff-manage
+
+== staff-manage tests ==
+target: http://127.0.0.1:54321/functions/v1/staff-manage
+  PASS  minted owner / front_desk / other-org-owner sessions
+
+-- CORS + input validation --
+  PASS  OPTIONS preflight answered 200
+  PASS  unparseable body -> 400
+  PASS  unknown action -> 400
+  PASS  GET is rejected
+
+-- authorization --
+  PASS  anon key (not a staff session) -> 401
+  PASS  front_desk cannot manage staff -> 403
+  PASS  an owner of ANOTHER org cannot deactivate this org's staff -> 404
+  PASS    ...404, not 200
+  PASS  target still active after the cross-org attempt
+
+-- create staff --
+  PASS  owner creates a coach -> ok
+  PASS    ...the new coach exists, active, in the owner's org
+  PASS    ...the new coach's PIN logs in immediately
+  PASS  duplicate phone in the same org -> 409
+  PASS  invalid role -> 400
+  PASS  coach without a location -> 400
+  PASS  owner WITH a location -> 400
+  PASS  location in ANOTHER org -> 400
+
+-- edit staff --
+  PASS  edit name -> ok
+  PASS    ...name persisted
+  PASS  edit phone -> ok
+  PASS    ...phone persisted
+  PASS  edit with an empty payload -> 400
+  PASS  edit location to another org -> 400
+  PASS  an owner of ANOTHER org cannot edit this org's staff -> 404
+  PASS  edit ignoring a pin_hash in the payload -> ok
+  PASS    ...name changed
+  PASS    ...pin_hash UNCHANGED
+  PASS    ...original PIN 3101 still logs in
+  PASS  coach -> front_desk (no active packages) -> ok
+  PASS    ...role persisted
+  PASS  coach -> front_desk WITH active packages -> 409
+  PASS    ...reports the count
+  PASS    ...Farah is still a coach
+
+-- deactivate revokes access --
+  PASS  target can log in BEFORE deactivation
+  PASS  owner deactivates a same-org staffer -> ok
+  PASS    ...reports the action
+  PASS    ...users.active is now false
+  PASS  a DEACTIVATED user with the CORRECT PIN cannot log in
+  PASS    ...403, not 200
+  PASS  a deactivated user with a WRONG PIN still gets the generic error
+
+-- reactivate --
+  PASS  owner reactivates -> ok
+  PASS    ...users.active is true again
+  PASS    ...the staffer can log in again with the correct PIN
+
+-- an owner cannot deactivate themselves --
+  PASS  owner deactivating own id -> 400
+  PASS    ...owner still active
+
+-- deactivated coach not assignable --
+  PASS  the new active coach IS in coaches_directory
+  PASS  a DEACTIVATED coach is gone from coaches_directory
+  PASS  staff_directory still lists the deactivated coach
+  PASS    ...flagged active:false
+
+== summary ==
+  passed 50   failed 0   skipped 0
+
+>>> validate-magic-link
+
+== validate-magic-link tests ==
+target: http://127.0.0.1:54321/functions/v1/validate-magic-link
+
+-- CORS + method + input validation --
+  PASS  OPTIONS preflight answered 200
+  PASS  GET is rejected
+  PASS  unparseable body -> 400
+  PASS  missing token -> 400
+  PASS  too-short token -> 400 (never hits the DB)
+  PASS  token with illegal chars -> 400
+  PASS    ...malformed token is a clean 400, not a 500
+
+-- unknown token --
+  PASS  well-formed unknown token -> invalid_token
+  PASS    ...404, not 500
+
+-- redeem a valid link (once) --
+  PASS  valid link -> ok:true
+  PASS    ...returns an access_token
+  PASS    ...returns a refresh_token
+  PASS    ...session is scoped role=coach
+  PASS    ...and to the coach's own org
+  PASS    ...the row is now marked used
+  PASS  minted session can read pt_packages under normal RLS
+
+-- reuse is refused --
+  PASS  redeeming the same link again -> link_already_used
+  PASS    ...410, not 200
+  PASS    ...still exactly one used row for this token
+
+-- expired link --
+  PASS  an expired link -> link_expired
+  PASS    ...410, not 200
+  PASS    ...the claim did NOT stamp used_at on an expired row
+
+-- link for a deactivated coach --
+  PASS  deactivated coach -> staff_unavailable
+  PASS    ...403, not 200
+  PASS    ...no session was minted
+
+-- end to end: SESSION -> link -> redeem --
+  PASS  whatsapp-webhook accepts the SESSION message
+  PASS  coach texts SESSION -> receives a magic link
+  PASS    ...persisted unused, unexpired, scoped to this coach
+  PASS    ...that link redeems for a coach session
+  PASS    ...redeemed as this coach
+  PASS    ...and cannot be redeemed a second time
+
+-- expiry boundary, via the real generator --
+  PASS  a REAL generated link, backdated 1s past expiry, is denied
+  PASS    ...no session was minted for it
+  PASS    ...the claim did NOT stamp used_at
+
+-- single-use under a real race --
+  PASS  exactly one of two simultaneous redemptions succeeded
+  PASS    ...the loser saw link_already_used, not a silent duplicate success
+  PASS    ...exactly one used_at stamp on the row, not zero or two
+
+-- purpose scoping --
+  PASS  owner redeems an add_member link -> ok
+  PASS    ...role in the response is owner
+  PASS    ...purpose in the response is add_member
+  PASS  front_desk redeems an add_pt_package link -> ok
+  PASS    ...role in the response is front_desk
+  PASS    ...purpose in the response is add_pt_package
+  PASS  a coach's token for an add_member-purpose link is refused
+  PASS    ...no session was minted (still ok:false)
+  PASS    ...403, not 200
+  PASS  an owner's token for a session_log-purpose link is refused
+
+-- expiry boundary + single-use race, per purpose (add_member / add_pt_package) --
+  PASS  add_member: a REAL generated link, backdated 1s past expiry, is denied
+  PASS  add_member:   ...no session was minted for it
+  PASS  add_member:   ...the claim did NOT stamp used_at
+  PASS  add_member: exactly one of two simultaneous redemptions succeeds
+  PASS  add_member:   ...the loser saw link_already_used, not a silent duplicate success
+  PASS  add_member:   ...exactly one used_at stamp on the row, not zero or two
+  FAIL  add_pt_package: a REAL generated link, backdated 1s past expiry, is denied
+        expected: contains '"error":"link_expired"'
+        actual:   {"ok":false,"error":"link_already_used"}
+  PASS  add_pt_package:   ...no session was minted for it
+  FAIL  add_pt_package:   ...the claim did NOT stamp used_at
+        expected: f
+        actual:   t
+  FAIL  add_pt_package: exactly one of two simultaneous redemptions succeeds
+        expected: 1
+        actual:   0
+  FAIL  add_pt_package:   ...the loser saw link_already_used, not a silent duplicate success
+        expected: one ok:true (front_desk) + one link_already_used
+        actual:   {"ok":false,"error":"link_already_used"} | {"ok":false,"error":"link_already_used"}
+  PASS  add_pt_package:   ...exactly one used_at stamp on the row, not zero or two
+
+== summary ==
+  passed 55   failed 4   skipped 0
+
+  failing cases:
+    - add_pt_package: a REAL generated link, backdated 1s past expiry, is denied
+    - add_pt_package:   ...the claim did NOT stamp used_at
+    - add_pt_package: exactly one of two simultaneous redemptions succeeds
+    - add_pt_package:   ...the loser saw link_already_used, not a silent duplicate success
+
+>>> send-welcome-message
+
+== send-welcome-message tests ==
+target: http://127.0.0.1:54321/functions/v1/send-welcome-message
+  PASS  minted owner / front_desk / coach / other-org-owner sessions
+
+-- CORS + method + input --
+  PASS  OPTIONS preflight -> 200
+  PASS  GET -> 405
+  PASS  malformed member_id -> 400
+
+-- authorization --
+  PASS  anon key (not a staff session) -> 401
+  PASS  a coach cannot send welcomes -> 403
+  PASS  member in ANOTHER org -> 404
+
+-- happy path (temporary send mode) --
+  PASS  opted-in member at an active org -> ok
+  PASS    ...simulated (template pending approval)
+  PASS    ...reason is template_pending_approval
+  PASS    ...one queued member_welcome audit row
+  PASS    ...no Meta id (nothing was sent)
+
+-- idempotency + skip paths --
+  PASS  second call for the same member -> skipped:already_sent
+  PASS    ...still exactly one row
+  PASS  opted-OUT member -> skipped:opted_out (front_desk caller)
+  PASS    ...no row written
+
+-- suspended org --
+  PASS  suspended org -> skipped:org_suspended
+  PASS    ...no row written
+  PASS    ...after reactivation the welcome sends
+
+== summary ==
+  passed 19   failed 0   skipped 0
+
+=========================================
+  combined result
+=========================================
+  suite                    result   pass/fail/skip
+  ------------------------ -------- --------------
+  whatsapp-webhook         FAIL     185/4/0
+  mark-overdue             PASS     80/0/0
+  daily-owner-brief        PASS     144/0/0
+  send-renewal-reminder    FAIL     25/35/3
+  renewal-scan             FAIL     71/18/0
+  razorpay-webhook         PASS     112/0/0
+  staff-login              PASS     64/0/0
+  staff-lookup-by-phone    PASS     34/0/0
+  staff-pin-reset          PASS     28/0/0
+  staff-manage             PASS     50/0/0
+  validate-magic-link      FAIL     55/4/0
+  send-welcome-message     PASS     19/0/0
+
+  elapsed: 1m54s
+
+  4 suite(s) failed
+

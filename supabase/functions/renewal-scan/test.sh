@@ -97,6 +97,17 @@ read_env() {
 
 RZP_KEY_ID="${RAZORPAY_KEY_ID:-$(read_env RAZORPAY_KEY_ID)}"
 
+# These suites run against RAZORPAY_MODE=mock: link creation returns a fake
+# plink_mock_<paise>_<ref> id and a https://rzp.mock/ URL, never calling
+# Razorpay. They REFUSE to run otherwise, so a stray `run-all-tests.sh` can
+# never create real links. The by-hand real-Razorpay check is
+# send-renewal-reminder/smoke-real-razorpay.sh.
+RZP_MODE="${RAZORPAY_MODE:-$(read_env RAZORPAY_MODE)}"
+if [ "$(printf '%s' "$RZP_MODE" | tr '[:upper:]' '[:lower:]')" != "mock" ]; then
+  printf '\nREFUSING TO RUN: RAZORPAY_MODE is not "mock" (got: %s). Set it in %s and restart `supabase functions serve`.\n\n' "${RZP_MODE:-<unset>}" "$ENV_FILE"; exit 1
+fi
+RZP_URL_BASE="https://rzp.mock/"
+
 status_env() {
   (cd "$PROJECT_DIR" && supabase status -o env 2>/dev/null)
 }
@@ -502,7 +513,7 @@ assert_equals   "scanned all 4 in-window memberships" "4" "$(field_num scanned "
 assert_equals   "all 4 reminders were created"        "4" "$(field_num created "$got")"
 assert_equals   "nothing errored"                    "0" "$(field_num errored "$got")"
 assert_equals   "nothing was skipped"                "0" "$(field_num skipped "$got")"
-assert_contains "response carries real payment links" '"payment_url":"https://rzp.io/' "$got"
+assert_contains "response carries real payment links" "\"payment_url\":\"$RZP_URL_BASE" "$got"
 assert_contains "duration is reported"                '"duration_ms":' "$got"
 
 printf '\n  %sREAL RAZORPAY LINKS CREATED%s — verify these in the dashboard:\n' "$B" "$N"

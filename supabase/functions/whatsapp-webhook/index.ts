@@ -83,6 +83,8 @@ const REPLY = {
     "You're already paid up for this period — no payment needed right now. See you at the gym!",
   paymentOptedOut:
     "You've opted out of WhatsApp payment messages — please contact the front desk to renew.",
+  paymentUnavailable:
+    "Online payment isn't set up for your gym yet — please contact the front desk to renew.",
   paymentError:
     "Sorry, we couldn't generate your payment link right now — please contact the front desk to renew.",
 } as const;
@@ -364,6 +366,108 @@ async function loadLatestMembership(
   return data;
 }
 
+
+// ---------------------------------------------------------------------------
+// QR IMAGE — UNVERIFIED AGAINST LIVE META. Built from Meta's Cloud API
+// "image" message type ({type:"image", image:{link, caption}}); only exercised
+// here in WHATSAPP_SEND_MODE=mock. A free-form (non-template) message is only
+// allowed inside the 24h customer-service window. This is only ever called
+// from requestPaymentLink(), i.e. as the reply to the member's own inbound
+// message (PAY, or a check-in that bounced on an unpaid membership), so the
+// window is open by construction. Never call it from a scheduled path.
+// ---------------------------------------------------------------------------
+const QR_IMAGE_URL_TTL_SECONDS = 600;
+const QR_IMAGE_TEMPLATE_TAG = "qr_image";
+
+async function sendQrImage(
+  supabase: SupabaseClient,
+  ctx: PayReplyContext,
+  amount: number | null,
+): Promise<void> {
+  try {
+    const { data: s, error } = await supabase
+      .from("org_payment_settings")
+      .select("qr_image_path,qr_enabled")
+      .eq("organization_id", ctx.organizationId)
+      .maybeSingle();
+    if (error || !s?.qr_enabled || !s.qr_image_path) return;
+
+    const { data: signed, error: signErr } = await supabase.storage
+      .from("payment-qr")
+      .createSignedUrl(s.qr_image_path, QR_IMAGE_URL_TTL_SECONDS);
+    if (signErr || !signed?.signedUrl) {
+      console.error("[whatsapp-webhook] could not sign QR image URL:", signErr);
+      return;
+    }
+
+    const caption = amount
+      ? `Scan to pay ₹${amount} by UPI, then tap "I've paid" on the pay page.`
+      : `Scan to pay by UPI, then tap "I've paid" on the pay page.`;
+
+    let waMessageId: string | null = null;
+    let status: "queued" | "sent" | "failed";
+
+    if (isMockMode()) {
+      console.log(
+        `[whatsapp-webhook] WHATSAPP_SEND_MODE=mock — not calling Meta. to=${ctx.phone} ` +
+          `image caption=${JSON.stringify(caption)}`,
+      );
+      status = "queued";
+    } else {
+      const accessToken = Deno.env.get("META_ACCESS_TOKEN");
+      const phoneNumberId = Deno.env.get("META_PHONE_NUMBER_ID");
+      if (!accessToken || !phoneNumberId) {
+        status = "failed";
+      } else {
+        const res = await fetch(
+          `https://graph.facebook.com/${META_API_VERSION}/${phoneNumberId}/messages`,
+          {
+            method: "POST",
+            headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
+            body: JSON.stringify({
+              messaging_product: "whatsapp",
+              recipient_type: "individual",
+              to: ctx.phone,
+              type: "image",
+              image: { link: signed.signedUrl, caption },
+            }),
+          },
+        );
+        const result = await res.json().catch(() => null);
+        if (res.ok) {
+          waMessageId = result?.messages?.[0]?.id ?? null;
+          status = "sent";
+        } else {
+          console.error(`[whatsapp-webhook] Meta image send failed (HTTP ${res.status}):`, result);
+          status = "failed";
+        }
+      }
+    }
+
+    const { error: logErr } = await supabase.from("whatsapp_messages").insert({
+      organization_id: ctx.organizationId,
+      member_id: ctx.memberId,
+      direction: "outbound",
+      phone: ctx.phone,
+      template_name: QR_IMAGE_TEMPLATE_TAG,
+      body_preview: `[image] ${caption}`,
+      wa_message_id: waMessageId,
+      status,
+    });
+    if (logErr) console.error("[whatsapp-webhook] failed to log QR image message:", logErr);
+  } catch (err) {
+    // The pay-page link has already gone out; the image is a convenience.
+    console.error("[whatsapp-webhook] QR image send threw:", err instanceof Error ? err.message : err);
+  }
+}
+
+interface PayReplyContext {
+  supabase: SupabaseClient;
+  phone: string;
+  organizationId: string;
+  memberId: string;
+}
+
 /**
  * Ask send-renewal-reminder for a real payment link on `membershipId`.
  *
@@ -376,7 +480,10 @@ async function loadLatestMembership(
  * malformed response here must fall back to REPLY.paymentError, not crash the
  * webhook.
  */
-async function requestPaymentLink(membershipId: string): Promise<string | null> {
+async function requestPaymentLink(
+  membershipId: string,
+  ctx?: PayReplyContext,
+): Promise<string | null> {
   const url = reminderUrl();
   const serviceKey = expectedServiceRoleKey();
 
@@ -423,10 +530,16 @@ async function requestPaymentLink(membershipId: string): Promise<string | null> 
       return REPLY.paymentAlreadyPaid;
     case "whatsapp_opt_out":
       return REPLY.paymentOptedOut;
+    case "no_payment_method":
+      return REPLY.paymentUnavailable;
   }
 
   if (body.created === true || body.reused === true) {
     // send-renewal-reminder already sent the WhatsApp message with the link.
+    // For UPI QR gyms the link is the pay page; follow it with the QR image.
+    if (body.mode === "qr" && ctx) {
+      await sendQrImage(ctx.supabase, ctx, typeof body.amount === "number" ? body.amount : null);
+    }
     return null;
   }
 
@@ -547,6 +660,7 @@ async function handleCheckin(
   supabase: SupabaseClient,
   memberId: string,
   organizationId: string,
+  phone: string,
 ): Promise<string | null> {
   // Most recent membership for this member, by period end.
   const { data: membership, error } = await supabase
@@ -566,7 +680,7 @@ async function handleCheckin(
     // No attendance row: an unpaid member must not be able to self-check-in.
     // Real payment link, sent by send-renewal-reminder itself on success —
     // see requestPaymentLink() above.
-    return await requestPaymentLink(membership.id);
+    return await requestPaymentLink(membership.id, { supabase, phone, organizationId, memberId });
   }
 
   if (membership.status === "cancelled") return REPLY.membershipCancelled;
@@ -1132,10 +1246,21 @@ async function ownerAlerts(supabase: SupabaseClient, org: string, orgName: strin
   const low = attn.filter((a) => a.low).length;
   const expiring = attn.filter((a) => a.expiring).length;
 
+  // Payment-setup flags (UPI QR). Shown only when there is something to flag,
+  // so a gym on plain Razorpay sees exactly the alerts it always did.
+  const since7d = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+  const skips = await supabase.from("payment_link_skips").select("id", { count: "exact", head: true })
+    .eq("organization_id", org).gte("created_at", since7d);
+  const extra: string[] = [];
+  if (!skips.error && (skips.count ?? 0) > 0) {
+    extra.push(`💳 ${skips.count} renewal reminder${skips.count === 1 ? "" : "s"} NOT sent this week — no payment method set up. Add a UPI QR in Settings.`);
+  }
+
   return [
     `⚠️ Alerts — ${orgName}`,
     `Overdue: ${overdue.length} member${overdue.length === 1 ? "" : "s"} · ${rupees(owed)} owed`,
     `PT attention: ${attn.length} package${attn.length === 1 ? "" : "s"} (${low} low on sessions, ${expiring} expiring soon)`,
+    ...extra,
     ``,
     `Text OVERDUE or PT for the full list.`,
   ].join("\n");
@@ -2007,6 +2132,7 @@ async function handleWebhook(req: Request): Promise<Response> {
             supabase,
             resolution.memberId,
             resolution.organizationId,
+            phone,
           );
           break;
         case "switch":
@@ -2019,7 +2145,12 @@ async function handleWebhook(req: Request): Promise<Response> {
             resolution.memberId,
           );
           reply = membership
-            ? await requestPaymentLink(membership.id)
+            ? await requestPaymentLink(membership.id, {
+              supabase,
+              phone,
+              organizationId: resolution.organizationId,
+              memberId: resolution.memberId,
+            })
             : REPLY.noMembership;
           break;
         }

@@ -68,6 +68,17 @@ read_env() {
 }
 
 RZP_KEY_ID="${RAZORPAY_KEY_ID:-$(read_env RAZORPAY_KEY_ID)}"
+
+# These suites run against RAZORPAY_MODE=mock: link creation returns a fake
+# plink_mock_<paise>_<ref> id and a https://rzp.mock/ URL, never calling
+# Razorpay. They REFUSE to run otherwise, so a stray `run-all-tests.sh` can
+# never create real links. The by-hand real-Razorpay check is
+# send-renewal-reminder/smoke-real-razorpay.sh.
+RZP_MODE="${RAZORPAY_MODE:-$(read_env RAZORPAY_MODE)}"
+if [ "$(printf '%s' "$RZP_MODE" | tr '[:upper:]' '[:lower:]')" != "mock" ]; then
+  printf '\nREFUSING TO RUN: RAZORPAY_MODE is not "mock" (got: %s). Set it in %s and restart `supabase functions serve`.\n\n' "${RZP_MODE:-<unset>}" "$ENV_FILE"; exit 1
+fi
+RZP_URL_BASE="https://rzp.mock/"
 WA_SEND_MODE="${WHATSAPP_SEND_MODE:-$(read_env WHATSAPP_SEND_MODE)}"
 
 # The service role key is injected into the function by the edge runtime, not by
@@ -334,12 +345,12 @@ got=$(post "$MEM_PAST_DUE")
 
 assert_contains "reminder reports created"        '"created":true' "$got"
 assert_contains "response is ok"                  '"ok":true' "$got"
-assert_contains "response carries the pay URL"    '"payment_url":"https://rzp.io/' "$got"
+assert_contains "response carries the pay URL"    "\"payment_url\":\"$RZP_URL_BASE" "$got"
 assert_contains "response carries the link id"    '"razorpay_link_id":"plink_' "$got"
 assert_contains "amount is the plan price in rupees, not paise" '"amount":1500' "$got"
 assert_contains "body_preview is the member-facing text" \
   '"body_preview":"Hi Bharat Rao, your Monthly Unlimited membership renews on ' "$got"
-assert_contains "message contains the pay link"   'Pay here to continue: https://rzp.io/' "$got"
+assert_contains "message contains the pay link"   "Pay here to continue: $RZP_URL_BASE" "$got"
 
 PAYMENT_ID=$(field payment_id "$got")
 LINK_ID=$(field razorpay_link_id "$got")
@@ -390,7 +401,7 @@ assert_db "message status is queued" \
 assert_db "message is linked to the new payment via related_payment_id" \
   "1" "$(sql "select count(*) from whatsapp_messages where related_payment_id='$PAYMENT_ID';")"
 assert_db "message body carries the real payment link" \
-  "1" "$(sql "select count(*) from whatsapp_messages where related_payment_id='$PAYMENT_ID' and body_preview like '%rzp.io%';")"
+  "1" "$(sql "select count(*) from whatsapp_messages where related_payment_id='$PAYMENT_ID' and body_preview like '%rzp.mock%';")"
 assert_db "wa_message_id is NULL (send was mocked, nothing was delivered)" \
   "t" "$(sql "select (wa_message_id is null) from whatsapp_messages where related_payment_id='$PAYMENT_ID';")"
 
@@ -541,6 +552,10 @@ else
   # Pricing step precedes the Razorpay call, so anything but ok/razorpay_error
   # (e.g. plan_amount_invalid) means the new amount lookup itself broke.
   check_bundle_renewal() { # <label> <membership_id> <expected amount>
+    # All three bundle memberships belong to ONE member, and guard #1 allows one
+    # reminder per member per day — so clear that member's reminder log first or
+    # every call after the first answers already_sent_today and prices nothing.
+    sql "delete from whatsapp_messages where member_id='$BP_MEMBER' and template_name='renewal_reminder';" >/dev/null
     local got; got=$(post "$2")
     case "$got" in
       *'"ok":true'*)

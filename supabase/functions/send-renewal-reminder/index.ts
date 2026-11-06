@@ -51,6 +51,12 @@ import { createAdminClient, type SupabaseClient } from "../_shared/supabase.ts";
 import { sha256Hex } from "../_shared/crypto.ts";
 import { authorizeServiceRole } from "../_shared/auth.ts";
 import { sendWhatsAppMessage } from "../_shared/whatsapp.ts";
+import {
+  decidePaymentMode,
+  payPageUrl,
+  razorpayIsMock,
+  recordPaymentSkip,
+} from "../_shared/payment-mode.ts";
 
 const TAG = "send-renewal-reminder";
 const PROVIDER = "razorpay" as const;
@@ -233,7 +239,17 @@ function rupeesToPaise(amount: number): number {
 // Razorpay Payment Links — REAL, not simulated
 // ---------------------------------------------------------------------------
 
+// RAZORPAY_MODE=mock (tests only; default is real): link creation never leaves
+// the process. The fake link id embeds the amount it was asked for, in paise —
+// plink_mock_<paise>_<reference_id> — so a test can read it back from
+// payments.razorpay_link_id and the returned payment_url.
+function mockLink(amountPaise: number, referenceId: string): PaymentLink {
+  const id = `plink_mock_${amountPaise}_${referenceId}`;
+  return { id, short_url: `https://rzp.mock/${id}` };
+}
+
 function razorpayAuthHeader(): string | null {
+  if (razorpayIsMock()) return "Basic mock";
   const keyId = Deno.env.get("RAZORPAY_KEY_ID");
   const keySecret = Deno.env.get("RAZORPAY_KEY_SECRET");
 
@@ -284,6 +300,14 @@ async function createPaymentLink(
     idempotencyKey: string;
   },
 ): Promise<PaymentLink> {
+  if (razorpayIsMock()) {
+    console.log(
+      `[${TAG}] RAZORPAY_MODE=mock — not calling Razorpay. amount_paise=${params.amountPaise} ` +
+        `reference_id=${params.referenceId}`,
+    );
+    return mockLink(params.amountPaise, params.referenceId);
+  }
+
   const payload = JSON.stringify({
     amount: params.amountPaise,
     currency: "INR",
@@ -378,6 +402,9 @@ async function fetchPaymentLinkByReference(
   authHeader: string,
   referenceId: string,
 ): Promise<PaymentLink | null> {
+  // Mock links are not recoverable by reference (the amount is part of the id);
+  // the payments row always carries the id, so this path is never needed.
+  if (razorpayIsMock()) return null;
   const res = await fetch(
     `${RAZORPAY_API}?reference_id=${encodeURIComponent(referenceId)}`,
     { headers: { authorization: authHeader } },
@@ -405,6 +432,11 @@ async function fetchPaymentLinkById(
   authHeader: string,
   linkId: string,
 ): Promise<PaymentLink | null> {
+  if (razorpayIsMock()) {
+    return linkId.startsWith("plink_mock_")
+      ? { id: linkId, short_url: `https://rzp.mock/${linkId}` }
+      : null;
+  }
   const res = await fetch(`${RAZORPAY_API}/${encodeURIComponent(linkId)}`, {
     headers: { authorization: authHeader },
   });
@@ -573,6 +605,30 @@ async function handleReminder(req: Request): Promise<Response> {
   // — is renewal-scan's dunning policy, and this function must stay callable for
   // whatever that policy selects. Status is echoed in the response so the caller
   // can see what it acted on.
+
+  // --- (c2) Which way does THIS gym collect? (see _shared/payment-mode.ts) ---
+  // Legacy gyms (no org_payment_settings row) and razorpay gyms fall straight
+  // through to the unchanged Razorpay path below.
+  const decision = await decidePaymentMode(supabase, membership.organization_id);
+
+  if (decision.mode === "none") {
+    await recordPaymentSkip(supabase, membership.organization_id, membership.id, decision.reason);
+    console.warn(
+      `[${TAG}] org ${membership.organization_id} has no usable payment method ` +
+        `(${decision.reason}) — membership ${membership.id} not reminded.`,
+    );
+    return json({
+      ok: true,
+      skipped: "no_payment_method",
+      reason: decision.reason,
+      membership_id: membership.id,
+      organization_id: membership.organization_id,
+    });
+  }
+
+  if (decision.mode === "qr") {
+    return await handleQrReminder(supabase, membership, member, plan);
+  }
 
   const authHeader = razorpayAuthHeader();
   if (!authHeader) {
@@ -828,11 +884,83 @@ async function handleReminder(req: Request): Promise<Response> {
     membership_status: membership.status,
     member_id: member.id,
     organization_id: membership.organization_id,
+    mode: "razorpay",
     payment_id: payment.id,
     razorpay_link_id: link.id,
     payment_url: link.short_url,
     amount: amountRupees,
     idempotency_key: idempotencyKey,
+    current_period_end: membership.current_period_end,
+    whatsapp_message_id: send.messageId,
+    whatsapp_message_logged: send.logged,
+    body_preview: text,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// UPI QR mode — no Razorpay call, no payments row. A payment_requests row holds
+// the pay-page token; the member pays by UPI and staff record it with
+// record_manual_payment(..., 'upi'). Same renewal_reminder template, same
+// variable ({{4}}): it just carries the pay-page URL instead of a Razorpay link.
+// ---------------------------------------------------------------------------
+async function handleQrReminder(
+  supabase: SupabaseClient,
+  membership: MembershipRow,
+  member: NonNullable<MembershipRow["members"]>,
+  plan: NonNullable<MembershipRow["membership_plans"]>,
+): Promise<Response> {
+  const { data: renewalAmount, error: amountError } = await supabase.rpc(
+    "membership_renewal_amount",
+    { p_membership_id: membership.id },
+  );
+  const amountRupees = Number(renewalAmount);
+  if (amountError || !Number.isFinite(amountRupees) || amountRupees <= 0) {
+    console.error(`[${TAG}] membership_renewal_amount failed for ${membership.id}:`, amountError);
+    return json({ ok: false, error: "plan_amount_invalid" }, 500);
+  }
+
+  const { data: reqRows, error: reqError } = await supabase.rpc("get_or_create_payment_request", {
+    p_membership_id: membership.id,
+    p_pt_package_id: null,
+    p_amount: amountRupees,
+    p_ttl_days: 30,
+  });
+  const pr = Array.isArray(reqRows) ? reqRows[0] : reqRows;
+  if (reqError || !pr?.token) {
+    console.error(`[${TAG}] get_or_create_payment_request failed:`, reqError);
+    return json({ ok: false, error: "payment_request_failed" }, 500);
+  }
+
+  const url = payPageUrl(pr.token)!; // decidePaymentMode guarantees the base is set
+  const renewsOn = formatDateForMember(membership.current_period_end);
+  const text = MESSAGE.renewalReminder(member.name, plan.name, renewsOn, url);
+
+  const send = await sendWhatsAppMessage(supabase, member.phone, text, {
+    tag: TAG,
+    memberId: member.id,
+    organizationId: membership.organization_id,
+    templateName: TEMPLATE_NAME,
+  }, {
+    name: TEMPLATE_NAME,
+    language: TEMPLATE_LANGUAGE,
+    bodyParams: [member.name, plan.name, renewsOn, url],
+  });
+
+  if (!send.logged) {
+    console.error(`[${TAG}] QR reminder for member ${member.id} was not logged.`);
+  }
+
+  return json({
+    ok: true,
+    [pr.reused ? "reused" : "created"]: true,
+    mode: "qr",
+    membership_id: membership.id,
+    membership_status: membership.status,
+    member_id: member.id,
+    organization_id: membership.organization_id,
+    payment_request_id: pr.request_id,
+    payment_url: url,
+    amount: amountRupees,
     current_period_end: membership.current_period_end,
     whatsapp_message_id: send.messageId,
     whatsapp_message_logged: send.logged,

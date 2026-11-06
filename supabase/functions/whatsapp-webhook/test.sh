@@ -73,6 +73,17 @@ APP_SECRET="${META_APP_SECRET:-$(read_env META_APP_SECRET)}"
 WA_SEND_MODE="${WHATSAPP_SEND_MODE:-$(read_env WHATSAPP_SEND_MODE)}"
 RZP_KEY_ID="${RAZORPAY_KEY_ID:-$(read_env RAZORPAY_KEY_ID)}"
 
+# These suites run against RAZORPAY_MODE=mock: link creation returns a fake
+# plink_mock_<paise>_<ref> id and a https://rzp.mock/ URL, never calling
+# Razorpay. They REFUSE to run otherwise, so a stray `run-all-tests.sh` can
+# never create real links. The by-hand real-Razorpay check is
+# send-renewal-reminder/smoke-real-razorpay.sh.
+RZP_MODE="${RAZORPAY_MODE:-$(read_env RAZORPAY_MODE)}"
+if [ "$(printf '%s' "$RZP_MODE" | tr '[:upper:]' '[:lower:]')" != "mock" ]; then
+  printf '\nREFUSING TO RUN: RAZORPAY_MODE is not "mock" (got: %s). Set it in %s and restart `supabase functions serve`.\n\n' "${RZP_MODE:-<unset>}" "$ENV_FILE"; exit 1
+fi
+RZP_URL_BASE="https://rzp.mock/"
+
 have_psql=false
 if docker exec "$DB_CONTAINER" true >/dev/null 2>&1; then have_psql=true; fi
 
@@ -322,7 +333,7 @@ got=$(send_message "$PHONE_PAST_DUE" "wamid.$RUN.a2" "in")
 assert_contains "past_due member 'in' resolves"      '"resolution":"resolved"' "$got"
 reply=$(last_reply "$PHONE_PAST_DUE")
 assert_contains "past_due member 'in' gets a real payment link" \
-  "Pay here to continue: https://rzp.io/" "$reply"
+  "Pay here to continue: $RZP_URL_BASE" "$reply"
 assert_contains "past_due member 'in' reply names them"          "Bharat Rao" "$reply"
 assert_db       "past_due member 'in' records NO attendance" "0" "$(attendance_count "$PHONE_PAST_DUE")"
 
@@ -376,7 +387,7 @@ got=$(send_message "$PHONE_ACTIVE" "wamid.$RUN.c1" "PAY")
 assert_contains "'PAY' resolves" '"resolution":"resolved"' "$got"
 pay_reply=$(last_reply "$PHONE_ACTIVE")
 assert_contains "'PAY' from an active member also gets a real payment link" \
-  "Pay here to continue: https://rzp.io/" "$pay_reply"
+  "Pay here to continue: $RZP_URL_BASE" "$pay_reply"
 
 printf '\n  %sREAL RAZORPAY LINK CREATED%s (via send-renewal-reminder, PHONE_ACTIVE / PAY):\n    %s\n\n' \
   "$B" "$N" "$pay_reply"
