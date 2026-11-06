@@ -607,8 +607,8 @@ async function handleReminder(req: Request): Promise<Response> {
   // can see what it acted on.
 
   // --- (c2) Which way does THIS gym collect? (see _shared/payment-mode.ts) ---
-  // Legacy gyms (no org_payment_settings row) and razorpay gyms fall straight
-  // through to the unchanged Razorpay path below.
+  // A gym with no org_payment_settings row is skipped (reason no_payment_method);
+  // only razorpay_enabled gyms reach the unchanged Razorpay path below.
   const decision = await decidePaymentMode(supabase, membership.organization_id);
 
   if (decision.mode === "none") {

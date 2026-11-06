@@ -189,6 +189,14 @@ field_num() { printf '%s' "$2" | sed -n "s/.*\"$1\":\([0-9-]*\).*/\1/p" | head -
 
 sql() { docker exec "$DB_CONTAINER" psql -U postgres -d postgres -tAc "$1" 2>/dev/null | tr -d '\r'; }
 
+# A gym with NO org_payment_settings row is skipped (no_payment_method) - see
+# _shared/payment-mode.ts. These suites exercise the Razorpay path, so every org
+# is explicitly opted in to Razorpay for the run and the rows are removed again
+# at the end (the pay-page suite owns the no-row / QR / skip behaviour).
+razorpay_orgs_on()  { sql "insert into org_payment_settings (organization_id, razorpay_enabled) select id, true from organizations on conflict (organization_id) do nothing" >/dev/null; }
+razorpay_orgs_off() { sql "delete from org_payment_settings where razorpay_enabled and upi_id is null and not qr_enabled and qr_image_path is null" >/dev/null; }
+razorpay_orgs_on
+
 assert_db() {
   if ! $have_psql; then
     skipped "$1" "docker/psql unavailable (container '$DB_CONTAINER')"
@@ -719,6 +727,7 @@ fi
 # ---------------------------------------------------------------------------
 reset_state
 
+razorpay_orgs_off
 printf '\n%s== summary ==%s\n' "$B" "$N"
 printf '  %spassed %d%s   %sfailed %d%s   %sskipped %d%s\n' "$G" "$PASS" "$N" "$R" "$FAIL" "$N" "$Y" "$SKIP" "$N"
 printf '  note: the Razorpay TEST MODE links printed above still exist in your\n'

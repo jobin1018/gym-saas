@@ -187,7 +187,7 @@ TOKEN=$(sqlq "select token from payment_requests where membership_id='$MEM'")
 sqlq "delete from whatsapp_messages where member_id='$MEMBER' and created_at::date=current_date" >/dev/null
 
 # ===========================================================================
-printf '\n%s-- mode rule: skipped / razorpay / legacy --%s\n' "$B" "$N"
+printf '\n%s-- mode rule: skipped / razorpay / no settings row --%s\n' "$B" "$N"
 sqlq "update org_payment_settings set qr_enabled=false where organization_id='$ORG_IRON'" >/dev/null
 got=$(remind $MEM)
 assert_contains "nothing enabled: skipped no_payment_method" '"skipped":"no_payment_method"' "$got"
@@ -216,9 +216,18 @@ got=$(remind $MEM)
 assert_contains "both enabled: Razorpay wins" '"mode":"razorpay"' "$got"
 
 sqlq "delete from whatsapp_messages where member_id='$MEMBER' and created_at::date=current_date; delete from payments where membership_id='$MEM' and idempotency_key like 'renewal-%'; delete from org_payment_settings where organization_id='$ORG_IRON'" >/dev/null
+sqlq "delete from payment_link_skips" >/dev/null
 got=$(remind $MEM)
-assert_contains "legacy gym (no settings row): Razorpay exactly as before" '"mode":"razorpay"' "$got"
-assert_contains "legacy gym: pending payments row + plink" 'plink_mock_150000_' "$got"
+assert_contains "no settings row: NOT Razorpay - skipped no_payment_method" '"skipped":"no_payment_method"' "$got"
+assert_contains "no settings row: reason is exactly no_payment_method" '"reason":"no_payment_method"' "$got"
+assert_not_contains "no settings row: no Razorpay link was created" 'plink_' "$got"
+assert_equals "no settings row: no payments row, nothing sent" "0|0" \
+  "$(sqlq "select (select count(*) from payments where membership_id='$MEM' and idempotency_key like 'renewal-%'), (select count(*) from whatsapp_messages where member_id='$MEMBER' and template_name='renewal_reminder' and created_at::date=current_date)")"
+assert_equals "no settings row: skip recorded with reason no_payment_method" "1" \
+  "$(sqlq "select count(*) from payment_link_skips where organization_id='$ORG_IRON' and membership_id='$MEM' and reason='no_payment_method'")"
+assert_contains "no settings row: flagged for the owner in v_payment_setup_alerts" '"reason":"no_payment_method"' "$(rest $OWNER v_payment_setup_alerts)"
+assert_equals "no settings row: front_desk does not see the alert" "[]" "$(rest $FD v_payment_setup_alerts)"
+assert_equals "no settings row: another gym's owner does not see it" "[]" "$(rest $FLEX_OWNER v_payment_setup_alerts)"
 sqlq "delete from whatsapp_messages where member_id='$MEMBER' and created_at::date=current_date; delete from payments where membership_id='$MEM' and idempotency_key like 'renewal-%'; delete from payment_link_skips" >/dev/null
 
 # restore the QR gym for the page tests

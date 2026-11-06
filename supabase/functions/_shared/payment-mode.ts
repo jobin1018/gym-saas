@@ -1,7 +1,10 @@
 // The ONE place that decides how an organization's members pay a renewal.
 //
-//   1. No org_payment_settings row  -> "legacy gym": Razorpay, exactly as it
-//      always was (including its hard failure when credentials are missing).
+//   1. No org_payment_settings row  -> none, reason "no_payment_method". (This
+//      used to fall back to Razorpay for "legacy" gyms. While no gym has live
+//      Razorpay, a gym that has not set up payments is flagged instead of
+//      silently being sent Razorpay links. Razorpay is now strictly opt-in via
+//      razorpay_enabled = true.)
 //   2. razorpay_enabled AND credentials exist           -> razorpay
 //   3. qr_enabled AND qr_image_path AND upi_id          -> qr
 //   4. otherwise                                        -> none (+ reason)
@@ -15,13 +18,14 @@
 import { type SupabaseClient } from "./supabase.ts";
 
 export type NoPaymentReason =
+  | "no_payment_method"
   | "no_payment_method_enabled"
   | "qr_enabled_but_incomplete"
   | "razorpay_credentials_missing"
   | "pay_page_url_not_configured";
 
 export type PaymentMode =
-  | { mode: "razorpay"; legacy: boolean }
+  | { mode: "razorpay" }
   | { mode: "qr"; upiId: string; qrImagePath: string }
   | { mode: "none"; reason: NoPaymentReason };
 
@@ -57,10 +61,10 @@ export async function decidePaymentMode(
     .maybeSingle();
   if (error) throw error;
 
-  if (!data) return { mode: "razorpay", legacy: true };
+  if (!data) return { mode: "none", reason: "no_payment_method" };
 
   if (data.razorpay_enabled && razorpayCredentialsPresent()) {
-    return { mode: "razorpay", legacy: false };
+    return { mode: "razorpay" };
   }
 
   if (data.qr_enabled) {
